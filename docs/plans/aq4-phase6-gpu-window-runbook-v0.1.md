@@ -59,6 +59,8 @@ CARGO_TARGET_DIR=/home/homelab1/coding-local/ultimateLLM/uLLM-phase6-build-targe
 
 buildは成功した（既知のC++ `subobject-linkage` warningのみ）。CPU-only staging evidenceはすでに作成済みである。
 
+window driverはこのworktree外targetという構成を明示的に検証し、上記`SOURCE_BIN`以外のbinaryを拒否する。これによりCargo outputをsource worktree内へ置くことでclean-worktree contractを曖昧にすることはない。
+
 - staged binary: `OUT/path-oracle-binary-staging/ullm-aq4-p2-path-oracle`
 - mode: `0555`、nlink: `1`
 - SHA-256: `774964446f3fbfe10323242e67f3aeb95f8f34d42e84db2e46763ff782e452de`

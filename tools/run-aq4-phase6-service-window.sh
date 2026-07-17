@@ -24,6 +24,8 @@ SOURCE_TREE=$3
 SOURCE_BIN=$4
 SOURCE_COMMIT=$5
 REPO=/home/homelab1/coding-local/ultimateLLM/uLLM-project
+BUILD_TARGET=/home/homelab1/coding-local/ultimateLLM/uLLM-phase6-build-target
+EXPECTED_SOURCE_BIN="$BUILD_TARGET/release/ullm-aq4-p2-path-oracle"
 PACKAGE=/home/homelab1/datapool/ullm/product/qwen35-9b-aq4-cli-v0.1/package
 PACKAGE_MANIFEST="$PACKAGE/manifest.json"
 CASES="$REPO/tests/fixtures/qwen35-aq4-p2-oracle/cases.json"
@@ -169,10 +171,14 @@ case "$SOURCE_TREE" in
   /*) ;;
   *) echo "source worktree must be an absolute path" >&2; exit 66 ;;
 esac
-case "$SOURCE_BIN" in
-  "$SOURCE_TREE"/*) ;;
-  *) echo "source binary must be under the clean source worktree" >&2; exit 66 ;;
-esac
+# Keep Cargo's target outside the detached source worktree, so the clean
+# worktree assertion below is meaningful.  The staging receipt records this
+# exact external release output and its declared SOURCE_COMMIT before any
+# service stop.
+if [ "$SOURCE_BIN" != "$EXPECTED_SOURCE_BIN" ]; then
+  echo "source binary must be the fixed external build-target release output" >&2
+  exit 66
+fi
 if [ ! -d "$OUT" ] || [ -L "$OUT" ] || [ -e "$OUT/path-oracle" ] || [ -e "$OUT/oracle-link" ] || [ -e "$OUT/final-output-comparison" ] || [ -e "$OUT/guard-before" ] || [ -e "$OUT/guard-after" ]; then
   echo "output contract failed" >&2
   exit 30
@@ -181,7 +187,7 @@ if [ ! -f "$LOCK" ] || [ -L "$LOCK" ] || [ ! -x "$PATH_ORACLE_BIN" ] || [ ! -x "
   echo "pre-stop file contract failed" >&2
   exit 31
 fi
-if [ ! -d "$SOURCE_TREE" ] || [ ! -x "$SOURCE_BIN" ] || [ ! -d "$PACKAGE" ] || [ ! -f "$PACKAGE_MANIFEST" ] || [ ! -f "$CASES" ] || [ ! -d "$SOURCE_ORACLE" ] || [ ! -d "$BASELINE_PATH_ORACLE" ] || [ ! -d "$TOKENIZER_ROOT" ] || [ ! -r "$MANIFEST" ]; then
+if [ ! -d "$SOURCE_TREE" ] || [ -L "$SOURCE_TREE" ] || [ ! -d "$BUILD_TARGET" ] || [ -L "$BUILD_TARGET" ] || [ ! -x "$SOURCE_BIN" ] || [ ! -d "$PACKAGE" ] || [ ! -f "$PACKAGE_MANIFEST" ] || [ ! -f "$CASES" ] || [ ! -d "$SOURCE_ORACLE" ] || [ ! -d "$BASELINE_PATH_ORACLE" ] || [ ! -d "$TOKENIZER_ROOT" ] || [ ! -r "$MANIFEST" ]; then
   echo "input contract failed" >&2
   exit 32
 fi

@@ -14,6 +14,9 @@ def test_phase6_window_driver_is_single_use_and_binds_the_exact_path_oracle_metr
     assert "run-aq4-phase3c-r9700-guard.py" in source
     assert "/opt/rocm/bin/amd-smi" in source
     assert "path-oracle-binary-staging" in source
+    assert "EXPECTED_SOURCE_BIN" in source
+    assert "fixed external build-target release output" in source
+    assert '"$SOURCE_TREE"/*' not in source
     assert "stage-aq4-phase6-path-oracle-binary.py" in source
     assert "compare-aq4-phase6-final-output.py" in source
     assert "export-qwen35-aq4-path-oracle.py" in source
