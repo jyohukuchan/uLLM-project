@@ -23,6 +23,7 @@
 - window driverのsource binary contractは、clean source worktree外の固定`uLLM-phase6-build-target/release/ullm-aq4-p2-path-oracle`を明示的に受理する形へ整合させた。これにより、runbookの正確なhandoff commandと「targetをworktree外に置いてclean contractを維持する」設計が一致する。他のbinary pathはstop前に拒否する。
 - さらにdriverが生成するwindow artifactのいずれかが既に存在する場合は、stop前に再実行を拒否する。これによりpre-stop failureを含め、同一`OUT`でのevidence上書きや無承認のsecond windowを防ぐ。rehearsal、baseline、stagingの既存evidenceだけはこの判定から除外する。
 - runbookを`docs/plans/aq4-phase6-gpu-window-runbook-v0.1.md`として追加し、旧Phase 3c v0.7 evidence/runbookを上書きしなかった。
+- `docs/plans/aq4-phase3c-gpu-window-runbook-v0.1.md`にもPhase 6への引き継ぎ節を追加した。既存のlayer 0・10 stage commandを履歴として保持しつつ、Phase 6では同一3 context/17 guard基盤を再利用し、最終hidden/logitのpath-oracle runbookを使うことを明示した。
 
 ### CPU-only準備と検証
 

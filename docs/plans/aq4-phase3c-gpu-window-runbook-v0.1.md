@@ -609,3 +609,9 @@ python3 "$REPO/tools/compare-aq4-layer0-cpu-gpu-stage-stream.py" \
 - staging create/verify failureも「測定無効」である。service停止前ならstopしない。既存staging rootを修復・上書き・hardlink化せず、新規のevidence rootで原因を記録して終了する。
 - health telemetryの一部が取得不能でも設定を変更して補完しない。traceが成功しても、その項目についてH9は判定不能として記録する。単発runの結果だけで決定性・熱相関・他GPU比較を結論づけない。
 - service/systemd/active manifest/P3 harnessを復旧操作の名目で変更しない。failure evidenceとexit codeをjournalに追記して、次の判断をユーザーに委ねる。
+
+## Phase 6 final-output verificationへの引き継ぎ
+
+このrunbookのlayer 0・10 stage traceとその既存evidenceは変更しない。final RMSNorm additive weight修正後のモデル最終hidden/logitを確認するPhase 6では、同じ3 context、R9700-only architecture+ASIC guard、`RuntimeDirectoryPreserve=yes`、既存lockのnon-creating probe、nlink=1 staging、17 required guardを再利用する一方、測定binaryは`ullm-aq4-p2-path-oracle`へ置き換える。
+
+Phase 6の唯一の比較対象は07/14の`0.6151289249025698`を記録したbounded final-logit relative L2であり、`ullm-aq4-differential-trace`の先頭32座標のlayer診断ではない。正確なfixture、30 guardとのsubset contract、root-only rehearsal、single window command、成果物と比較方法は[Phase 6 GPU final-output window runbook](aq4-phase6-gpu-window-runbook-v0.1.md)に固定する。Phase 6には本runbook中の旧trace commandを使わない。
