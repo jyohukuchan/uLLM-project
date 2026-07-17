@@ -114,6 +114,44 @@ The dry-run validates the same_artifact_all_m1 path-oracle mechanics only. It
 does not run a model and does not turn the accepted-risk result into a formal
 P2 approval.
 
+### 4.1 Browser-gate image build and verification
+
+This local rootless-Docker prerequisite is separate from the historical
+CPU-only preparation above. It neither contacts a service nor uses a GPU or
+lock. The browser gates bind-mount only their `.cjs` scripts, so their image
+must provide the `playwright` Node.js package itself. Do not use the historical
+Firecrawl image ID: it identifies an unrelated `firecrawl-playwright-service`
+image.
+
+From the repository root, build the dedicated image before running a browser
+gate:
+
+    docker build --pull=false \
+      --file deploy/openwebui/Dockerfile.browser-gate \
+      --tag ullm/openwebui-browser-gate:playwright-1.58.0 \
+      deploy/openwebui
+    docker image inspect --format '{{.Id}}' \
+      ullm/openwebui-browser-gate:playwright-1.58.0
+
+`Dockerfile.browser-gate` is based on the locally verified
+`mcr.microsoft.com/playwright:v1.58.0-noble` content digest and installs only
+`playwright@1.58.0` globally (without downloading another browser). The build
+recorded for this runbook produced:
+
+    sha256:0bd709ea36ffa7204cd60da0fe9707be38eb73c97c7a9d45911ff0e8b7c1e3ea
+
+Verify the package resolution, then optionally verify the matching Chromium
+binary before proceeding. The second command uses the same arbitrary host UID
+and GID mode used by the gates:
+
+    docker run --rm --entrypoint node \
+      sha256:0bd709ea36ffa7204cd60da0fe9707be38eb73c97c7a9d45911ff0e8b7c1e3ea \
+      -e 'const { chromium } = require("playwright"); console.log("playwright require OK, chromium=" + typeof chromium)'
+
+    docker run --rm --user "$(id -u):$(id -g)" --entrypoint node \
+      sha256:0bd709ea36ffa7204cd60da0fe9707be38eb73c97c7a9d45911ff0e8b7c1e3ea \
+      -e 'const { chromium } = require("playwright"); chromium.launch({headless:true}).then(async browser => { await browser.close(); console.log("chromium launch/close OK"); })'
+
 ## 5. Parent-only initial setup and resident promotion receipt
 
 Run the following as a parent operator. It creates no candidate before real
@@ -144,7 +182,7 @@ update if any of them are no longer locally available.
     SERVICE=ullm-openai.service
     LLAMA_SERVICE=llama-qwen35-udq4.service
     TOKEN_FILE=/etc/ullm/openai-api-key
-    BROWSER_IMAGE=sha256:dbd552f6c831816050a1381a54cdb8d37df56df7f6559c82aba451d2ea93e0aa
+    BROWSER_IMAGE=sha256:0bd709ea36ffa7204cd60da0fe9707be38eb73c97c7a9d45911ff0e8b7c1e3ea
     PROBE_IMAGE=sha256:5dce198cca467ce79994ed65e01d03882238f9efdd16a8c6f4bc55151c8a4a54
     OPENWEBUI_IMAGE=ullm/open-webui@sha256:ef5ae4fbc06abb662eeefe87e584ea7c69e55838f5f08f637057b9108048b409
     GATEWAY_CHECK_IMAGE=ghcr.io/open-webui/open-webui@sha256:a6da0c292081d810a396ce786a10536d0b1b9ba2925dcca20ebb03f9fa90dbff
