@@ -524,6 +524,10 @@ def _run_cases_in_process(
                 "clean_shutdown": True,
                 "stderr_tail": _stderr_tail(stderr),
             }
+        except EvidenceError as error:
+            raise EvidenceError(
+                f"{error}; stderr_tail={_stderr_tail(stderr)!r}"
+            ) from error
         finally:
             if not clean_shutdown and process.poll() is None:
                 process.kill()
