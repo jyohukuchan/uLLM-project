@@ -1,6 +1,6 @@
 # AQ4 fidelity root cause and fix plan v0.1
 
-Status: **根本原因を修正し、CPU-onlyで大幅な改善を確認した。次はGPU再確認(Phase 6)と正式P2 fidelity gate再実行(Phase 7)。**
+Status: **根本原因を修正し、CPU-onlyで大幅な改善を確認した。Phase 6のCPU-only準備（clean source build、nlink=1 staging、同一3-row final-output比較runbook）は完了し、親エージェントによるR9700 guard rehearsalと単発GPU windowを待つ。GPU再確認後に正式P2 fidelity gate（Phase 7）を再実行する。**
 
 2026-07-17、Phase 3c（H5否定）→Phase 3d（全32層+final norm+LM head測定、`layer31→final RMSNorm`で相対L2が3.92倍に急増する境界を特定）→根本原因特定（source Qwen3.5の最終RMSNormは`normalized*(1+weight)`のadditive conventionだが、AQ4側`loader.rs`の`effective_rmsnorm_weight_values`が最終normをこの対象から漏らしていた）を経て、**Path Gの修正を実装しCPU-onlyで検証した**（commit `e992b3ea`,`1ed64022`、journal: `aq4-final-rmsnorm-additive-weight-fix-v0.1.md`）。
 
@@ -411,6 +411,8 @@ Status: **完了**（commit `e992b3ea`,`1ed64022`、実行: `gpt-5.6-terra`/`max
 - GPU/serviceは未使用。
 
 ## Phase 6: GPU差分trace再確認（単発承認window）
+
+Status: **CPU-only準備完了、root-only guard rehearsal / 単発service-stop window待ち**（tooling commit `d3ea48d5`、runbook: [aq4-phase6-gpu-window-runbook-v0.1.md](aq4-phase6-gpu-window-runbook-v0.1.md)）。07/14の`0.6151289249`は`ullm-aq4-p2-path-oracle`のbounded logit sample相対L2最大値であるため、Phase 6では同binaryを唯一のGPU model runとして使う。`ullm-aq4-differential-trace`は同一M=1経路のlayer診断には使えるが、この数値そのものの比較経路ではない。
 
 ### Tasks
 
