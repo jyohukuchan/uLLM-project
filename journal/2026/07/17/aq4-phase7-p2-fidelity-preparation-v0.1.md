@@ -58,6 +58,9 @@ formal holdout 24件は次のとおりである（左からcase ID、case SHA-25
 - `fidelity-capture-binary-staging/ullm-aq4-fidelity-capture`はcontent copyで、SHA-256一致、mode `0555`、`nlink=1`である。receiptと`SHA256SUMS`はmode `0444`、`nlink=1`で検証済みである。
 - host-only R9700 guard binaryは`query-hip-device-identity`へcompileした。実行はしておらず、mode `0775`、`nlink=1`、SHA-256 `e85043b1bc1812a1b0ebcba31fcfa0bff5402be348d713a37f44643d9885175d`である。
 - 新規比較器はtoken agreement、top-k overlap、logits cosine / relative-L2 / max-abs、hidden cosine / relative-L2 / max-abs、固定品質率を全24 holdout rowから計算し、freeze receiptとsource/target/split/identityのhash chainを再検証する。
+- CPU-only source oracleを完走した。`source-oracles/calibration/`は24/24 row、`status=available`、validator `status=valid`、nonfinite 0、`device=cpu`、`dtype=bfloat16`、model load 1回、elapsed `2455.046966970898`秒である。manifest SHA-256は`7a7eb2b71847d186e78f1536fc6c831501fa2bcb86197f39bc465d9035c521ea`、cases SHA-256は`724e4edca267237e81c92de918f8c343253b5b00af9bc3b9c4d9c03232a29135`である。
+- `source-oracles/holdout/`も24/24 row、`status=available`、validator `status=valid`、nonfinite 0、`device=cpu`、`dtype=bfloat16`、model load 1回、elapsed `2727.510046951007`秒である。manifest SHA-256は`2ee2949167d9da2be0e96b0ad8e59be0d55015eb020aaf22f016e52028dd4204`、execution-view cases SHA-256は`20b11edc558599724beee0d97a97a7b7a3f73950537f2ba3849fae19d2c94793`である。
+- 両source artifactで`manifest.json`、`rows.jsonl`、`vectors/hidden.f32le`、`vectors/logits.f32le`の`SHA256SUMS`を独立に再検証して全件一致した。`prepare --verify`、staging `--verify`、`bash -n`、`py_compile`、Phase 7対象pytest 8件も成功した。新規scriptは全てmode `0775`（git executable bit）、host guard binaryは`0775`、staged capture binaryは`0555` / `nlink=1`である。
 
 ### root-only guard rehearsal（親エージェント用）
 
@@ -81,6 +84,6 @@ sudo /home/homelab1/coding-local/ultimateLLM/uLLM-project/tools/run-aq4-phase7-s
 
 ## 次の行動
 
-1. 実行中のCPU BF16 source oracleを完走・validatorで確認し、source artifactのmanifest SHA-256、row数、nonfinite数、runtimeがCPU/BF16であることをjournalへ追記する。
-2. source/oracleとbinary stagingのCPU-only最終検証、script executable bit、test suiteを再確認する。GPU guard rehearsalとservice-stop windowはこのタスクでは実行しない。
-3. 親エージェントは上の3 rehearsalが全てvalidであることを確認してから、single-window commandを一回だけ実行する。旧07/15 splitやP3/Phase 3c/Phase 6の既存window evidenceを再利用・再実行しない。
+1. 親エージェントはproduction serviceを稼働させたまま、上のroot-only rehearsal 3 commandを各一回だけ実行する。3つの`r9700-guard-rehearsal-summary.json`がすべて`status=valid`でなければ停止windowへ進まない。
+2. 3 rehearsal成功後にだけ、上のsingle-window commandを一回だけ実行する。driverはcalibration target 24件をfreezeしてからholdout target 24件を同じstop windowで一回ずつ処理する。
+3. 旧07/15 split、P3 harness、既存Phase 3c/Phase 6 window evidence、`path-oracle-export`を再利用・再実行・修正しない。GPU guard rehearsalとservice-stop windowはこのCPU-only準備タスクでは実行していない。
