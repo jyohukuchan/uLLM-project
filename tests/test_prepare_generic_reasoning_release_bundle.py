@@ -61,6 +61,28 @@ def test_prepare_writes_valid_complete_bundle(tmp_path: Path) -> None:
     assert PREPARER._load_validator().validate(output)["gate_eligible"] is True
 
 
+def test_prepare_accepts_complete_bundle_with_v2_no_switch_browser_evidence(
+    tmp_path: Path,
+) -> None:
+    paths, _unused = inputs(tmp_path)
+    browser = FIXTURES.BROWSER_FIXTURE.evidence()
+    for field in FIXTURES.BROWSER_FIXTURE.TOOL.SWITCH_EVIDENCE_FIELDS:
+        browser.pop(field)
+    browser["provider_request_count"] = 2
+    browser["provider_requests"] = browser["provider_requests"][:2]
+    FIXTURES.write_json(paths["browser_evidence"], browser)
+    FIXTURES.write_json(
+        paths["browser_validator"],
+        FIXTURES.BROWSER_FIXTURE.TOOL.validate(paths["browser_evidence"]),
+    )
+    output = tmp_path / "bundle.json"
+
+    document = PREPARER.prepare(**paths, output=output, status="complete")
+
+    assert document["status"] == "complete"
+    assert PREPARER._load_validator().validate(output)["gate_eligible"] is True
+
+
 def test_prepare_incomplete_status_preserves_gate_failure(tmp_path: Path) -> None:
     paths, _unused = inputs(tmp_path)
     output = tmp_path / "bundle.json"

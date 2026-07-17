@@ -44,6 +44,14 @@ CONTAINER_USER_RE = re.compile(r"[0-9]{1,5}:[0-9]{1,5}\Z")
 _VALIDATOR_MODULE_NAME = "_ullm_openwebui_reasoning_browser_validator"
 _SERVED_MODEL_MODULE_NAME = "_ullm_reasoning_browser_served_model_validator"
 TARGET_GPU_INDEX = "1"
+SWITCH_EVIDENCE_FIELDS = {
+    "provider_switch_performed",
+    "provider_switch_model_id_sha256",
+    "provider_switch_answer",
+    "provider_return_performed",
+    "provider_return_model_id_sha256",
+    "provider_return_answer",
+}
 
 
 class SmokeError(RuntimeError):
@@ -172,8 +180,8 @@ def _strict_json(raw: bytes) -> dict[str, Any]:
 
 def _provider_hashes(document: dict[str, Any]) -> list[str]:
     requests = document.get("provider_requests")
-    if not isinstance(requests, list) or len(requests) != 4:
-        raise SmokeError("v2 browser evidence does not contain four provider requests")
+    if not isinstance(requests, list) or not 2 <= len(requests) <= 4:
+        raise SmokeError("v2 browser evidence has an invalid provider request count")
     hashes: list[str] = []
     for index, request in enumerate(requests):
         if not isinstance(request, dict) or not isinstance(
@@ -212,19 +220,25 @@ def _bind_model_identity(
     document: dict[str, Any],
     *,
     model_id: str,
-    switch_model_id: str,
+    switch_model_id: str | None,
 ) -> None:
     expected = _sha256(model_id.encode("utf-8"))
-    switch_expected = _sha256(switch_model_id.encode("utf-8"))
     if document.get("schema_version") != "ullm.openwebui.reasoning_browser_smoke.v2":
         raise SmokeError("browser evidence is not the v2 schema")
     if document.get("model_id_sha256") != expected:
         raise SmokeError("browser evidence primary model identity differs")
+    hashes = _provider_hashes(document)
+    if switch_model_id is None:
+        if set(document) & SWITCH_EVIDENCE_FIELDS:
+            raise SmokeError("browser evidence unexpectedly contains a provider switch")
+        if hashes != [expected, expected]:
+            raise SmokeError("browser provider request model sequence differs")
+        return
+    switch_expected = _sha256(switch_model_id.encode("utf-8"))
     if document.get("provider_switch_model_id_sha256") != switch_expected:
         raise SmokeError("browser evidence switch model identity differs")
     if document.get("provider_return_model_id_sha256") != expected:
         raise SmokeError("browser evidence return model identity differs")
-    hashes = _provider_hashes(document)
     if hashes[:2] != [expected, expected] or hashes[2:] != [switch_expected, expected]:
         raise SmokeError("browser provider request model sequence differs")
 
@@ -530,8 +544,8 @@ def execute(
     openwebui_url: str,
     model_id: str,
     model_name: str,
-    switch_model_id: str,
-    switch_model_name: str,
+    switch_model_id: str | None = None,
+    switch_model_name: str | None = None,
     browser_script: Path = DEFAULT_SCRIPT,
     docker: str = "docker",
     timeout_seconds: float = 900.0,
@@ -553,10 +567,16 @@ def execute(
     image = _validate_image(browser_image)
     model_id = _validate_public_text(model_id, "model ID")
     model_name = _validate_public_text(model_name, "model name")
-    switch_model_id = _validate_public_text(switch_model_id, "switch model ID")
-    switch_model_name = _validate_public_text(switch_model_name, "switch model name")
-    if model_id == switch_model_id:
-        raise SmokeError("switch model ID must differ from the candidate model ID")
+    if (switch_model_id is None) != (switch_model_name is None):
+        raise SmokeError("switch model ID and name must be supplied together")
+    switch_requested = switch_model_id is not None
+    if switch_requested:
+        switch_model_id = _validate_public_text(switch_model_id, "switch model ID")
+        switch_model_name = _validate_public_text(switch_model_name, "switch model name")
+        if model_id == switch_model_id:
+            raise SmokeError("switch model ID must differ from the candidate model ID")
+    if alternate_r9700_services and not switch_requested:
+        raise SmokeError("alternate R9700 services require a switch model")
     container_user = browser_user or f"{os.geteuid()}:{os.getegid()}"
     container_uid, container_gid = _validate_container_user(container_user)
     del token, script
@@ -608,11 +628,16 @@ def execute(
         f"ULLM_MODEL_ID={model_id}",
         "--env",
         f"ULLM_MODEL_NAME={model_name}",
-        "--env",
-        f"OPENWEBUI_SWITCH_MODEL_ID={switch_model_id}",
-        "--env",
-        f"OPENWEBUI_SWITCH_MODEL_NAME={switch_model_name}",
     ]
+    if switch_requested:
+        command.extend(
+            [
+                "--env",
+                f"OPENWEBUI_SWITCH_MODEL_ID={switch_model_id}",
+                "--env",
+                f"OPENWEBUI_SWITCH_MODEL_NAME={switch_model_name}",
+            ]
+        )
     if control_server is not None:
         command.extend(
             [
@@ -717,8 +742,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--openwebui-url", required=True)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--model-name", required=True)
-    parser.add_argument("--switch-model-id", required=True)
-    parser.add_argument("--switch-model-name", required=True)
+    parser.add_argument("--switch-model-id")
+    parser.add_argument("--switch-model-name")
     parser.add_argument("--browser-script", type=Path, default=DEFAULT_SCRIPT)
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--timeout-seconds", type=float, default=900.0)

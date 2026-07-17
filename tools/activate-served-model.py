@@ -33,6 +33,10 @@ RESULT_SCHEMA = "ullm.served_model.activation.v1"
 _VALIDATOR_MODULE_NAME = "_ullm_served_model_activation_validator"
 _BUNDLE_VALIDATOR_MODULE_NAME = "_ullm_release_bundle_activation_validator"
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
+BOOTSTRAP_AUTHORIZATION_SCHEMA = (
+    "ullm.served_model.v2_differing_worker_bootstrap_authorization.v1"
+)
+MAX_AUTHORIZATION_NOTE_BYTES = 4_096
 
 
 class ActivationError(RuntimeError):
@@ -372,6 +376,90 @@ def _write_bootstrap_backup(path: Path, raw: bytes) -> None:
         os.close(descriptor)
 
 
+def _validate_authorization_note(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ActivationError(
+            "differing-worker v2 bootstrap authorization requires a non-empty authorization note"
+        )
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ActivationError("authorization note is not valid UTF-8") from error
+    if (
+        len(encoded) > MAX_AUTHORIZATION_NOTE_BYTES
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise ActivationError("authorization note is invalid")
+    return value
+
+
+def _bootstrap_authorization_metadata_path(backup: Path) -> Path:
+    return backup.with_name(f"{backup.name}.authorization.json")
+
+
+def _write_bootstrap_authorization_metadata(path: Path, document: dict[str, str]) -> None:
+    """Write a root-only audit sidecar paired with a bootstrap backup."""
+
+    if not path.is_absolute():
+        raise ActivationError("bootstrap authorization metadata path must be absolute")
+    _reject_symlink_components(
+        path, "bootstrap authorization metadata", leaf_may_absent=True
+    )
+    parent = path.parent
+    try:
+        metadata = parent.stat()
+    except OSError as error:
+        raise ActivationError(
+            "bootstrap authorization metadata directory is unavailable"
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & stat.S_IWOTH:
+        raise ActivationError("bootstrap authorization metadata directory is unsafe")
+    if path.exists() or path.is_symlink():
+        raise ActivationError(
+            "bootstrap authorization metadata already exists or is a symlink"
+        )
+    raw = (
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    descriptor, temporary_raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
+    temporary: Path | None = Path(temporary_raw)
+    published = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ActivationError("bootstrap authorization metadata write failed")
+            view = view[written:]
+        os.fsync(descriptor)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise ActivationError(
+                "bootstrap authorization metadata already exists or is a symlink"
+            ) from error
+        published = True
+        temporary.unlink()
+        temporary = None
+        _fsync_directory(parent)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if published:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(descriptor)
+
+
 def _require_inactive_services(services: Sequence[str]) -> None:
     if not services:
         raise ActivationError("v2 bootstrap requires explicit inactive services")
@@ -475,8 +563,17 @@ def activate(
     bootstrap_v2: bool = False,
     bootstrap_backup: Path | None = None,
     require_inactive_services: Sequence[str] = (),
+    authorize_differing_worker_v2_bootstrap: bool = False,
+    authorization_note: str | None = None,
 ) -> ActivationResult:
-    """Activate a candidate and restore the prior manifest on any later failure."""
+    """Activate a candidate and restore the prior manifest on any later failure.
+
+    An explicitly authorized differing-worker v2 bootstrap is only a temporary
+    candidate-active transition for collecting soak, stop, failure, and browser
+    evidence.  After collection, the caller must restore the original active
+    bytes and make the final change through ordinary bundle-gated activation;
+    this route is never production approval.
+    """
 
     if command_timeout_seconds <= 0:
         raise ActivationError("command timeout must be positive")
@@ -490,6 +587,16 @@ def activate(
         )
     ):
         raise ActivationError("activation command count exceeds the limit")
+    if authorize_differing_worker_v2_bootstrap:
+        if not bootstrap_v2:
+            raise ActivationError(
+                "differing-worker v2 bootstrap authorization requires --bootstrap-v2"
+            )
+        authorization_note = _validate_authorization_note(authorization_note)
+    elif authorization_note is not None:
+        raise ActivationError(
+            "authorization note requires differing-worker v2 bootstrap authorization"
+        )
 
     directory = _safe_activation_directory(active)
     normalized_active = directory / active.name
@@ -508,6 +615,9 @@ def activate(
     staged: Path | None = None
     backup: Path | None = None
     bootstrap_backup_written = False
+    bootstrap_authorization_metadata_path: Path | None = None
+    bootstrap_authorization_metadata: dict[str, str] | None = None
+    bootstrap_authorization_metadata_written = False
     switched = False
     try:
         try:
@@ -583,17 +693,60 @@ def activate(
                         raise ActivationError(
                             "v2 bootstrap candidate model differs from active model"
                         )
-                    if old_summary.get("worker", {}).get(
+                    old_worker_sha256 = old_summary.get("worker", {}).get(
                         "binary_sha256"
-                    ) != summary.get("worker", {}).get("binary_sha256"):
-                        raise ActivationError(
-                            "v2 bootstrap candidate worker differs from active worker"
+                    )
+                    candidate_worker_sha256 = summary.get("worker", {}).get(
+                        "binary_sha256"
+                    )
+                    if old_worker_sha256 != candidate_worker_sha256:
+                        if not authorize_differing_worker_v2_bootstrap:
+                            raise ActivationError(
+                                "v2 bootstrap candidate worker differs from active worker"
+                            )
+                        assert authorization_note is not None
+                        bootstrap_authorization_metadata_path = (
+                            _bootstrap_authorization_metadata_path(bootstrap_backup)
                         )
+                        bootstrap_authorization_metadata = {
+                            "schema_version": BOOTSTRAP_AUTHORIZATION_SCHEMA,
+                            "authorization_note": authorization_note,
+                            "purpose": "temporary_candidate_active_evidence_collection_only",
+                            "required_follow_up": (
+                                "restore original active bytes, then use ordinary "
+                                "bundle-gated activation"
+                            ),
+                            "active_manifest_sha256": hashlib.sha256(
+                                active_raw
+                            ).hexdigest(),
+                            "candidate_manifest_sha256": str(
+                                summary["manifest_sha256"]
+                            ),
+                            "active_worker_binary_sha256": str(old_worker_sha256),
+                            "candidate_worker_binary_sha256": str(
+                                candidate_worker_sha256
+                            ),
+                        }
+                    elif authorize_differing_worker_v2_bootstrap:
+                        raise ActivationError(
+                            "differing-worker v2 bootstrap authorization requires a different active worker"
+                        )
+                elif authorize_differing_worker_v2_bootstrap:
+                    raise ActivationError(
+                        "differing-worker v2 bootstrap authorization requires a v2 active manifest"
+                    )
                 _hash_safe_file(systemd_unit, "bootstrap systemd unit")
                 _hash_safe_file(environment_file, "bootstrap environment file")
                 _require_inactive_services(require_inactive_services)
                 _write_bootstrap_backup(bootstrap_backup, active_raw)
                 bootstrap_backup_written = True
+                if bootstrap_authorization_metadata_path is not None:
+                    assert bootstrap_authorization_metadata is not None
+                    _write_bootstrap_authorization_metadata(
+                        bootstrap_authorization_metadata_path,
+                        bootstrap_authorization_metadata,
+                    )
+                    bootstrap_authorization_metadata_written = True
             else:
                 if bootstrap_v2:
                     raise ActivationError(
@@ -607,7 +760,13 @@ def activate(
                     systemd_unit=systemd_unit,
                     environment_file=environment_file,
                 )
-        elif bootstrap_v2 or bootstrap_backup is not None or require_inactive_services:
+        elif (
+            bootstrap_v2
+            or bootstrap_backup is not None
+            or require_inactive_services
+            or authorize_differing_worker_v2_bootstrap
+            or authorization_note is not None
+        ):
             raise ActivationError("v2 bootstrap options require a v2 candidate")
 
         backup = _snapshot_active(normalized_active, directory)
@@ -660,6 +819,14 @@ def activate(
                 bootstrap_backup.unlink(missing_ok=True)
             except OSError:
                 pass
+            if (
+                bootstrap_authorization_metadata_written
+                and bootstrap_authorization_metadata_path is not None
+            ):
+                try:
+                    bootstrap_authorization_metadata_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
         if isinstance(error, ActivationError):
@@ -697,6 +864,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="allow an explicitly temporary v1/v2-to-v2 candidate switch before the complete release bundle exists",
     )
+    parser.add_argument(
+        "--authorize-differing-worker-v2-bootstrap",
+        action="store_true",
+        help=(
+            "allow only a temporary v2-to-v2 differing-worker evidence switch; "
+            "requires --bootstrap-v2 and --authorization-note"
+        ),
+    )
+    parser.add_argument("--authorization-note", metavar="TEXT")
     parser.add_argument("--bootstrap-backup", type=Path)
     parser.add_argument("--require-inactive-service", action="append", default=[])
     parser.add_argument(
@@ -732,6 +908,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_v2=args.bootstrap_v2,
             bootstrap_backup=args.bootstrap_backup,
             require_inactive_services=args.require_inactive_service,
+            authorize_differing_worker_v2_bootstrap=(
+                args.authorize_differing_worker_v2_bootstrap
+            ),
+            authorization_note=args.authorization_note,
         )
     except Exception:
         # Commands and manifests can contain deployment paths or secrets. Keep

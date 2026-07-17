@@ -59,6 +59,15 @@ def evidence() -> dict:
     }
 
 
+def no_switch_evidence() -> dict:
+    value = evidence()
+    for field in TOOL.SWITCH_EVIDENCE_FIELDS:
+        value.pop(field)
+    value["provider_request_count"] = 2
+    value["provider_requests"] = value["provider_requests"][:2]
+    return value
+
+
 def test_validator_accepts_hash_only_browser_gate(tmp_path: Path) -> None:
     path = tmp_path / "browser.json"
     path.write_text(json.dumps(evidence()), encoding="ascii")
@@ -67,6 +76,18 @@ def test_validator_accepts_hash_only_browser_gate(tmp_path: Path) -> None:
 
     assert report["structurally_valid"] is True
     assert report["gate_eligible"] is True
+
+
+def test_validator_accepts_v2_browser_gate_without_a_switch_cycle(tmp_path: Path) -> None:
+    path = tmp_path / "browser.json"
+    path.write_text(json.dumps(no_switch_evidence()), encoding="ascii")
+
+    report = TOOL.validate(path)
+
+    assert report["input_schema_version"] == TOOL.SCHEMA_VERSION
+    assert report["structurally_valid"] is True
+    assert report["gate_eligible"] is True
+    assert report["provider_request_count"] == 2
 
 
 @pytest.mark.parametrize(

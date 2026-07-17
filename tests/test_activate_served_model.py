@@ -67,6 +67,27 @@ def v2_activation_directory(tmp_path: Path) -> tuple[Path, Path]:
     return root, candidate
 
 
+def differing_worker_v2_manifests(tmp_path: Path) -> tuple[Path, Path, Path, bytes]:
+    root, candidate = v2_activation_directory(tmp_path)
+    active = root / "active.json"
+    old = json.loads(candidate.read_text(encoding="ascii"))
+    old["promotion"]["source_commit"] = "2" * 40
+    active.write_text(json.dumps(old), encoding="ascii")
+    old_raw = active.read_bytes()
+
+    replacement_worker = root / "worker-new"
+    replacement_worker.write_bytes(b"different-worker\n")
+    replacement_worker.chmod(0o755)
+    new = json.loads(candidate.read_text(encoding="ascii"))
+    new["promotion"]["source_commit"] = "3" * 40
+    new["worker"]["binary"] = replacement_worker.name
+    new["worker"]["binary_sha256"] = hashlib.sha256(
+        replacement_worker.read_bytes()
+    ).hexdigest()
+    candidate.write_text(json.dumps(new), encoding="ascii")
+    return root, candidate, active, old_raw
+
+
 def command(script: str, *arguments: Path | str) -> tuple[str, ...]:
     return (sys.executable, "-c", script, *(os.fspath(value) for value in arguments))
 
@@ -186,6 +207,137 @@ def test_v2_bootstrap_can_temporarily_switch_between_same_worker_v2_manifests(
         json.loads(backup.read_text(encoding="ascii"))["promotion"]["source_commit"]
         == "2" * 40
     )
+
+
+def test_v2_bootstrap_rejects_differing_worker_without_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, candidate, active, old_raw = differing_worker_v2_manifests(tmp_path)
+    unit = root / "ullm-openai.service"
+    environment = root / "ullm-openai.env"
+    unit.write_bytes(b"[Service]\nExecStart=/usr/bin/ullm\n")
+    environment.write_bytes(b"ULLM_TEST=1\n")
+    backup = root / "previous-active.json"
+    monkeypatch.setattr(ACTIVATOR, "_require_inactive_services", lambda _services: None)
+
+    with pytest.raises(
+        ACTIVATOR.ActivationError,
+        match="v2 bootstrap candidate worker differs from active worker",
+    ):
+        ACTIVATOR.activate(
+            candidate,
+            active,
+            bootstrap_v2=True,
+            bootstrap_backup=backup,
+            systemd_unit=unit,
+            environment_file=environment,
+            require_inactive_services=("ullm-openai.service",),
+        )
+
+    assert active.read_bytes() == old_raw
+    assert not backup.exists()
+
+
+def test_v2_bootstrap_authorizes_differing_worker_without_weakening_safety_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, candidate, active, old_raw = differing_worker_v2_manifests(tmp_path)
+    unit = root / "ullm-openai.service"
+    environment = root / "ullm-openai.env"
+    unit.write_bytes(b"[Service]\nExecStart=/usr/bin/ullm\n")
+    environment.write_bytes(b"ULLM_TEST=1\n")
+    backup = root / "previous-active.json"
+    hash_labels: list[str] = []
+    snapshot_paths: list[Path] = []
+    original_hash = ACTIVATOR._hash_safe_file
+    original_snapshot = ACTIVATOR._snapshot_active
+
+    def record_hash(path: Path, label: str) -> str:
+        hash_labels.append(label)
+        return original_hash(path, label)
+
+    def record_snapshot(path: Path, directory: Path) -> Path | None:
+        snapshot_paths.append(path)
+        return original_snapshot(path, directory)
+
+    monkeypatch.setattr(ACTIVATOR, "_hash_safe_file", record_hash)
+    monkeypatch.setattr(ACTIVATOR, "_snapshot_active", record_snapshot)
+    monkeypatch.setattr(ACTIVATOR, "_require_inactive_services", lambda _services: None)
+    result = ACTIVATOR.activate(
+        candidate,
+        active,
+        bootstrap_v2=True,
+        bootstrap_backup=backup,
+        systemd_unit=unit,
+        environment_file=environment,
+        require_inactive_services=("ullm-openai.service",),
+        authorize_differing_worker_v2_bootstrap=True,
+        authorization_note="temporary candidate-active browser and gate evidence",
+    )
+
+    metadata_path = root / "previous-active.json.authorization.json"
+    metadata = json.loads(metadata_path.read_text(encoding="ascii"))
+    assert result.manifest_sha256 == hashlib.sha256(candidate.read_bytes()).hexdigest()
+    assert active.read_bytes() == candidate.read_bytes()
+    assert backup.read_bytes() == old_raw
+    assert snapshot_paths == [active]
+    assert hash_labels == ["bootstrap systemd unit", "bootstrap environment file"]
+    assert metadata["schema_version"] == ACTIVATOR.BOOTSTRAP_AUTHORIZATION_SCHEMA
+    assert metadata["authorization_note"] == (
+        "temporary candidate-active browser and gate evidence"
+    )
+    assert metadata["active_manifest_sha256"] == hashlib.sha256(old_raw).hexdigest()
+    assert metadata["candidate_manifest_sha256"] == result.manifest_sha256
+    assert stat.S_IMODE(metadata_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("note", [None, "", " \t "])
+def test_v2_bootstrap_differing_worker_authorization_requires_a_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, note: str | None
+) -> None:
+    root, candidate, active, old_raw = differing_worker_v2_manifests(tmp_path)
+    unit = root / "ullm-openai.service"
+    environment = root / "ullm-openai.env"
+    unit.write_bytes(b"[Service]\nExecStart=/usr/bin/ullm\n")
+    environment.write_bytes(b"ULLM_TEST=1\n")
+    backup = root / "previous-active.json"
+    monkeypatch.setattr(ACTIVATOR, "_require_inactive_services", lambda _services: None)
+
+    with pytest.raises(ACTIVATOR.ActivationError, match="authorization note"):
+        ACTIVATOR.activate(
+            candidate,
+            active,
+            bootstrap_v2=True,
+            bootstrap_backup=backup,
+            systemd_unit=unit,
+            environment_file=environment,
+            require_inactive_services=("ullm-openai.service",),
+            authorize_differing_worker_v2_bootstrap=True,
+            authorization_note=note,
+        )
+
+    assert active.read_bytes() == old_raw
+    assert not backup.exists()
+
+
+def test_v2_bootstrap_differing_worker_authorization_cli_requires_a_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = ACTIVATOR.main(
+        [
+            "--candidate",
+            str(tmp_path / "candidate.json"),
+            "--active-manifest",
+            str(tmp_path / "active.json"),
+            "--bootstrap-v2",
+            "--authorize-differing-worker-v2-bootstrap",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "served-model activation failed\n"
 
 
 def test_v2_activation_binds_bundle_and_rollback_identity(

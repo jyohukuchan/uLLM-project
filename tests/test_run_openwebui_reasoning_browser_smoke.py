@@ -30,9 +30,8 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def evidence(model_id: str, switch_model_id: str) -> dict:
+def evidence(model_id: str, switch_model_id: str | None = None) -> dict:
     primary = digest(model_id)
-    switched = digest(switch_model_id)
 
     def request(model_hash: str, suffix: str) -> dict:
         return {
@@ -43,30 +42,42 @@ def evidence(model_id: str, switch_model_id: str) -> dict:
             "assistant_has_reasoning_content": False,
         }
 
-    return {
+    result = {
         "schema_version": "ullm.openwebui.reasoning_browser_smoke.v2",
         "model_id_sha256": primary,
         "first_answer": {"utf8_bytes": 20, "sha256": "c" * 64},
         "expanded_view": {"utf8_bytes": 40, "sha256": "f" * 64},
         "second_answer": {"utf8_bytes": 21, "sha256": "d" * 64},
-        "provider_switch_performed": True,
-        "provider_switch_model_id_sha256": switched,
-        "provider_switch_answer": {"utf8_bytes": 22, "sha256": "3" * 64},
-        "provider_return_performed": True,
-        "provider_return_model_id_sha256": primary,
-        "provider_return_answer": {"utf8_bytes": 23, "sha256": "6" * 64},
         "reasoning_details_expanded": True,
-        "provider_request_count": 4,
+        "provider_request_count": 2,
         "provider_requests": [
             request(primary, "one"),
             request(primary, "two"),
-            request(switched, "three"),
-            request(primary, "four"),
         ],
         "hidden_reasoning_reinserted": False,
         "page_error_count": 0,
         "page_error_digests": [],
     }
+    if switch_model_id is not None:
+        switched = digest(switch_model_id)
+        result.update(
+            {
+                "provider_switch_performed": True,
+                "provider_switch_model_id_sha256": switched,
+                "provider_switch_answer": {"utf8_bytes": 22, "sha256": "3" * 64},
+                "provider_return_performed": True,
+                "provider_return_model_id_sha256": primary,
+                "provider_return_answer": {"utf8_bytes": 23, "sha256": "6" * 64},
+                "provider_request_count": 4,
+                "provider_requests": [
+                    request(primary, "one"),
+                    request(primary, "two"),
+                    request(switched, "three"),
+                    request(primary, "four"),
+                ],
+            }
+        )
+    return result
 
 
 class FakeProcess:
@@ -127,6 +138,71 @@ def test_runner_publishes_valid_hash_only_evidence_and_binds_command(
     assert "NODE_PATH=/usr/src/app/node_modules" in commands[0]
     assert f"ULLM_MODEL_ID={model_id}" in commands[0]
     assert f"OPENWEBUI_SWITCH_MODEL_ID={switch_model_id}" in commands[0]
+
+
+def test_runner_publishes_gate_eligible_evidence_without_a_provider_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("secret-token\n", encoding="ascii")
+    script = tmp_path / "smoke.cjs"
+    script.write_text("console.log('{}')\n", encoding="ascii")
+    output = tmp_path / "browser.json"
+    model_id = "ullm-qwen3.5-9b-aq4"
+    payload = (json.dumps(evidence(model_id)) + "\n").encode("ascii")
+    commands: list[list[str]] = []
+
+    def fake_popen(command, *, stdout, **kwargs):
+        del kwargs
+        commands.append(command)
+        return FakeProcess(stdout, payload)
+
+    monkeypatch.setattr(TOOL.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        TOOL,
+        "_validate_manifest_identity",
+        lambda _path, _model: {"manifest_sha256": "m" * 64},
+    )
+    result = TOOL.execute(
+        output=output,
+        manifest=tmp_path / "manifest.json",
+        token_file=token,
+        browser_image="sha256:" + "a" * 64,
+        openwebui_url="http://127.0.0.1:3000/",
+        model_id=model_id,
+        model_name="uLLM Qwen3.5 9B AQ4",
+        browser_script=script,
+    )
+
+    document = json.loads(output.read_text(encoding="ascii"))
+    assert result["provider_request_count"] == 2
+    assert TOOL._load_validator().validate(output)["gate_eligible"] is True
+    assert not (set(document) & TOOL.SWITCH_EVIDENCE_FIELDS)
+    assert all("OPENWEBUI_SWITCH_MODEL_" not in part for part in commands[0])
+
+
+def test_runner_cli_allows_switch_arguments_to_be_omitted(tmp_path: Path) -> None:
+    args = TOOL.parse_args(
+        [
+            "--output",
+            str(tmp_path / "browser.json"),
+            "--manifest",
+            str(tmp_path / "active.json"),
+            "--token-file",
+            str(tmp_path / "token"),
+            "--browser-image",
+            "sha256:" + "a" * 64,
+            "--openwebui-url",
+            "http://127.0.0.1:3000/",
+            "--model-id",
+            "ullm-qwen3.5-9b-aq4",
+            "--model-name",
+            "uLLM Qwen3.5 9B AQ4",
+        ]
+    )
+
+    assert args.switch_model_id is None
+    assert args.switch_model_name is None
 
 
 def test_runner_rejects_external_model_binding_mismatch(

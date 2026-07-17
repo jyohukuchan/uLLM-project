@@ -96,13 +96,15 @@ The browser-side Phase 5 smoke is
 and boolean state, and must be run only after a v2 candidate is configured.
 The checked-in runner `tools/run-openwebui-reasoning-browser-smoke.py` requires
 the served-model manifest, rejects an active v1 manifest before starting a
-browser, binds the candidate and comparison model IDs, validates the v2 record,
-and atomically publishes only gate-eligible hash-only output.
+browser, binds the candidate model ID (and a comparison model ID only when a
+switch cycle is requested), validates the v2 record, and atomically publishes
+only gate-eligible hash-only output.
 Its current evidence schema is
 `ullm.openwebui.reasoning_browser_smoke.v2`; v2 records the model hash for
-each provider request. Existing evidence also contains a uLLM → llama.cpp →
-uLLM switch cycle, but llama.cpp comparison and provider switching are not
-required release gates after the 2026-07-14 user decision.
+each provider request. A no-switch v2 record has two candidate-model requests
+and omits switch-specific fields. Existing evidence also contains a uLLM →
+llama.cpp → uLLM switch cycle, but llama.cpp comparison and provider switching
+are not required release gates after the 2026-07-14 user decision.
 The validator retains read compatibility with the earlier v1 hash-only record.
 The `expanded_view` field is a hash and byte count of the expanded assistant
 view; it is required to be larger than the answer-only view without retaining

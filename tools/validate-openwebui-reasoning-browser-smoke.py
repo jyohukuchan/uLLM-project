@@ -30,6 +30,14 @@ FORBIDDEN_KEYS = {
     "raw",
     "screenshot",
 }
+SWITCH_EVIDENCE_FIELDS = {
+    "provider_switch_performed",
+    "provider_switch_model_id_sha256",
+    "provider_switch_answer",
+    "provider_return_performed",
+    "provider_return_model_id_sha256",
+    "provider_return_answer",
+}
 
 
 class ValidationError(ValueError):
@@ -136,19 +144,16 @@ def validate(path: Path) -> dict[str, Any]:
         "page_error_count",
         "page_error_digests",
     }
-    expected_v2 = expected_v1 | {
-        "provider_switch_performed",
-        "provider_switch_model_id_sha256",
-        "provider_switch_answer",
-        "provider_return_performed",
-        "provider_return_model_id_sha256",
-        "provider_return_answer",
-    }
     version = document.get("schema_version")
+    switch_cycle = False
     if version == SCHEMA_VERSION_V1:
         expected = expected_v1
     elif version == SCHEMA_VERSION:
-        expected = expected_v2
+        switch_fields = set(document) & SWITCH_EVIDENCE_FIELDS
+        if switch_fields and switch_fields != SWITCH_EVIDENCE_FIELDS:
+            raise ValidationError("browser evidence switch fields differ")
+        switch_cycle = bool(switch_fields)
+        expected = expected_v1 | switch_fields
     else:
         expected = set()
     if set(document) != expected:
@@ -173,35 +178,50 @@ def validate(path: Path) -> dict[str, Any]:
     for index, request in enumerate(requests):
         _request(request, index, version=version)
     if version == SCHEMA_VERSION:
-        if document["provider_switch_performed"] is not True:
-            raise ValidationError("provider switch was not performed")
-        _hash(
-            document["provider_switch_model_id_sha256"],
-            "provider_switch_model_id_sha256",
-        )
-        _text_evidence(document["provider_switch_answer"], "provider_switch_answer")
-        if document["provider_switch_model_id_sha256"] == document["model_id_sha256"]:
-            raise ValidationError("provider switch model is not distinct")
-        if document["provider_return_performed"] is not True:
-            raise ValidationError("provider return was not performed")
-        _hash(
-            document["provider_return_model_id_sha256"],
-            "provider_return_model_id_sha256",
-        )
-        _text_evidence(document["provider_return_answer"], "provider_return_answer")
-        if len(requests) < 4:
-            raise ValidationError("provider switch request is missing")
-        if any(
-            request["model_id_sha256"] != document["model_id_sha256"]
-            for request in requests[:2]
-        ):
-            raise ValidationError("initial provider request model differs")
-        if requests[-2]["model_id_sha256"] != document["provider_switch_model_id_sha256"]:
-            raise ValidationError("provider switch request model differs")
-        if requests[-1]["model_id_sha256"] == requests[-2]["model_id_sha256"]:
-            raise ValidationError("provider return request model is not distinct")
-        if requests[-1]["model_id_sha256"] != document["provider_return_model_id_sha256"]:
-            raise ValidationError("provider return request model differs")
+        if switch_cycle:
+            if document["provider_switch_performed"] is not True:
+                raise ValidationError("provider switch was not performed")
+            _hash(
+                document["provider_switch_model_id_sha256"],
+                "provider_switch_model_id_sha256",
+            )
+            _text_evidence(document["provider_switch_answer"], "provider_switch_answer")
+            if document["provider_switch_model_id_sha256"] == document["model_id_sha256"]:
+                raise ValidationError("provider switch model is not distinct")
+            if document["provider_return_performed"] is not True:
+                raise ValidationError("provider return was not performed")
+            _hash(
+                document["provider_return_model_id_sha256"],
+                "provider_return_model_id_sha256",
+            )
+            _text_evidence(document["provider_return_answer"], "provider_return_answer")
+            if len(requests) < 4:
+                raise ValidationError("provider switch request is missing")
+            if any(
+                request["model_id_sha256"] != document["model_id_sha256"]
+                for request in requests[:2]
+            ):
+                raise ValidationError("initial provider request model differs")
+            if (
+                requests[-2]["model_id_sha256"]
+                != document["provider_switch_model_id_sha256"]
+            ):
+                raise ValidationError("provider switch request model differs")
+            if requests[-1]["model_id_sha256"] == requests[-2]["model_id_sha256"]:
+                raise ValidationError("provider return request model is not distinct")
+            if (
+                requests[-1]["model_id_sha256"]
+                != document["provider_return_model_id_sha256"]
+            ):
+                raise ValidationError("provider return request model differs")
+        else:
+            if len(requests) != 2:
+                raise ValidationError("v2 no-switch evidence must contain two provider requests")
+            if any(
+                request["model_id_sha256"] != document["model_id_sha256"]
+                for request in requests
+            ):
+                raise ValidationError("v2 no-switch provider request model differs")
     if document["hidden_reasoning_reinserted"] is not False:
         raise ValidationError("hidden reasoning was reinserted")
     _integer(document["page_error_count"], "page_error_count", maximum=0)

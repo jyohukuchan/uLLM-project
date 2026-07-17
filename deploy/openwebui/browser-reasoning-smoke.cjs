@@ -8,11 +8,9 @@ const SUMMARY_SCHEMA = "ullm.openwebui.reasoning_browser_smoke.v2";
 const BASE_URL = process.env.OPENWEBUI_URL || "http://192.168.0.66:3000";
 const MODEL_ID = process.env.ULLM_MODEL_ID || "ullm-qwen3.5-9b-aq4";
 const MODEL_LABEL = process.env.ULLM_MODEL_NAME || "uLLM Qwen3.5 9B AQ4";
-const SWITCH_MODEL_ID =
-  process.env.OPENWEBUI_SWITCH_MODEL_ID || "llama-qwen3.5-9b-ud-q4";
-const SWITCH_MODEL_LABEL =
-  process.env.OPENWEBUI_SWITCH_MODEL_NAME ||
-  "llama.cpp Qwen3.5 9B UD-Q4_K_XL";
+const SWITCH_MODEL_ID = process.env.OPENWEBUI_SWITCH_MODEL_ID || "";
+const SWITCH_MODEL_LABEL = process.env.OPENWEBUI_SWITCH_MODEL_NAME || "";
+const SWITCH_ENABLED = Boolean(SWITCH_MODEL_ID || SWITCH_MODEL_LABEL);
 const TOKEN_FILE = process.env.OPENWEBUI_TOKEN_FILE || "/run/secrets/openwebui-token";
 const FIRST_MARKER = process.env.OPENWEBUI_REASONING_ANSWER || "REASONING_BROWSER_OK";
 const SECOND_MARKER =
@@ -39,6 +37,7 @@ const TOGGLE_SELECTOR = "div.w-fit.text-gray-500";
 const RESPONSE_TIMEOUT_MS = 120_000;
 const NAVIGATION_TIMEOUT_MS = 60_000;
 const MAX_POST_DATA_BYTES = 2 * 1024 * 1024;
+const MAX_PROVIDER_REQUESTS = SWITCH_ENABLED ? 4 : 2;
 const TRANSITION_SOCKET = process.env.OPENWEBUI_TRANSITION_SOCKET || "";
 
 function sha256(value) {
@@ -214,7 +213,10 @@ async function waitForHostTransition(phase) {
 async function run(browser) {
   const baseUrl = normalizedBaseUrl(BASE_URL);
   const token = strictToken(fs.readFileSync(TOKEN_FILE));
-  if (SWITCH_MODEL_ID === MODEL_ID) {
+  if (SWITCH_ENABLED && (!SWITCH_MODEL_ID || !SWITCH_MODEL_LABEL)) {
+    throw new Error("provider switch model ID and name must be supplied together");
+  }
+  if (SWITCH_ENABLED && SWITCH_MODEL_ID === MODEL_ID) {
     throw new Error("provider switch model must differ from the uLLM model");
   }
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -233,7 +235,7 @@ async function run(browser) {
   });
   page.on("request", (request) => {
     if (!requestIsChatCompletion(request)) return;
-    if (requestBodies.length >= 4) {
+    if (requestBodies.length >= MAX_PROVIDER_REQUESTS) {
       requestBodyError = true;
       return;
     }
@@ -298,58 +300,69 @@ async function run(browser) {
     throw new Error("hidden reasoning was reinserted into the next turn");
   }
 
-  await waitForHostTransition("before-switch");
-  const switchUrl = new URL("/", baseUrl);
-  switchUrl.searchParams.set("models", SWITCH_MODEL_ID);
-  await page.goto(switchUrl.toString(), {
-    waitUntil: "domcontentloaded",
-    timeout: NAVIGATION_TIMEOUT_MS,
-  });
-  await page.waitForFunction(
-    (modelLabel) => document.body?.innerText?.includes(modelLabel) === true,
-    SWITCH_MODEL_LABEL,
-    { timeout: NAVIGATION_TIMEOUT_MS },
-  );
-  await submit(page, SWITCH_PROMPT);
-  const switchedAssistant = await waitForAnswer(page, SWITCH_MARKER);
-  rememberChatId(page, chatIds);
-  const switchedText = await visibleAnswerText(switchedAssistant);
-  if (switchedText !== SWITCH_MARKER) {
-    throw new Error("provider switch answer is not separated from reasoning details");
-  }
-  if (requestBodies.length < 3) throw new Error("provider switch request was not observed");
-  const switchRequest = requestBodies[requestBodies.length - 1];
-  if (switchRequest.model_id_sha256 !== sha256(SWITCH_MODEL_ID)) {
-    throw new Error("provider switch request used the wrong model");
-  }
+  let switchEvidence = {};
+  if (SWITCH_ENABLED) {
+    await waitForHostTransition("before-switch");
+    const switchUrl = new URL("/", baseUrl);
+    switchUrl.searchParams.set("models", SWITCH_MODEL_ID);
+    await page.goto(switchUrl.toString(), {
+      waitUntil: "domcontentloaded",
+      timeout: NAVIGATION_TIMEOUT_MS,
+    });
+    await page.waitForFunction(
+      (modelLabel) => document.body?.innerText?.includes(modelLabel) === true,
+      SWITCH_MODEL_LABEL,
+      { timeout: NAVIGATION_TIMEOUT_MS },
+    );
+    await submit(page, SWITCH_PROMPT);
+    const switchedAssistant = await waitForAnswer(page, SWITCH_MARKER);
+    rememberChatId(page, chatIds);
+    const switchedText = await visibleAnswerText(switchedAssistant);
+    if (switchedText !== SWITCH_MARKER) {
+      throw new Error("provider switch answer is not separated from reasoning details");
+    }
+    if (requestBodies.length < 3) throw new Error("provider switch request was not observed");
+    const switchRequest = requestBodies[requestBodies.length - 1];
+    if (switchRequest.model_id_sha256 !== sha256(SWITCH_MODEL_ID)) {
+      throw new Error("provider switch request used the wrong model");
+    }
 
-  await waitForHostTransition("before-return");
-  const switchBackUrl = new URL("/", baseUrl);
-  switchBackUrl.searchParams.set("models", MODEL_ID);
-  await page.goto(switchBackUrl.toString(), {
-    waitUntil: "domcontentloaded",
-    timeout: NAVIGATION_TIMEOUT_MS,
-  });
-  await page.waitForFunction(
-    (modelLabel) => document.body?.innerText?.includes(modelLabel) === true,
-    MODEL_LABEL,
-    { timeout: NAVIGATION_TIMEOUT_MS },
-  );
-  await submit(page, SWITCH_BACK_PROMPT);
-  const switchedBackAssistant = await waitForAnswer(page, SWITCH_BACK_MARKER);
-  rememberChatId(page, chatIds);
-  const switchedBackText = await visibleAnswerText(switchedBackAssistant);
-  if (switchedBackText !== SWITCH_BACK_MARKER) {
-    throw new Error("provider return answer is not separated from reasoning details");
-  }
-  if (requestBodies.length < 4) throw new Error("provider return request was not observed");
-  const switchBackRequest = requestBodies[requestBodies.length - 1];
-  if (switchBackRequest.model_id_sha256 !== sha256(MODEL_ID)) {
-    throw new Error("provider return request used the wrong model");
+    await waitForHostTransition("before-return");
+    const switchBackUrl = new URL("/", baseUrl);
+    switchBackUrl.searchParams.set("models", MODEL_ID);
+    await page.goto(switchBackUrl.toString(), {
+      waitUntil: "domcontentloaded",
+      timeout: NAVIGATION_TIMEOUT_MS,
+    });
+    await page.waitForFunction(
+      (modelLabel) => document.body?.innerText?.includes(modelLabel) === true,
+      MODEL_LABEL,
+      { timeout: NAVIGATION_TIMEOUT_MS },
+    );
+    await submit(page, SWITCH_BACK_PROMPT);
+    const switchedBackAssistant = await waitForAnswer(page, SWITCH_BACK_MARKER);
+    rememberChatId(page, chatIds);
+    const switchedBackText = await visibleAnswerText(switchedBackAssistant);
+    if (switchedBackText !== SWITCH_BACK_MARKER) {
+      throw new Error("provider return answer is not separated from reasoning details");
+    }
+    if (requestBodies.length < 4) throw new Error("provider return request was not observed");
+    const switchBackRequest = requestBodies[requestBodies.length - 1];
+    if (switchBackRequest.model_id_sha256 !== sha256(MODEL_ID)) {
+      throw new Error("provider return request used the wrong model");
+    }
+    switchEvidence = {
+      provider_switch_performed: true,
+      provider_switch_model_id_sha256: sha256(SWITCH_MODEL_ID),
+      provider_switch_answer: textEvidence(switchedText),
+      provider_return_performed: true,
+      provider_return_model_id_sha256: sha256(MODEL_ID),
+      provider_return_answer: textEvidence(switchedBackText),
+    };
   }
 
   if (requestBodyError) throw new Error("provider request body validation failed");
-  if (requestBodies.length !== 4) {
+  if (requestBodies.length !== MAX_PROVIDER_REQUESTS) {
     throw new Error("unexpected provider request count");
   }
   if (pageErrors.length > 0) throw new Error("OpenWebUI page errors were observed");
@@ -361,12 +374,7 @@ async function run(browser) {
     first_answer: textEvidence(firstText),
     expanded_view: textEvidence(expandedText),
     second_answer: textEvidence(secondText),
-    provider_switch_performed: true,
-    provider_switch_model_id_sha256: sha256(SWITCH_MODEL_ID),
-    provider_switch_answer: textEvidence(switchedText),
-    provider_return_performed: true,
-    provider_return_model_id_sha256: sha256(MODEL_ID),
-    provider_return_answer: textEvidence(switchedBackText),
+    ...switchEvidence,
     reasoning_details_expanded: true,
     provider_request_count: requestBodies.length,
     provider_requests: requestBodies,
