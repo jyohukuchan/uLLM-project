@@ -1,9 +1,32 @@
 # AQ4 fidelity-fix promotion runbook v0.1
 
-Status: CPU-only preparation complete. No service, GPU, lock, Docker, sudo, or
-activation operation was performed by this preparation. The candidate and
-complete release bundle are intentionally not yet present because their
-evidence inputs require a real R9700-only service window.
+Status (2026-07-18): **Functionally live, formally incomplete.** The candidate
+manifest (`5d015a01...`, worker `1f93f215...`, source commit `f1a3cf4c` plus
+follow-on tooling fixes through `c167e12b`) has been active in production
+since 2026-07-18T05:16:28+09:00 via the section 8 temporary
+differing-worker-bootstrap route, and has stayed active, healthy
+(`NRestarts=0`, `readyz` consistently `ready`) throughout Section 8's
+evidence collection. The fidelity fix is genuinely deployed and serving.
+
+What is NOT done: the formal Section 9/10 bundle-gated activation. Assembling
+a `--status complete` release bundle requires `--browser-evidence` /
+`--browser-validator`, which requires a working OpenWebUI browser-automation
+session. That session is currently broken by a pre-existing infrastructure
+gap unrelated to this fix (the browser gates inject the gateway's backend
+bearer key into `localStorage.token`, but OpenWebUI's frontend uses its own
+separate session/JWT auth, so every browser gate redirects to `/auth` and
+fails; see the follow-up task "Fix OpenWebUI browser-gate session
+authentication"). Section 8.4's HTTP/SSE release campaign (no browser
+required) succeeded: 10 cases across all 5 reasoning modes, correct
+candidate identity and R9700 exclusivity confirmed.
+
+**Do not run Section 9's "restore current active bytes" step until the
+browser-gate auth fix lands and a complete bundle can actually be
+assembled.** Restoring now without a working path back through Section 10
+would revert production to the pre-fix build with no way to
+re-promote via the documented bundle-gated route. The candidate stays active
+as its own de facto rollback-safe state (health-checked dozens of times
+across this session) until that follow-up closes.
 
 This runbook is for an AQ4-to-AQ4 replacement of the same public model, not
 the SQ8-to-AQ4 example in deploy/README.md. It is a handoff to the parent
