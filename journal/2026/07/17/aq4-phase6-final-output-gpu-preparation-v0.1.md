@@ -21,6 +21,7 @@
 - `tools/compare-aq4-phase6-final-output.py`は07/14 baselineを`0.6151289249025698`へexact再計算してから、修正後path oracleとside-by-side比較する。`after_fix`のmetric、absolute差、改善率をcreate-new artifactへ保存する。これは正式P2 gateではないことも明記する。
 - `tools/run-aq4-phase6-service-window.sh`は、Phase 3c v0.7の17 guard、既存lockのnon-creating probe、R9700-only HIP+ASIC guard、`RuntimeDirectoryPreserve=yes`、nlink=1 staging、single stop/startを再利用する。path-oracleの元のactive production contractに合わせ、17 guardが30 active production guardのsubsetであることをassertし、実行childには完全な30 guardを`env -i`で与える。
 - window driverのsource binary contractは、clean source worktree外の固定`uLLM-phase6-build-target/release/ullm-aq4-p2-path-oracle`を明示的に受理する形へ整合させた。これにより、runbookの正確なhandoff commandと「targetをworktree外に置いてclean contractを維持する」設計が一致する。他のbinary pathはstop前に拒否する。
+- さらにdriverが生成するwindow artifactのいずれかが既に存在する場合は、stop前に再実行を拒否する。これによりpre-stop failureを含め、同一`OUT`でのevidence上書きや無承認のsecond windowを防ぐ。rehearsal、baseline、stagingの既存evidenceだけはこの判定から除外する。
 - runbookを`docs/plans/aq4-phase6-gpu-window-runbook-v0.1.md`として追加し、旧Phase 3c v0.7 evidence/runbookを上書きしなかった。
 
 ### CPU-only準備と検証

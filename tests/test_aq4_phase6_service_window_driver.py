@@ -9,6 +9,8 @@ def test_phase6_window_driver_is_single_use_and_binds_the_exact_path_oracle_metr
 
     assert "--confirm-single-window" in source
     assert "systemctl restart" not in source
+    assert "WINDOW_ARTIFACTS" in source
+    assert "refusing to reuse a Phase 6 service-window output" in source
     assert "exec 9< \"$lock\"" in source
     assert "flock -n 9" in source
     assert "run-aq4-phase3c-r9700-guard.py" in source

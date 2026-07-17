@@ -45,6 +45,38 @@ LOCK_PROBE="$REPO/tools/probe-aq4-phase3c-existing-lock.py"
 STAGE_DIR="$OUT/path-oracle-binary-staging"
 PATH_ORACLE_BIN="$STAGE_DIR/ullm-aq4-p2-path-oracle"
 
+# Re-invocation after any pre-stop check or post-stop action would overwrite
+# evidence and could create an unapproved second service window.  Rehearsal,
+# baseline, and staging paths are deliberately not in this list; every member
+# here is created only by this driver.
+WINDOW_ARTIFACTS=(
+  "$OUT/path-oracle"
+  "$OUT/oracle-link"
+  "$OUT/final-output-comparison"
+  "$OUT/guard-before"
+  "$OUT/guard-after"
+  "$OUT/path-oracle-binary-staging-verify-window.json"
+  "$OUT/phase6-guard-contract.json"
+  "$OUT/service-window-events.tsv"
+  "$OUT/service-window-result.txt"
+  "$OUT/service-window-pre-stop.txt"
+  "$OUT/service-window-stop.stdout"
+  "$OUT/service-window-stop.stderr"
+  "$OUT/service-window-stop-systemctl-show.txt"
+  "$OUT/service-window-stop-systemctl-show.stderr"
+  "$OUT/service-window-stop.txt"
+  "$OUT/service-window-lock-after-stop.json"
+  "$OUT/path-oracle-export.stdout"
+  "$OUT/path-oracle-export.stderr"
+  "$OUT/path-oracle.exit-status.txt"
+  "$OUT/service-window-start.stdout"
+  "$OUT/service-window-start.stderr"
+  "$OUT/service-window-start.txt"
+  "$OUT/service-window-post-restore.txt"
+  "$OUT/final-output-comparison.stdout"
+  "$OUT/final-output-comparison.stderr"
+)
+
 # This is the complete v0.7 Phase 3c guard set.  Phase 6 uses the same 17
 # guard names as a mandatory subset, while the original path-oracle contract
 # additionally needs every active production guard below.
@@ -179,10 +211,16 @@ if [ "$SOURCE_BIN" != "$EXPECTED_SOURCE_BIN" ]; then
   echo "source binary must be the fixed external build-target release output" >&2
   exit 66
 fi
-if [ ! -d "$OUT" ] || [ -L "$OUT" ] || [ -e "$OUT/path-oracle" ] || [ -e "$OUT/oracle-link" ] || [ -e "$OUT/final-output-comparison" ] || [ -e "$OUT/guard-before" ] || [ -e "$OUT/guard-after" ]; then
+if [ ! -d "$OUT" ] || [ -L "$OUT" ]; then
   echo "output contract failed" >&2
   exit 30
 fi
+for artifact in "${WINDOW_ARTIFACTS[@]}"; do
+  if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+    echo "refusing to reuse a Phase 6 service-window output: $artifact" >&2
+    exit 30
+  fi
+done
 if [ ! -f "$LOCK" ] || [ -L "$LOCK" ] || [ ! -x "$PATH_ORACLE_BIN" ] || [ ! -x "$GUARD_BIN" ] || [ ! -f "$STAGING_TOOL" ] || [ ! -f "$EXPORT_TOOL" ] || [ ! -f "$COMPARISON_TOOL" ] || [ ! -f "$GUARD_TOOL" ] || [ ! -f "$LOCK_PROBE" ] || [ ! -x /opt/rocm/bin/amd-smi ]; then
   echo "pre-stop file contract failed" >&2
   exit 31
