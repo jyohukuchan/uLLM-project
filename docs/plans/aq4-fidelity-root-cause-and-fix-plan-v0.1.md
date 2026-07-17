@@ -487,6 +487,17 @@ Status: **完了**（実行: 親エージェント、tooling準備: `gpt-5.6-ter
 
 加えて凍結policy文書間(`aq4-p2-calibration-evidence-binding-v0.1.md` vs `aq4-p2-fidelity-holdout-protocol-v0.1.md`)の既存矛盾が判明し、これとは独立に`formal_p2_status=blocked_contract_resolution`として記録された。
 
+#### token_agreement_rate不合格の追加分析(margin相関)
+
+`holdout-evaluation.json`のrows(24件)と`source-oracles/holdout/rows.jsonl`のtopk logit値を突き合わせ、不一致だった4ケースの性質を確認した(親エージェント経由ではなく、この場で直接読み取り専用で実施)。
+
+- 不一致4ケース全てで、AQ4側top1はbf16側top1ではなく**必ずbf16側top2のトークン**であり、無関係なトークンへの転落や順位の大崩れは1件もなかった。
+- bf16のtop1-top2 logit差(margin)は、不一致4ケースで0.28/0.31/0.44/0.66。一方、AQ4量子化がlogitベクトル全体に与える典型的な誤差(各行の`delta_norm_sq/elements`のRMS)は全24ケース共通で0.21〜0.33の狭い範囲に収まっている。
+- margin > 0.75の12ケースは全て一致(不一致ゼロ)。逆にmargin 0.06/0.09という最小2ケースはたまたま一致していた(ノイズが逆側に転ばなかっただけの偶発的な一致とみられる)。
+- 特定token_id、特定prefill形状(`all_m1`/`cold_batched`)、特定context長への偏りは見られない。
+
+margin(僅差度)がAQ4量子化ノイズのRMS規模と同程度のケースでのみ不一致が発生し、margin規模と単調な相関を示すこの分布は、実装バグ(特定経路・特定トークンへの系統的誤り)ではなく、**4bit量子化に内在する、僅差ケースでの確率的な順位入れ替わり**である可能性を強く示唆する。ただし統計的傍証であり、完全な証明ではない。
+
 ### Tasks
 
 1. ~~`docs/specs/aq4-p2-calibration-evidence-binding-v0.1.md`の凍結policyに対し、独立holdoutで正式calibrationを再実行する。~~ **完了**。
@@ -502,7 +513,7 @@ Status: **完了**（実行: 親エージェント、tooling準備: `gpt-5.6-ter
 
 ### 残る作業(ユーザー判断が必要)
 
-1. **token_agreement_rate不合格への対応**: 僅差でのtop-1入れ替わり(4/24ケース)の残存原因をさらに追跡するか、holdoutサンプル数を増やしてWilson下限の精度を上げるか、07/09に採用された「strict exact-matchを昇格gateにしない」方針を踏まえてpolicyの妥当性自体を再検討するか。
+1. **token_agreement_rate不合格への対応**: margin相関分析(上記)により実装バグではなく量子化ノイズによる確率的な僅差入れ替わりである可能性が高いと判断されたが、これは統計的傍証であり確証ではない。holdoutサンプル数を増やしてWilson下限の精度を上げるか、07/09に採用された「strict exact-matchを昇格gateにしない」方針を踏まえてpolicyの妥当性自体を再検討するか、この傍証で十分とみなし現状のpolicy運用の中で対応するか。
 2. **凍結policy文書間の矛盾解決**: `docs/proposals/aq4-p2-correctness-fidelity-amendment-v0.1.md`の正式承認手続きに従い、どちらの文書を正とするか、または統合するかを決定する。
 
 ## Decision Tree
