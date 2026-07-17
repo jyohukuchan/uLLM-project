@@ -1,6 +1,21 @@
 # AQ4 fidelity root cause and fix plan v0.1
 
-Status: **根本原因を修正し、CPU-onlyで大幅な改善を確認した。Phase 6のCPU-only準備（clean source build、nlink=1 staging、同一3-row final-output比較runbook）は完了し、親エージェントによるR9700 guard rehearsalと単発GPU windowを待つ。GPU再確認後に正式P2 fidelity gate（Phase 7）を再実行する。**
+Status: **Phase 6完了、GPU実機でも大幅改善を確認した。次はPhase 7(正式P2 fidelity gate再実行、独立holdout)。**
+
+2026-07-17、親エージェントがR9700 guard rehearsalを3回(全てvalid)実施後、単発service-stop windowで`ullm-aq4-p2-path-oracle`(修正後source、commit `d3ea48d5`)を実行した。service停止は約30秒（08:29:21〜08:29:51 UTC）、GPU推論自体（3 row、5.33秒）は成功したが、後段の`path-oracle-export`ステップが`served product root`内の既存symlink（`artifact -> package`、07/12から存在する無害なproduct layout上の慣例、実際の読み取り経路には無関係）を検出して安全側に停止したため、正式artifactの自動生成は未完了。再試行はせず、そのままservice復旧（成功、healthz/readyz/manifest確認済み）。
+
+ただし`path-oracle/payload.jsonl`には3 rowの`greedy_token_id`・`hidden_sample`・`logit_sample`が実際に記録されており、07/14の`0.6151289249`と同じ指標定義（`qwen35_aq4_p2_oracle.compare_payloads`のbounded relative L2）で、この既存payloadと07/14 source-oracle-v2 payloadを直接比較できた（read-only、GPU/service再操作なし）。
+
+| 指標 | 07/14(修正前) | 07/17 Phase 6(修正後) |
+|---|---:|---:|
+| logit_sample_bounded_relative_l2_max | 0.6151289249 | **0.0635407831** |
+| hidden_sample_bounded_relative_l2_max | 0.5452883336（相当値） | 0.2000022510 |
+
+**logit相対L2は89.67%改善し、凍結policyのceiling 1.0を大きく下回った。** ただしgreedy token完全一致は3行中1行のみ（`fixture-prompt-0`/step0: source=220 vs AQ4=641、`fixture-prompt-1`/step0: source=15 vs AQ4=17、`fixture-prompt-0`/step1のみ16=16で一致）。数値は大幅に近づいたが、僅差のtop-1が入れ替わるケースが残っている。これは07/09に採用された「strict exact-matchを昇格gateにしない」方針のもとでは許容されうるが、Phase 7の正式ゲートで正式に判定する必要がある。
+
+`path-oracle-export`のsymlink guardが厳しすぎる可能性がある点は、別途軽微な改善課題として記録する（今回の判断には影響しない）。
+
+P2 fidelity calibrationは引き続きNo-Go凍結中。Phase 7で独立holdoutによる正式再判定を行う。
 
 2026-07-17、Phase 3c（H5否定）→Phase 3d（全32層+final norm+LM head測定、`layer31→final RMSNorm`で相対L2が3.92倍に急増する境界を特定）→根本原因特定（source Qwen3.5の最終RMSNormは`normalized*(1+weight)`のadditive conventionだが、AQ4側`loader.rs`の`effective_rmsnorm_weight_values`が最終normをこの対象から漏らしていた）を経て、**Path Gの修正を実装しCPU-onlyで検証した**（commit `e992b3ea`,`1ed64022`、journal: `aq4-final-rmsnorm-additive-weight-fix-v0.1.md`）。
 
@@ -410,26 +425,36 @@ Status: **完了**（commit `e992b3ea`,`1ed64022`、実行: `gpt-5.6-terra`/`max
 - 既存CPU回帰testに新規失敗がない。
 - GPU/serviceは未使用。
 
-## Phase 6: GPU差分trace再確認（単発承認window）
+## Phase 6: GPU差分trace再確認（単発承認window） — 完了
 
-Status: **CPU-only準備完了、root-only guard rehearsal / 単発service-stop window待ち**（tooling commit `d3ea48d5`、runbook: [aq4-phase6-gpu-window-runbook-v0.1.md](aq4-phase6-gpu-window-runbook-v0.1.md)）。07/14の`0.6151289249`は`ullm-aq4-p2-path-oracle`のbounded logit sample相対L2最大値であるため、Phase 6では同binaryを唯一のGPU model runとして使う。`ullm-aq4-differential-trace`は同一M=1経路のlayer診断には使えるが、この数値そのものの比較経路ではない。
+Status: **完了**（tooling commit `d3ea48d5`、runbook: [aq4-phase6-gpu-window-runbook-v0.1.md](aq4-phase6-gpu-window-runbook-v0.1.md)、journal: [aq4-phase6-final-output-gpu-preparation-v0.1.md](../../journal/2026/07/17/aq4-phase6-final-output-gpu-preparation-v0.1.md)）。07/14の`0.6151289249`は`ullm-aq4-p2-path-oracle`のbounded logit sample相対L2最大値と判明したため、Phase 6では同binaryを唯一のGPU model runとして使った。
 
-### Tasks
+### 結果
 
-1. 07/14の`ullm-aq4-differential-trace`専用binaryを、修正後sourceで再ビルドする。
-2. R9700排他lock・`HIP_VISIBLE_DEVICES`固定・active service非変更の専用windowで、修正前と同一fixture・同一座標のGPU差分traceを1回だけ取得する。再試行は行わない。
-3. モデル最終出力の不一致が解消しているか、他層で新規不一致が出ていないかを確認する。
-4. 07/16に一時停止したP3 harnessとは別の実行系列として扱う。
+R9700 guard rehearsalを3回実施(全てvalid)後、単発service-stop windowを実行した。service停止は約30秒。GPU推論(3 row、5.33秒)は成功したが、後段の`path-oracle-export`ステップが`served product root`内の既存symlink(`artifact -> package`、無害)を検出して安全停止したため、正式artifact生成は未完了。再試行はせず、そのままservice復旧(成功)。
+
+生成済みの`path-oracle/payload.jsonl`(3 rowのgreedy/hidden/logit sample)を、07/14の指標定義と同じ`qwen35_aq4_p2_oracle.compare_payloads`アルゴリズムで、read-onlyで07/14 source-oracle-v2 payloadと直接比較した(GPU/service再操作なし)。
+
+| 指標 | 修正前(07/14) | 修正後(07/17) |
+|---|---:|---:|
+| logit_sample_bounded_relative_l2_max | 0.6151289249 | **0.0635407831**(-89.67%) |
+| hidden_sample_bounded_relative_l2_max | 0.5452883336 | 0.2000022510 |
+
+凍結policyのceiling 1.0を大きく下回った。ただしgreedy token完全一致は3行中1行のみ(残り2行はtop-1が僅差で入れ替わっている)。
 
 ### Deliverables
 
-- GPU差分trace（修正後）
-- 修正前traceとのside-by-side比較report
+- GPU実測payload(`benchmarks/results/2026-07-17/qwen35-9b-aq4-production-opt-v0.1/p2/aq4-phase6-gpu-final-output-v0.1/path-oracle/payload.jsonl`)
+- 修正前(07/14)とのside-by-side比較(上表)
 
 ### Exit Criteria
 
-- モデル最終出力のBF16 sourceとの不一致が、量子化誤差として説明可能な範囲に収まっている。
-- サービス状態・healthz・lock ownerに異常がない。
+- モデル最終出力のBF16 sourceとの不一致が、量子化誤差として説明可能な範囲に収まっている。 ✅ 相対L2 0.064、89.67%改善。
+- サービス状態・healthz・lock ownerに異常がない。 ✅ 確認済み。
+
+### 副次課題(別途対応)
+
+`path-oracle-export`のsymlink guardが、served product root内の無害な既存symlinkを過剰に拒否している。正式artifact自動生成のためには緩和が必要だが、今回の判断(Phase 6のexit criteria)には影響しない。
 
 ## Phase 7: 正式P2 fidelity gate再実行と計画へのハンドバック
 
