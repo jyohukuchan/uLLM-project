@@ -284,6 +284,7 @@ def inspect_active_manifest(path: Path) -> dict[str, Any]:
     regular(package_path, "active package manifest")
     regular(worker_path, "active worker binary")
     package = package_tree_identity(package_path.parent)
+    promotion = payload.get("promotion", product.get("promotion"))
     return {
         "manifest_path": str(path.resolve()),
         "manifest_sha256": sha_file(path, "active served-model manifest"),
@@ -307,7 +308,7 @@ def inspect_active_manifest(path: Path) -> dict[str, Any]:
             "format_id": fmt.get("format_id"),
             "implementation_id": fmt.get("implementation_id"),
         },
-        "promotion": product.get("promotion"),
+        "promotion": promotion,
     }
 
 
@@ -735,10 +736,14 @@ def create_preparation(args: argparse.Namespace) -> dict[str, Any]:
     deployed_commit = None
     promotion = active.get("promotion")
     if isinstance(promotion, dict):
-        source_info = promotion.get("source")
-        if isinstance(source_info, dict):
-            value = source_info.get("git_commit")
-            deployed_commit = value if isinstance(value, str) else None
+        value = promotion.get("source_commit")
+        if isinstance(value, str):
+            deployed_commit = value
+        else:
+            source_info = promotion.get("source")
+            if isinstance(source_info, dict):
+                value = source_info.get("git_commit")
+                deployed_commit = value if isinstance(value, str) else None
     comparability = {
         "status": "comparable" if deployed_commit == source["git_commit"] else "separated_not_comparable",
         "reason": (
@@ -1114,10 +1119,43 @@ def verify_preparation(output: Path) -> dict[str, Any]:
     }
 
 
+def verify_live_active_identity(output: Path, active_manifest: Path) -> dict[str, Any]:
+    """Verify that a sealed preparation still names the live served identity.
+
+    A preparation is deliberately immutable. This check never refreshes it in
+    place: a changed active manifest requires a new preparation output.
+    """
+    result = verify_preparation(output)
+    identity = load_json(output.absolute() / "identity.json", "identity")
+    frozen = identity.get("deployed_active") if isinstance(identity, dict) else None
+    require(isinstance(frozen, dict), "preparation identity lacks frozen deployed active identity")
+    live = inspect_active_manifest(active_manifest.absolute())
+    require(
+        frozen == live,
+        "frozen deployed active identity differs from live active manifest; create a new preparation output",
+    )
+    return {
+        **result,
+        "live_active_identity": {
+            "manifest_path": live["manifest_path"],
+            "manifest_sha256": live["manifest_sha256"],
+            "model": live["model"],
+            "worker_binary_sha256": live["worker"]["sha256"],
+            "package_manifest_sha256": live["package"]["manifest_sha256"],
+            "package_content_sha256": live["package"]["tree"]["sha256"],
+        },
+    }
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="new immutable preparation directory")
     parser.add_argument("--verify", action="store_true", help="verify an existing preparation directory without modifying it")
+    parser.add_argument(
+        "--verify-live-active-identity",
+        action="store_true",
+        help="with --verify, require the frozen deployed identity to equal --active-manifest",
+    )
     parser.add_argument("--source-worktree", type=Path, help="clean detached source worktree at the frozen HEAD")
     parser.add_argument("--active-manifest", type=Path, default=Path("/etc/ullm/served-models/active.json"))
     parser.add_argument("--source-model", type=Path, default=Path("/home/homelab1/datapool/ai_models/safetensors/Qwen/Qwen3.5-9B"))
@@ -1128,9 +1166,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         if args.verify:
-            result = verify_preparation(args.output)
+            result = (
+                verify_live_active_identity(args.output, args.active_manifest)
+                if args.verify_live_active_identity
+                else verify_preparation(args.output)
+            )
         else:
             require(args.source_worktree is not None, "--source-worktree is required when creating preparation")
+            require(not args.verify_live_active_identity, "--verify-live-active-identity requires --verify")
             result = create_preparation(args)
     except (PreparationError, OSError, ValueError) as error:
         print(f"AQ4 P2 production baseline preparation failed: {error}", file=sys.stderr)

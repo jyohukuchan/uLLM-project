@@ -116,12 +116,19 @@ def run_validation(program: Path, arguments: list[str], label: str) -> dict[str,
     return value
 
 
-def load_plan(preparation: Path, staging: Path, case_id: str) -> dict[str, Any]:
+def load_plan(preparation: Path, staging: Path, case_id: str, served_manifest: Path) -> dict[str, Any]:
     preparation = preparation.absolute()
     staging = staging.absolute()
     preparation_validation = run_validation(
         tool_path("prepare-aq4-p2-production-baseline.py"),
-        ["--output", str(preparation), "--verify"],
+        [
+            "--output",
+            str(preparation),
+            "--verify",
+            "--active-manifest",
+            str(served_manifest.absolute()),
+            "--verify-live-active-identity",
+        ],
         "preparation verification",
     )
     staging_validation = run_validation(
@@ -167,6 +174,61 @@ def validate_source_root(source: Path) -> dict[str, Any]:
     value = load_json(manifest, "source oracle manifest")
     require(isinstance(value, dict) and value.get("schema_version") == "ullm.qwen35_aq4_source_calibration.v1" and value.get("oracle_kind") == "independent_source_full" and value.get("status") == "available", "source oracle is not available independent evidence")
     return {"root": str(source), "manifest_sha256": sha_file(manifest, "source oracle manifest"), "sha256sums_sha256": sha_file(sums, "source oracle SHA256SUMS")}
+
+
+def validate_source_identity(plan: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Reject a stale source identity during the CPU-only preflight.
+
+    The calibration binary performs the complete vector validation later.
+    These model and selected-fixture checks keep a known stale source oracle
+    from reaching a service-stop window in the first place.
+    """
+    root = Path(str(source["root"]))
+    manifest = load_json(root / "manifest.json", "source oracle manifest")
+    require(isinstance(manifest, dict), "source oracle manifest differs")
+    identity = manifest.get("identity")
+    cases_binding = manifest.get("cases")
+    require(isinstance(identity, dict), "source oracle model identity is missing")
+    require(isinstance(cases_binding, dict), "source oracle cases binding is missing")
+    model = plan["identity"]["deployed_active"].get("model")
+    require(isinstance(model, dict), "frozen active model identity differs")
+    source_model_id = identity.get("model_id")
+    source_model_revision = identity.get("model_revision")
+    expected_model_id = model.get("upstream_id")
+    expected_model_revision = model.get("revision")
+    require(
+        isinstance(source_model_id, str)
+        and isinstance(source_model_revision, str)
+        and isinstance(expected_model_id, str)
+        and isinstance(expected_model_revision, str)
+        and source_model_id == expected_model_id
+        and source_model_revision == expected_model_revision,
+        "source oracle model identity differs from frozen active model",
+    )
+    cases_path = Path(str(cases_binding.get("path", "")))
+    require(cases_path.is_absolute(), "source oracle cases path must be absolute")
+    cases_sha = sha_file(cases_path, "source oracle cases")
+    require(cases_binding.get("sha256") == cases_sha, "source oracle cases hash differs")
+    cases = load_json(cases_path, "source oracle cases")
+    require(isinstance(cases, dict) and isinstance(cases.get("cases"), list), "source oracle cases differ")
+    case_id = plan["case"].get("case_id")
+    selected = [item for item in cases["cases"] if isinstance(item, dict) and item.get("case_id") == case_id]
+    fixture = plan["fixture"].get("cases")
+    require(isinstance(fixture, list), "path-oracle fixture differs")
+    selected_fixture = [item for item in fixture if isinstance(item, dict) and item.get("case_id") == case_id]
+    require(len(selected) == 1 and len(selected_fixture) == 1, "source oracle does not cover the selected path-oracle anchor")
+    require(
+        selected[0].get("prompt_token_ids") == selected_fixture[0].get("prompt_token_ids")
+        and selected[0].get("step_count") == selected_fixture[0].get("step_count"),
+        "source oracle case differs from frozen path-oracle fixture",
+    )
+    return {
+        "model_id": source_model_id,
+        "model_revision": source_model_revision,
+        "cases_path": str(cases_path),
+        "cases_sha256": cases_sha,
+        "case_id": case_id,
+    }
 
 
 def validate_execute_environment(identity: dict[str, Any]) -> dict[str, Any]:
@@ -229,8 +291,9 @@ def paths_for(plan: dict[str, Any], case_id: str) -> tuple[Path, Path, Path]:
 
 
 def execute(plan: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    environment = validate_execute_environment(plan["identity"])
     source = validate_source_root(args.source)
+    source_identity = validate_source_identity(plan, source)
+    environment = validate_execute_environment(plan["identity"])
     target_parent, inputs, target_output = paths_for(plan, args.case_id)
     require(args.output.absolute() == target_output.absolute(), "target output must be preparation/source-oracle/target/CASE_ID")
     require(not os.path.lexists(inputs) and not os.path.lexists(target_output), "path-oracle case was already attempted; immutable retry is forbidden")
@@ -264,7 +327,7 @@ def execute(plan: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "case_id": args.case_id,
             "preparation_manifest_sha256": sha_file(plan["preparation"] / "preparation-manifest.json", "preparation manifest"),
             "staging_receipt_sha256": sha_file(plan["staging"] / "staging-receipt.json", "staging receipt"),
-            "source": source,
+            "source": {**source, "identity_validation": source_identity},
             "inputs": {"case_sha256": case_sha, "identity_sha256": identity_sha, "preflight_sha256": preflight_sha, "preflight_provenance_sha256": preflight_provenance_sha, "fixture_sha256": sha_file(plan["preparation"] / "oracle-fixture.json", "oracle fixture")},
             "environment": environment,
         }
@@ -317,16 +380,18 @@ def main(argv: list[str] | None = None) -> int:
         args.staging = args.staging.absolute()
         args.source = args.source.absolute()
         args.output = args.output.absolute()
-        plan = load_plan(args.preparation, args.staging, args.case_id)
+        args.served_manifest = args.served_manifest.absolute()
+        plan = load_plan(args.preparation, args.staging, args.case_id, args.served_manifest)
         target_parent, inputs, expected_output = paths_for(plan, args.case_id)
         require(args.output == expected_output.absolute(), "output path differs from the selected immutable anchor path")
         if args.dry_run:
             source = validate_source_root(args.source)
+            source_identity = validate_source_identity(plan, source)
             result = {
                 "schema_version": SCHEMA,
                 "status": "dry_run_valid",
                 "case_id": args.case_id,
-                "source": source,
+                "source": {**source, "identity_validation": source_identity},
                 "planned_input_directory": str(inputs),
                 "planned_target_output": str(expected_output),
                 "calibration_requested_device_index": 1,

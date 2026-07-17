@@ -283,13 +283,63 @@ manifest. The parent must first prove:
 
 Do not reuse an output directory or rerun a failed gate into the same path.
 
+The sealed `baseline-v0.4` preparation was created while the old active
+manifest was live. It remains immutable evidence of that state: do not edit
+its `identity.json`, delete its failed target-input receipt, or reuse its
+`source-oracle/source-full` under the candidate. Create a new preparation root
+while the candidate is active. The following is CPU-only (the source capture
+is intentionally long, but does not open HIP or touch the service):
+
+    export ACTIVE=/etc/ullm/served-models/active.json
+    export P2_PREP=$REPO/benchmarks/results/2026-07-17/qwen35-9b-aq4-production-opt-v0.1/p2/aq4-production-prefill-decode-baseline-v0.5-candidate-active-0cd76056
+    export P2_CLEAN_SOURCE=/home/homelab1/coding-local/ultimateLLM/uLLM-p2-baseline-source-f1a3cf4c
+    export P2_BUILD=/home/homelab1/coding-local/ultimateLLM/uLLM-p2-baseline-build-f1a3cf4c/release
+    export P2_MODEL=/home/homelab1/datapool/ai_models/safetensors/Qwen/Qwen3.5-9B
+    export P2_SOURCE=$P2_PREP/source-oracle/source-full
+    export P2_CASE=p2-oracle-anchor-prefill-all-m1-n128-m1
+    export P2_SOURCE_COMMIT=f1a3cf4c86978b3b8900396a0b6a8caff90b97f1
+
+    test "$(sha256sum "$ACTIVE" | awk '{print $1}')" = 5d015a013dcf70cea13dd9ed569d89ed2a025a17e14a6192ca18ee4cdadd1c8a
+    test ! -e "$P2_PREP"
+    /usr/bin/python3 "$REPO/tools/prepare-aq4-p2-production-baseline.py" \
+      --output "$P2_PREP" --source-worktree "$P2_CLEAN_SOURCE" \
+      --active-manifest "$ACTIVE" --source-model "$P2_MODEL"
+    /usr/bin/python3 "$REPO/tools/prepare-aq4-p2-production-baseline.py" \
+      --output "$P2_PREP" --verify --active-manifest "$ACTIVE" \
+      --verify-live-active-identity
+    /usr/bin/python3 "$REPO/tools/stage-aq4-p2-production-baseline-binaries.py" \
+      --output "$P2_PREP/staging/baseline-binaries" --preparation "$P2_PREP" \
+      --resident-source "$P2_BUILD/ullm-aq4-p2-resident-driver" \
+      --calibration-source "$P2_BUILD/ullm-aq4-p2-calibration" \
+      --source-commit "$P2_SOURCE_COMMIT"
+    /usr/bin/python3 "$REPO/tools/stage-aq4-p2-r9700-guard.py" \
+      --output "$P2_PREP/guard/r9700-guard-staging" --preparation "$P2_PREP" \
+      --source "$REPO/tools/query-hip-device-identity.cpp" \
+      --source-commit "$P2_SOURCE_COMMIT"
+    env CUDA_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1 ULLM_HIP_VISIBLE_DEVICES=-1 \
+      /usr/bin/python3 "$REPO/tools/capture-aq4-p2-production-source-oracle.py" \
+        --preparation "$P2_PREP" --model-dir "$P2_MODEL" --output "$P2_SOURCE" \
+        --confirm-cpu-source-capture --threads 1
+    env CUDA_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 ROCR_VISIBLE_DEVICES=-1 ULLM_HIP_VISIBLE_DEVICES=-1 \
+      /usr/bin/python3 "$REPO/tools/run-aq4-p2-production-path-oracle.py" \
+        --preparation "$P2_PREP" --staging "$P2_PREP/staging/baseline-binaries" \
+        --case-id "$P2_CASE" --source "$P2_SOURCE" \
+        --output "$P2_PREP/source-oracle/target/$P2_CASE" \
+        --served-manifest "$ACTIVE" --dry-run
+
+The live-identity dry run must report `dry_run_valid`; it now rejects both a
+stale frozen active identity and a source oracle whose model revision or
+selected fixture differs. Do not enter a service window otherwise.
+The service-window driver separately rejects dirty tooling, so use a clean
+tracked worktree containing this change; do not bypass that check.
+
     export ULLM_MODEL_ID=ullm-qwen3.5-9b-aq4
     export ULLM_MODEL_NAME='uLLM Qwen3.5 9B AQ4 reasoning'
     export OPENWEBUI_URL=http://192.168.0.66:3000/
-    export P2_PREP=$REPO/benchmarks/results/2026-07-17/qwen35-9b-aq4-production-opt-v0.1/p2/aq4-production-prefill-decode-baseline-v0.4
+    export P2_PREP=$REPO/benchmarks/results/2026-07-17/qwen35-9b-aq4-production-opt-v0.1/p2/aq4-production-prefill-decode-baseline-v0.5-candidate-active-0cd76056
     export P2_GUARD=$P2_PREP/guard/r9700-guard-staging/query-hip-device-identity
     export P2_CLEAN_SOURCE=/home/homelab1/coding-local/ultimateLLM/uLLM-p2-baseline-source-f1a3cf4c
-    export P2_SOURCE=$REPO/benchmarks/results/2026-07-17/qwen35-9b-aq4-production-opt-v0.1/p2/aq4-phase7-p2-fidelity-preparation-v0.1/source-oracles/calibration
+    export P2_SOURCE=$P2_PREP/source-oracle/source-full
     export P2_CASE=p2-oracle-anchor-prefill-all-m1-n128-m1
 
     test ! -e "$OUT/soak-100"
@@ -300,10 +350,32 @@ Do not reuse an output directory or rerun a failed gate into the same path.
     test ! -e "$OUT/http-sse-campaign"
     test ! -e "$P2_PREP/source-oracle/target/$P2_CASE"
 
-### 8.1 same_artifact_all_m1 path check
+### 8.1 same_artifact_all_m1 path check — deliberately skipped for this promotion
 
-This is one all-M=1 path-oracle service window, not a repeat of the frozen
-holdout. It is a R9700-only identity/path check and must be read as such.
+The first attempt against the stale `baseline-v0.4` preparation failed closed
+(`P2 model identity differs from served model`; service was stopped and
+restored cleanly, no harm done). The correct fix is a fresh `baseline-v0.5`
+preparation plus a new ~42-minute CPU-only fp32 source-oracle capture (both
+already designed and validated in isolation; see the parent's commits and
+journal for 2026-07-17/18).
+
+The parent operator decided not to spend that additional CPU-only time and
+GPU window on this specific check for this promotion, because two
+independent, already-completed pieces of evidence already cover the same
+concern (that the deployed candidate binary is the one actually being
+validated):
+
+- Section 5's `run-aq4-resident-promotion-evidence.py` run (`verified: true`)
+  directly exercises the candidate worker binary against the legacy engine
+  via real HIP execution and SHA-256-binds both binaries' identities.
+- The formal Phase 7 fidelity holdout (48 independent cases, documented in
+  `docs/plans/aq4-fidelity-root-cause-and-fix-plan-v0.1.md`) already
+  validated the same RMSNorm-fixed code path end-to-end against an
+  independent CPU oracle.
+
+`same_artifact_all_m1` is therefore treated as redundant with existing
+evidence for this promotion, not as an unverified gap. If a future promotion
+needs it, run the `baseline-v0.5-candidate-active-*` sequence above and then:
 
     sudo "$REPO/tools/run-aq4-p2-production-path-oracle-service-window.sh" \
       "$P2_PREP" "$P2_GUARD" "$P2_CLEAN_SOURCE" "$SOURCE_COMMIT" \

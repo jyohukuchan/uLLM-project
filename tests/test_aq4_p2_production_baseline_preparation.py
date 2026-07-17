@@ -301,6 +301,8 @@ def test_path_oracle_dry_run_validates_only_cpu_envelope_and_source_receipt(tmp_
             {"output": preparation / "staging" / "baseline-binaries", "preparation": preparation, "resident_source": resident, "calibration_source": calibration, "source_commit": commit},
         )()
     )
+    case_id = json.loads((preparation / "calibration-case-index.json").read_text())["cases"][0]["case_id"]
+    source_cases = preparation / "source-oracle-cases.json"
     source_oracle = tmp_path / "source-oracle"
     source_oracle.mkdir()
     write(
@@ -310,13 +312,14 @@ def test_path_oracle_dry_run_validates_only_cpu_envelope_and_source_receipt(tmp_
                 "schema_version": "ullm.qwen35_aq4_source_calibration.v1",
                 "oracle_kind": "independent_source_full",
                 "status": "available",
+                "identity": {"model_id": "Qwen/Qwen3.5-9B", "model_revision": "fixture-revision"},
+                "cases": {"path": str(source_cases.resolve()), "sha256": PATH_ORACLE.sha_file(source_cases, "source cases")},
             },
             sort_keys=True,
         ).encode()
         + b"\n",
     )
     write(source_oracle / "SHA256SUMS", b"fixture\n")
-    case_id = json.loads((preparation / "calibration-case-index.json").read_text())["cases"][0]["case_id"]
     output = preparation / "source-oracle" / "target" / case_id
     result = subprocess.run(
         [
@@ -332,6 +335,8 @@ def test_path_oracle_dry_run_validates_only_cpu_envelope_and_source_receipt(tmp_
             str(source_oracle),
             "--output",
             str(output),
+            "--served-manifest",
+            str(manifest),
             "--dry-run",
         ],
         check=False,
@@ -344,6 +349,54 @@ def test_path_oracle_dry_run_validates_only_cpu_envelope_and_source_receipt(tmp_
     assert payload["status"] == "dry_run_valid"
     assert payload["gpu_or_service_action"] == "none"
     assert not output.exists()
+
+    stale = json.loads(manifest.read_text())
+    stale["public"]["revision"] = "fixture-revision-candidate"
+    write(manifest, json.dumps(stale, sort_keys=True).encode() + b"\n")
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/run-aq4-p2-production-path-oracle.py"),
+            "--preparation",
+            str(preparation),
+            "--staging",
+            str(preparation / "staging/baseline-binaries"),
+            "--case-id",
+            case_id,
+            "--source",
+            str(source_oracle),
+            "--output",
+            str(output),
+            "--served-manifest",
+            str(manifest),
+            "--dry-run",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HIP_VISIBLE_DEVICES": "-1", "ULLM_HIP_VISIBLE_DEVICES": "-1"},
+    )
+    assert rejected.returncode != 0
+    assert "frozen deployed active identity differs" in rejected.stderr
+    assert not output.exists()
+
+    fresh = parent / "fresh-preparation"
+    PREPARE.create_preparation(
+        type("Args", (), {"output": fresh, "source_worktree": source, "active_manifest": manifest, "source_model": model})()
+    )
+    refreshed = PREPARE.verify_live_active_identity(fresh, manifest)
+    assert refreshed["live_active_identity"]["model"]["revision"] == "fixture-revision-candidate"
+    fresh_plan = {
+        "identity": json.loads((fresh / "identity.json").read_text()),
+        "case": json.loads((fresh / "calibration-case-index.json").read_text())["cases"][0],
+        "fixture": json.loads((fresh / "oracle-fixture.json").read_text()),
+    }
+    try:
+        PATH_ORACLE.validate_source_identity(fresh_plan, PATH_ORACLE.validate_source_root(source_oracle))
+    except PATH_ORACLE.OracleWindowError as error:
+        assert "source oracle model identity differs" in str(error)
+    else:
+        raise AssertionError("stale source oracle was accepted for the fresh active identity")
 
 
 def test_profile_parser_binds_new_raw_trace_without_running_rocprof(tmp_path: Path) -> None:
