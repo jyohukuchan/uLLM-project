@@ -1,6 +1,6 @@
 # AQ4 fidelity root cause and fix plan v0.1
 
-Status: **Phase 7完了。劇的に改善したが、正式な無条件Goには至っていない。**
+Status: **完了(ユーザー判断によりクローズ、2026-07-17)。** 根本原因(最終RMSNormのadditive weight適用漏れ)は特定・修正・多段検証済みで、07/15の破局的失敗(19/19ケースが相対L2>1.0)は解消した。正式P2 fidelity gateの8指標中7指標は合格し、唯一不合格の`token_agreement_rate`はmargin相関分析により量子化に内在するノイズ由来の確率的な僅差入れ替わりと判断され、ユーザーが「量子化である以上ノイズは当然」としてこれを許容し本件を完了とした。凍結policy文書間の矛盾は本件のcode fixとは独立の文書運用課題として残存する(下記参照)。
 
 2026-07-17、07/15の凍結holdout(19件No-Go)とは別の新規独立holdout48件(calibration 24 / formal holdout 24、tuning/diagnosticで使った全fixtureとhash非重複を機械確認済み)を生成し、単発service-stop window(約13.5分、48ケース処理のため通常より長い)で正式calibrationを実行した。serviceは正常復旧。
 
@@ -513,7 +513,7 @@ margin(僅差度)がAQ4量子化ノイズのRMS規模と同程度のケースで
 
 ### 残る作業(ユーザー判断が必要)
 
-1. **token_agreement_rate不合格への対応**: margin相関分析(上記)により実装バグではなく量子化ノイズによる確率的な僅差入れ替わりである可能性が高いと判断されたが、これは統計的傍証であり確証ではない。holdoutサンプル数を増やしてWilson下限の精度を上げるか、07/09に採用された「strict exact-matchを昇格gateにしない」方針を踏まえてpolicyの妥当性自体を再検討するか、この傍証で十分とみなし現状のpolicy運用の中で対応するか。
+1. ~~**token_agreement_rate不合格への対応**~~ **クローズ(2026-07-17)**: margin相関分析により量子化ノイズに内在する確率的な僅差入れ替わりと判断され、ユーザーが「量子化である以上ノイズは当然」として許容。追加のcode fixは不要と判断。
 2. **凍結policy文書間の矛盾解決**: `docs/proposals/aq4-p2-correctness-fidelity-amendment-v0.1.md`の正式承認手続きに従い、どちらの文書を正とするか、または統合するかを決定する。
 
 ## Decision Tree
