@@ -2,7 +2,7 @@
 
 ## 前回の要点
 
-`ullm.qwen35_aq4_source_calibration.v1` は、独立BF16 sourceのpost-final-RMSNorm hiddenとraw logitsをf32 little-endian sidecarへ保存する。engine coreは、通常生成のprepared token直後だけ同じhidden/logitsをchunk observerへ公開し、source greedy列をhash-bound teacher forcingとしてcommitできる。
+`ullm.qwen35_aq4_source_calibration.v1` は、独立sourceのpost-final-RMSNorm hiddenとraw logitsをf32 little-endian sidecarへ保存する。source forwardの実行dtypeはsource manifestの`runtime.dtype`に実値で記録し、現行CPU production captureは`float32`である。engine coreは、通常生成のprepared token直後だけ同じhidden/logitsをchunk observerへ公開し、source greedy列をhash-bound teacher forcingとしてcommitできる。
 
 ## 今回の変更点
 
