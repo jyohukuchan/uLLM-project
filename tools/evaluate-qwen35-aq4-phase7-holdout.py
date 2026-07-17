@@ -102,12 +102,14 @@ def atomic_json(path: Path, value: Any) -> None:
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
-    # A prechecked create-new destination and a same-directory replace are
-    # sufficient here because the service driver rejects every output marker
-    # before it consumes the one permitted holdout window.
-    if os.path.lexists(path):
-        raise EvaluationError(f"holdout evaluation appeared while writing: {path}")
-    temporary.rename(path)
+    # Publish through a hard link rather than rename(2): a raced or preexisting
+    # destination then fails atomically instead of being replaced.  The final
+    # report has nlink=1 again after removing our private temporary link.
+    try:
+        os.link(temporary, path, follow_symlinks=False)
+    except FileExistsError as error:
+        raise EvaluationError(f"holdout evaluation appeared while writing: {path}") from error
+    temporary.unlink()
     directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         os.fsync(directory_fd)

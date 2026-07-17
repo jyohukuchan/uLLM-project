@@ -61,3 +61,19 @@ def test_frozen_policy_assessment_rejects_any_pathological_relative_l2_row() -> 
     assert rejected["pathological_relative_l2_rejections"]["logits_relative_l2"] == [
         f"case-{index}" for index in range(24)
     ]
+
+
+def test_holdout_report_publication_is_create_new_and_single_link(tmp_path: Path) -> None:
+    module = load_module()
+    output = tmp_path / "holdout-evaluation.json"
+
+    module.atomic_json(output, {"status": "go"})
+
+    assert output.exists()
+    assert output.stat().st_nlink == 1
+    try:
+        module.atomic_json(output, {"status": "no-go"})
+    except module.EvaluationError:
+        pass
+    else:  # pragma: no cover - defensive assertion for a one-time receipt
+        raise AssertionError("a second holdout report publication was accepted")
