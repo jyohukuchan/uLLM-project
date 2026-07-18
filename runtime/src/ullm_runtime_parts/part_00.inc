@@ -1204,6 +1204,18 @@ public:
             error);
     }
 
+    bool compile_linear_attn_recurrent_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        return compile_kernel(
+            arch,
+            linear_attn_recurrent_shuffle_prototype_kernel_source(),
+            "ullm_linear_attn_recurrent_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
 private:
     using hiprtc_create_program_fn =
         int (*)(void **, const char *, const char *, int, const char *const *, const char *const *);

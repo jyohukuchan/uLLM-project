@@ -1264,6 +1264,26 @@ ullm_status ullm_runtime_linear_attn_recurrent_f32(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream);
 
+/*
+ * Direct, experimental gfx1201 kernel for the Qwen3.5 Gated DeltaNet recurrent update
+ * (key/value heads=16/32 and key/value dim=128). This never changes production dispatch and
+ * never falls back; it is intended only for differential and timing validation.
+ */
+ullm_status ullm_runtime_linear_attn_recurrent_shuffle_prototype_f32(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *k_buffer,
+    const ullm_runtime_buffer *v_buffer,
+    const ullm_runtime_buffer *gate_buffer,
+    const ullm_runtime_buffer *beta_buffer,
+    size_t key_heads,
+    size_t value_heads,
+    size_t sequence_len,
+    size_t key_dim,
+    size_t value_dim,
+    ullm_runtime_buffer *state_buffer,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
 ullm_status ullm_runtime_smoke_add_f32(
     const float *lhs,
     const float *rhs,
