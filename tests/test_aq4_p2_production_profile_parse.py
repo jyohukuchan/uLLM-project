@@ -259,6 +259,37 @@ def test_parse_binds_a_synthetic_profile_with_the_new_family(tmp_path: Path) -> 
     assert json.loads(output.read_text(encoding="utf-8")) == result
 
 
+def test_parse_api_accepts_the_rocprofv3_function_column_variant(tmp_path: Path) -> None:
+    # The rocprofv3 build actually installed for P2 capture names the HIP API
+    # trace's name column "Function" rather than "Name"/"API_Name"/"ApiName".
+    profile, window, binding = bound_inputs(tmp_path)
+    write_kernel_trace(
+        profile / "detail_kernel_trace.csv",
+        [
+            {
+                "Kernel_Name": "ullm_top1_f32_kernel",
+                "Start_Timestamp": 0,
+                "End_Timestamp": 10,
+                "Phase": "decode",
+            }
+        ],
+    )
+    (profile / "detail_hip_api_trace.csv").write_text(
+        "Domain,Function,Process_Id,Thread_Id,Correlation_Id,Start_Timestamp,End_Timestamp\n"
+        "HIP,hipModuleLaunchKernel,1,1,1,0,10\n"
+        "HIP,hipStreamSynchronize,1,1,2,10,20\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "profile.json"
+
+    result = parse_profile(profile, window, binding, output)
+
+    assert result["status"] == "profiled_diagnostic"
+    assert result["launch_sync"]["status"] == "captured"
+    assert result["launch_sync"]["launch_count"] == 1
+    assert result["launch_sync"]["sync_count"] == 1
+
+
 def test_unknown_kernel_time_is_blocked_by_default_and_can_be_explicitly_allowed(
     tmp_path: Path,
 ) -> None:

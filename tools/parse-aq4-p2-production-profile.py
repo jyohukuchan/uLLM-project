@@ -23,7 +23,13 @@ from typing import Any
 
 
 SCHEMA = "ullm.aq4_p2_production_baseline_profile.v1"
-MAX_ROWS = 500_000
+# Calibrated against real rocprofv3 captures for the 6 P2 detailed-profile
+# windows: the largest normal-scale HIP API trace observed was 1,316,514 rows
+# (prefill-n128-m1).  decode-c3584 (M=1 chunking over a 3584-token context)
+# is a deliberate outlier at ~36.6M rows / ~5.85GB total and is intentionally
+# left out of bounds rather than raised to accommodate -- see
+# journal/2026/07/18/aq4-p2-production-profile-parser-fixes-v0.1.md.
+MAX_ROWS = 2_000_000
 MAX_TRACE_BYTES = 256 * 1024 * 1024
 MAX_PROFILE_FILES = 128
 MAX_PROFILE_TOTAL_BYTES = 512 * 1024 * 1024
@@ -187,7 +193,7 @@ def parse_api(path: Path | None) -> dict[str, Any]:
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         require(reader.fieldnames is not None, "HIP API trace header differs")
-        name_col = column(reader.fieldnames, ("Name", "API_Name", "ApiName", "name"), "HIP API name")
+        name_col = column(reader.fieldnames, ("Name", "API_Name", "ApiName", "name", "Function"), "HIP API name")
         assert name_col
         for number, row in enumerate(reader, 2):
             require(number <= MAX_ROWS + 1 and None not in row, "HIP API trace row differs")
