@@ -1503,6 +1503,15 @@ fn startup(
         || observed.name.is_empty()
         || observed.device_id < 0
     {
+        eprintln!(
+            "DEBUG_DEVICE_MISMATCH: device_index={} observed_gcn_arch={:?} manifest_device={:?} observed_backend={:?} observed_name={:?} observed_device_id={}",
+            args.device_index,
+            observed.gcn_arch_name,
+            model.worker.identity.device,
+            observed.backend,
+            observed.name,
+            observed.device_id
+        );
         return Err("runtime device is not exact served R9700/gfx1201 identity".into());
     }
     let binary = env::current_exe()
