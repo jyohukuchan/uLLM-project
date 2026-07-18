@@ -57,6 +57,7 @@ const F_SEAL_SHRINK: c_int = 0x0002;
 const F_SEAL_GROW: c_int = 0x0004;
 const F_SEAL_WRITE: c_int = 0x0008;
 const REQUIRED_MEMFD_SEALS: c_int = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+#[cfg(test)]
 const WORKER_HARDLINK_FIXTURE_RAW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/aq4-p2-resident-worker-hardlinks/active-production.json"
@@ -1047,8 +1048,7 @@ fn resource_peak(preflight: &Value) -> Value {
 
 impl WorkerHardlinkGuard {
     fn capture(worker_path: &Path, expected_sha256: &str) -> Result<Self, String> {
-        let fixture: WorkerHardlinkFixture = serde_json::from_str(WORKER_HARDLINK_FIXTURE_RAW)
-            .map_err(|error| format!("worker hardlink fixture rejected: {error}"))?;
+        let fixture = build_worker_hardlink_fixture(worker_path, expected_sha256)?;
         validate_worker_hardlink_set(&fixture, worker_path, expected_sha256, || {})?;
         Ok(Self { fixture })
     }
@@ -1056,6 +1056,55 @@ impl WorkerHardlinkGuard {
     fn verify(&self, worker_path: &Path, expected_sha256: &str) -> Result<(), String> {
         validate_worker_hardlink_set(&self.fixture, worker_path, expected_sha256, || {})
     }
+}
+
+fn build_worker_hardlink_fixture(
+    worker_path: &Path,
+    expected_sha256: &str,
+) -> Result<WorkerHardlinkFixture, String> {
+    if !valid_sha256(expected_sha256) {
+        return Err("worker link fixture identity differs".into());
+    }
+    require_absolute_normal_path(worker_path, "worker primary path")?;
+    snapshot_no_symlink_components(worker_path, "worker primary path")?;
+    let parent = worker_path
+        .parent()
+        .ok_or_else(|| "worker primary path has no parent".to_string())?;
+    require_absolute_normal_path(parent, "worker scan root")?;
+
+    let metadata = fs::symlink_metadata(worker_path)
+        .map_err(|error| format!("worker primary path metadata failed: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("worker primary path must be a regular non-symlink file".into());
+    }
+    let expected = worker_file_identity(&metadata);
+
+    let mut roots = vec![parent.to_path_buf()];
+    let deps = parent.join("deps");
+    match fs::symlink_metadata(&deps) {
+        Ok(_) => roots.push(deps),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("worker deps root metadata failed: {error}")),
+    }
+
+    let mut discovered_paths = BTreeSet::new();
+    for root in &roots {
+        discovered_paths.extend(scan_worker_inode_paths(root, expected, "worker scan root")?);
+    }
+    if !discovered_paths.remove(worker_path) {
+        return Err("worker primary path is absent from scan roots".into());
+    }
+    let mut paths = vec![worker_path.to_path_buf()];
+    paths.extend(discovered_paths);
+
+    Ok(WorkerHardlinkFixture {
+        schema_version: "ullm.aq4_p2_resident_worker_link_identity.v2".into(),
+        roots,
+        paths,
+        primary_path: worker_path.to_path_buf(),
+        sha256: expected_sha256.into(),
+        expected,
+    })
 }
 
 fn worker_file_identity(metadata: &fs::Metadata) -> WorkerFileIdentity {
@@ -2830,6 +2879,51 @@ mod tests {
         assert_eq!(fixture.expected.nlink, 1);
         validate_worker_hardlink_set(&fixture, &fixture.primary_path, &fixture.sha256, || {})
             .unwrap();
+    }
+
+    #[test]
+    fn worker_guard_capture_builds_live_fixture_for_cargo_style_hardlinks() {
+        let tree = worker_test_tree(true);
+        let guard = WorkerHardlinkGuard::capture(&tree.primary, &tree.fixture.sha256).unwrap();
+
+        assert_eq!(
+            guard.fixture.roots,
+            vec![tree.release.clone(), tree.deps.clone()]
+        );
+        assert_eq!(
+            guard.fixture.paths,
+            vec![tree.primary.clone(), tree.alias.clone()]
+        );
+        assert_eq!(guard.fixture.primary_path, tree.primary);
+        assert_eq!(
+            guard.fixture.expected,
+            worker_file_identity(&fs::symlink_metadata(&tree.primary).unwrap())
+        );
+        guard.verify(&tree.primary, &tree.fixture.sha256).unwrap();
+    }
+
+    #[test]
+    fn worker_guard_capture_accepts_single_link_staging_worker_without_deps() {
+        let directory = TemporaryDirectory::new("worker-staging");
+        let primary = directory.0.join("ullm-aq4-worker");
+        fs::write(&primary, b"staging-worker").unwrap();
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o755)).unwrap();
+        let expected_sha256 = sha256_bytes(b"staging-worker");
+
+        let guard = WorkerHardlinkGuard::capture(&primary, &expected_sha256).unwrap();
+
+        assert_eq!(guard.fixture.roots, vec![directory.0.clone()]);
+        assert_eq!(guard.fixture.paths, vec![primary.clone()]);
+        assert_eq!(guard.fixture.expected.nlink, 1);
+        guard.verify(&primary, &expected_sha256).unwrap();
+    }
+
+    #[test]
+    fn worker_guard_capture_rejects_hardlink_outside_live_roots() {
+        let tree = worker_test_tree(false);
+        fs::hard_link(&tree.primary, tree.directory.join("outside-release-worker")).unwrap();
+
+        assert!(WorkerHardlinkGuard::capture(&tree.primary, &tree.fixture.sha256).is_err());
     }
 
     #[test]
