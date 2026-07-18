@@ -1872,7 +1872,7 @@
 
     #[test]
     #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_DIFFERENTIAL=1"]
-    fn hip_aq4_wmma_prototype_v2_m128_group16_mlp_shapes_match_cpu_when_enabled() {
+    fn hip_aq4_wmma_prototype_v2_m128_group16_model_shapes_match_cpu_when_enabled() {
         assert_eq!(
             std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_DIFFERENTIAL").as_deref(),
             Ok("1"),
@@ -1894,16 +1894,23 @@
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed as f32) / (u32::MAX as f32)
         };
-        // These are the two full MLP projections that dominate prefill. Together they exercise
-        // both v2 ping-pong counts (128 and 384 Wide-K tiles) and both null/non-null row-scale
-        // ABI paths against the CPU AQ4 reference.
+        // These are every distinct group16/M=128 production geometry admitted by v1. Together
+        // they exercise both v2 ping-pong counts (128 and 384 Wide-K tiles), the null/non-null
+        // row-scale ABI paths, and the two-row-tile linear_attn_a/b launch against the CPU AQ4
+        // reference.
         for &(family, rows, cols, use_row_scales) in &[
+            ("attn_q + linear_attn_qkv", 8_192_usize, 4_096, true),
+            ("linear_attn_z", 4_096, 4_096, false),
+            ("linear_attn_a + linear_attn_b", 32, 4_096, true),
             ("mlp_gate + mlp_up", 12_288_usize, 4_096, true),
             ("mlp_down", 4_096, 12_288, false),
         ] {
             let batch_count = 128_usize;
             assert_eq!(rows % 16, 0, "{family} must fill WMMA row tiles");
             assert_eq!(cols % 32, 0, "{family} must fill Wide-K pairs");
+            if rows == 32 {
+                assert_eq!(rows / 16, 2, "{family} must launch exactly two row tiles");
+            }
             let elements = rows * cols;
             let index_bytes = elements / 2;
             let groups = elements / 16;
@@ -2096,7 +2103,7 @@
 
     #[test]
     #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_TIMING=1"]
-    fn hip_aq4_wmma_prototype_v2_m128_group16_mlp_timing_vs_wmma_prototype_when_enabled() {
+    fn hip_aq4_wmma_prototype_v2_m128_group16_model_shapes_timing_vs_wmma_prototype_when_enabled() {
         assert_eq!(
             std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_TIMING").as_deref(),
             Ok("1"),
@@ -2121,12 +2128,18 @@
             (seed as f32) / (u32::MAX as f32)
         };
         for &(family, rows, cols) in &[
+            ("attn_q + linear_attn_qkv", 8_192_usize, 4_096),
+            ("linear_attn_z", 4_096, 4_096),
+            ("linear_attn_a + linear_attn_b", 32, 4_096),
             ("mlp_gate + mlp_up", 12_288_usize, 4_096),
             ("mlp_down", 4_096, 12_288),
         ] {
             let batch_count = 128_usize;
             assert_eq!(rows % 16, 0, "{family} must fill WMMA row tiles");
             assert_eq!(cols % 32, 0, "{family} must fill Wide-K pairs");
+            if rows == 32 {
+                assert_eq!(rows / 16, 2, "{family} must launch exactly two row tiles");
+            }
             let elements = rows * cols;
             let index_bytes = elements / 2;
             let groups = elements / 16;

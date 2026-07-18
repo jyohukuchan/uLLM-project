@@ -7,6 +7,14 @@
 AQ4 registry、dispatch 判定は変更しない。新しい C ABI と Rust wrapper には意図的に
 `*_wmma_prototype_v2_*` という名前を付け、同じプロセスで v1 と v2 を比較できるようにした。
 
+v2 の kernel guard、host ABI validation、launch grid はすでに v1 と同じ一般化済み contract を
+使う。すなわち `gfx1201`、group16、M=128、`rows % 16 == 0`、`cols % 32 == 0` であり、grid は
+`(rows / 16, 128 / 128)` である。このため対象には attn_q/linear_attn_qkv (`8192x4096`)、
+linear_attn_z (`4096x4096`)、linear_attn_a/linear_attn_b (`32x4096`)、mlp_gate/mlp_up
+(`12288x4096`)、mlp_down (`4096x12288`) の全てが含まれる。今回追加したのは、この全 shape set を
+v2 で実機検証する GPU-gated test coverage である。実機 differential と timing の結果が揃うまでは
+production dispatch を v1 のまま維持する。
+
 ## roofline の前提
 
 project の architecture reference は FP16 WMMA を 1024 FLOP/clock/CU と記載している。
@@ -36,6 +44,11 @@ v2 は K 依存の weight/input LDS tile だけを二重化し、合計 26,624 B
 もう一方の LDS stage に store して、一つの uniform producer/consumer barrier で公開する。最終 output
 barrier を含めて 129 / 385 回となり、v1 の K-loop barrier 数をほぼ半分にする。
 
+この 26,624 B は CTA ごとの固定値であり、`32x4096` の場合も変わらない。small-row shape は
+`grid_x = 32 / 16 = 2` で CTA が二つになるだけである。gfx1201 の 64 KiB/CU LDS budget を下回ることを
+kernel source の compile-time assertion でも固定した。これは resident CTA 数や VGPR occupancy を保証する
+ものではないため、実機 validation では compile/launch 成功、differential、timing を必ず確認する。
+
 LDS のみで見る resident 上限は、3 CTA / 24 wave32（32 wavefront/CU の 75%）から、2 CTA / 16 wave32
 （50%）になる。FP32 input prefetch の register 使用量により、実際の occupancy はさらに下がり得る。
 このため v2 は production への変更ではなく、明確な A/B 実験である。timing を解釈する前に GPU profiler
@@ -46,29 +59,40 @@ LDS のみで見る resident 上限は、3 CTA / 24 wave32（32 wavefront/CU の
 ```bash
 ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_DIFFERENTIAL=1 \
   cargo test -p ullm-runtime-sys \
-  hip_aq4_wmma_prototype_v2_m128_group16_mlp_shapes_match_cpu_when_enabled \
+  hip_aq4_wmma_prototype_v2_m128_group16_model_shapes_match_cpu_when_enabled \
   -- --ignored --nocapture --test-threads=1
 ```
 
-この test は `12288x4096` と `4096x12288`、M=128 を CPU AQ4 reference と比較する。128 回と
-384 回の Wide-K iteration、および optional row-scale ABI の null/non-null の両方を通す。staging
-tolerance は `0.05 + 0.01 * abs(expected)` である。
+この test は全 5 group16 production geometry、M=128 を CPU AQ4 reference と比較する。128 回と
+384 回の Wide-K iteration、optional row-scale ABI の null/non-null、small `32x4096` の 2-row-tile
+launch を通す。staging tolerance は `0.05 + 0.01 * abs(expected)` である。
 
 ```bash
 ULLM_RUN_AQ4_WMMA_PROTOTYPE_V2_TIMING=1 \
   cargo test -p ullm-runtime-sys \
-  hip_aq4_wmma_prototype_v2_m128_group16_mlp_timing_vs_wmma_prototype_when_enabled \
+  hip_aq4_wmma_prototype_v2_m128_group16_model_shapes_timing_vs_wmma_prototype_when_enabled \
   -- --ignored --nocapture --test-threads=1
 ```
 
-timing test は各 isolated module を 3 回 warm-up し、各 MLP shape で v1 を 20 launch、v2 を 20 launch
-する。ms/launch、nominal GEMM TFLOPS、v1/v2 speedup を出力する。
+timing test は各 isolated module を 3 回 warm-up し、全 5 production geometry で v1 を 20 launch、v2 を
+20 launchする。ms/launch、nominal GEMM TFLOPS、v1/v2 speedup を出力する。
 
 ## CPU-only verification
 
 ```text
-cargo test -p ullm-runtime-sys --lib aq4_wmma_prototype -- --test-threads=1
-1 passed, 0 failed, 4 ignored
+cargo test -p ullm-runtime-sys -- --test-threads=1
+160 passed, 0 failed, 7 ignored
+
+cargo test -p ullm-engine --lib
+737 passed, 0 failed, 1 ignored
+
+cargo test -p ullm-engine --lib backend_operation_registry::tests:: -- --test-threads=1
+50 passed, 0 failed, 1 ignored
+
+git diff --check
+passed
 ```
 
-ignored test は有効化しておらず、この作業では HIPRTC と GPU kernel を実行していない。
+`cargo fmt --all --check` は今回の変更とは無関係な既存 source files の formatting diff を報告するため
+失敗する。整形対象を勝手に広げず、その baseline failure はこの変更に含めない。GPU-gated ignored test は
+有効化しておらず、この作業では HIPRTC と GPU kernel を実行していない。

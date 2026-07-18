@@ -1350,6 +1350,19 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
     using FragB = fragment<matrix_b, kTileRows, kTileCols, kWmmaK, float16_t, col_major>;
     using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;
 
+    // This allocation is per CTA, so it is unchanged for the 32x4096 linear_attn_a/b
+    // geometry: that launch has exactly two row CTAs, each with the same ping-pong stages.
+    constexpr unsigned int kWeightTilesLdsBytes =
+        kStages * kTileRows * kWideK * sizeof(float16_t);
+    constexpr unsigned int kInputTilesLdsBytes =
+        kStages * kBatchTile * kWideK * sizeof(float16_t);
+    constexpr unsigned int kOutputTileLdsBytes =
+        kWavesPerBlock * kTileRows * kTileCols * sizeof(float);
+    constexpr unsigned int kStaticLdsBytes =
+        kWeightTilesLdsBytes + kInputTilesLdsBytes + kOutputTileLdsBytes;
+    static_assert(kStaticLdsBytes == 26624u, "AQ4 WMMA v2 LDS accounting drifted");
+    static_assert(kStaticLdsBytes <= 64u * 1024u, "AQ4 WMMA v2 must fit gfx1201 LDS");
+
     // V2 has two ping-pong LDS stages. A wave first copies the current stage into fragments,
     // then prefetches its next input vectors to registers while its current WMMA work executes.
     // The next LDS stage is only published at the transition barrier, so no stage is overwritten
