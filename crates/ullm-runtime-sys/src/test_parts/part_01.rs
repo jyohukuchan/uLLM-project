@@ -1046,7 +1046,7 @@
                 *byte = low | (high << 4);
             }
             let scale_indices: Vec<u8> = (0..groups)
-                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .map(|_| ((next_unit() * scale_count as f32) as u8).min(scale_count as u8 - 1))
                 .collect();
             let codebook_values: Vec<f32> = (0..16)
                 .map(|_| next_unit() * 1.0 - 0.5)
@@ -1270,7 +1270,7 @@
                 *byte = low | (high << 4);
             }
             let scale_indices: Vec<u8> = (0..groups)
-                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .map(|_| ((next_unit() * scale_count as f32) as u8).min(scale_count as u8 - 1))
                 .collect();
             let codebook_values: Vec<f32> = (0..16).map(|_| next_unit() - 0.5).collect();
             let scale_values: Vec<f32> = (0..scale_count).map(|_| 0.5 + next_unit() * 0.5).collect();
@@ -1481,7 +1481,7 @@
                 *byte = low | (high << 4);
             }
             let scale_indices: Vec<u8> = (0..groups)
-                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .map(|_| ((next_unit() * scale_count as f32) as u8).min(scale_count as u8 - 1))
                 .collect();
             let codebook_values: Vec<f32> = (0..16).map(|_| next_unit() - 0.5).collect();
             let scale_values: Vec<f32> = (0..scale_count).map(|_| 0.5 + next_unit() * 0.5).collect();
@@ -1711,7 +1711,7 @@
                 *byte = low | (high << 4);
             }
             let scale_indices: Vec<u8> = (0..groups)
-                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .map(|_| ((next_unit() * scale_count as f32) as u8).min(scale_count as u8 - 1))
                 .collect();
             let codebook_values: Vec<f32> = (0..16).map(|_| next_unit() - 0.5).collect();
             let scale_values: Vec<f32> = (0..scale_count).map(|_| 0.5 + next_unit() * 0.5).collect();
