@@ -1562,9 +1562,9 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
-    // Direct-only gfx1201 AQ4 group8 WMMA experiment. It deliberately owns a separate HIPRTC
-    // source/module from the group16 production kernel, so compiling or timing it cannot perturb
-    // the served group16 code object.
+    // Production gfx1201 AQ4 group8 WMMA path. It deliberately owns a separate HIPRTC
+    // source/module from the group16 production kernel, so its rocWMMA compilation cannot
+    // perturb the served group16 code object.
     static const char *aq4_matvec_wmma_group8_prototype_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>

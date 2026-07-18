@@ -2034,10 +2034,10 @@ pub fn aq4_matvec_batch_wmma_prototype_f32(
     })
 }
 
-/// Directly invokes the isolated gfx1201 rocWMMA AQ4 group8 M=128 prototype.
+/// Directly invokes the production gfx1201 rocWMMA AQ4 group8 M=128 kernel.
 ///
-/// This forced path has no dispatch or environment dependency and never falls back. Its initial
-/// scope is limited to the profiled 4096x4096 and 1024x4096 group8 projection shapes.
+/// This forced path has no dispatch or environment dependency and never falls back. It accepts
+/// nonzero group8 shapes with rows divisible by 16 and cols divisible by 32.
 #[allow(clippy::too_many_arguments)]
 pub fn aq4_matvec_batch_wmma_group8_prototype_f32(
     index_buffer: &RuntimeBuffer,
@@ -2065,9 +2065,9 @@ pub fn aq4_matvec_batch_wmma_group8_prototype_f32(
     if batch_count != 128 {
         return Err("AQ4 group8 WMMA prototype requires batch count M=128".to_string());
     }
-    if !matches!((rows, cols), (4_096, 4_096) | (1_024, 4_096)) {
+    if rows == 0 || cols == 0 || !rows.is_multiple_of(16) || !cols.is_multiple_of(32) {
         return Err(
-            "AQ4 group8 WMMA prototype requires a 4096x4096 or 1024x4096 target shape"
+            "AQ4 group8 WMMA prototype requires nonzero rows divisible by 16 and cols divisible by 32"
                 .to_string(),
         );
     }

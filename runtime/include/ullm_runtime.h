@@ -310,10 +310,10 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
     ullm_runtime_stream *stream);
 
 /*
- * Direct-only gfx1201 rocWMMA AQ4 group8 M=128 experiment. This additive ABI uses a separate
- * HIPRTC module and never participates in production dispatch. It accepts only the profiled
- * 4096x4096 and 1024x4096 projection shapes, rejecting every other backend or geometry without
- * a fallback.
+ * Direct production gfx1201 rocWMMA AQ4 group8 GEMM for M=128. This stable ABI uses a separate
+ * HIPRTC module and accepts only nonzero shapes with rows divisible by 16 and cols divisible by
+ * 32; those constraints preserve complete 16-row output tiles and the Wide-K 16-byte source
+ * loads. It has no fallback.
  */
 ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
     const ullm_runtime_buffer *index_buffer,

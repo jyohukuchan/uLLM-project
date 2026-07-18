@@ -1355,7 +1355,7 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
             cols,
             batch_count)) {
         set_error(
-            "AQ4 group8 WMMA prototype requires exact gfx1201, group8, M=128, and a 4096x4096 or 1024x4096 target shape");
+            "AQ4 group8 WMMA prototype requires exact gfx1201, group8, M=128, nonzero rows divisible by 16, and cols divisible by 32");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u ||

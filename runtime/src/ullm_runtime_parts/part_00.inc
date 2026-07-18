@@ -3520,8 +3520,8 @@ HipAq4MatvecWmmaPrototypeKernelCache &hip_aq4_matvec_wmma_prototype_kernel_cache
     return cache;
 }
 
-// The group8 experiment owns a second rocWMMA module/cache. The production group16 module and
-// all existing scalar/register dispatch paths remain immutable while this direct API is tested.
+// The group8 production path owns a second rocWMMA module/cache. The group16 module and all
+// scalar/register dispatch paths remain isolated from its compiler flags and source.
 class HipAq4MatvecWmmaGroup8PrototypeKernelCache {
 public:
     void *function_for_device(int device_id, std::string *error) {
@@ -4126,12 +4126,13 @@ bool aq4_matvec_batch_wmma_group8_prototype_shape_is_supported(
     size_t rows,
     size_t cols,
     size_t batch_count) {
-    // Keep the initial group8 experiment scoped to the two profiled projection geometries. They
-    // both have exact 16-row output tiles and K=4096, so the 16-byte packed and FP32 source
-    // vector loads are aligned at every row and Wide-K iteration.
+    // K divisible by 32 makes every packed-index row stride and FP32 input row stride 16-byte
+    // aligned. Complete 16-row tiles let the launch use an exact row grid. These are the full
+    // production group8 WMMA constraints; the served 4096x4096 and 1024x4096 projections are
+    // both members of this set.
     return arch == "gfx1201" && group_size == kAq4RegisterGroup8 &&
-        batch_count == kAq4WmmaPrototypeBm &&
-        ((rows == 4096u && cols == 4096u) || (rows == 1024u && cols == 4096u));
+        batch_count == kAq4WmmaPrototypeBm && rows != 0u && cols != 0u &&
+        rows % kAq4WmmaPrototypeBn == 0u && cols % kAq4WmmaPrototypeBk == 0u;
 }
 
 Aq4MatvecBatchDispatchKind aq4_matvec_batch_dispatch_kind_for_device(
@@ -4485,7 +4486,7 @@ bool aq4_matvec_batch_f32_wmma_group8_prototype_hip_kernel(
             batch_count)) {
         if (error != nullptr) {
             *error =
-                "AQ4 group8 WMMA prototype requires gfx1201, group8, M=128, and a 4096x4096 or 1024x4096 target shape";
+                "AQ4 group8 WMMA prototype requires gfx1201, group8, M=128, nonzero rows divisible by 16, and cols divisible by 32";
         }
         return false;
     }

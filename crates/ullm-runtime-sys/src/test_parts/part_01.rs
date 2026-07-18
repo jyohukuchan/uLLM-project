@@ -1879,12 +1879,12 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_DIFFERENTIAL=1"]
-    fn hip_aq4_wmma_group8_prototype_m128_target_shapes_match_cpu_when_enabled() {
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_DIFFERENTIAL=1"]
+    fn hip_aq4_wmma_group8_m128_target_shapes_match_cpu_when_enabled() {
         assert_eq!(
-            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_DIFFERENTIAL").as_deref(),
+            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_DIFFERENTIAL").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_DIFFERENTIAL=1 before running this GPU differential test"
+            "set ULLM_RUN_AQ4_WMMA_GROUP8_DIFFERENTIAL=1 before running this GPU differential test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -1902,9 +1902,9 @@
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed as f32) / (u32::MAX as f32)
         };
-        // The direct ABI uses a separate module from both production group16 WMMA and the
-        // group8 register kernel. These two tuples exercise the profiled dimensions and both
-        // optional row-scale ABI states.
+        // The production direct ABI uses a separate module from both group16 WMMA and the group8
+        // register kernel. These tuples exercise the served dimensions and both optional
+        // row-scale ABI states.
         for &(family, rows, cols, use_row_scales) in &[
             ("attn_o + linear_attn_out", 4_096_usize, 4_096, true),
             ("attn_k + attn_v", 1_024, 4_096, false),
@@ -2106,13 +2106,13 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_TIMING=1"]
-    fn hip_aq4_wmma_group8_prototype_m128_target_shapes_timing_vs_register_bm8_group8_when_enabled()
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_TIMING=1"]
+    fn hip_aq4_wmma_group8_m128_target_shapes_timing_vs_register_bm8_group8_when_enabled()
     {
         assert_eq!(
-            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_TIMING").as_deref(),
+            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_TIMING").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_AQ4_WMMA_GROUP8_PROTOTYPE_TIMING=1 before running this GPU timing test"
+            "set ULLM_RUN_AQ4_WMMA_GROUP8_TIMING=1 before running this GPU timing test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -2305,7 +2305,7 @@
             assert!(register_ms.is_finite() && register_ms > 0.0);
             assert!(wmma_ms.is_finite() && wmma_ms > 0.0);
             eprintln!(
-                "AQ4 group8 WMMA prototype timing family={family} rows={rows} cols={cols} M={batch_count}: register-bm8-group8={register_ms:.3} ms ({register_tflops:.2} TFLOPS), wmma-group8={wmma_ms:.3} ms ({wmma_tflops:.2} TFLOPS), speedup={:.3}x",
+                "AQ4 group8 WMMA timing family={family} rows={rows} cols={cols} M={batch_count}: register-bm8-group8={register_ms:.3} ms ({register_tflops:.2} TFLOPS), wmma-group8={wmma_ms:.3} ms ({wmma_tflops:.2} TFLOPS), speedup={:.3}x",
                 register_ms / wmma_ms
             );
         }

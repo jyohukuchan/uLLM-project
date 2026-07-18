@@ -249,10 +249,10 @@
     }
 
     #[test]
-    fn aq4_wmma_group8_prototype_target_shape_contracts_have_exact_full_tile_grids() {
-        // The direct-only group8 experiment is intentionally scoped to the two profiled
-        // projections. Each 16-byte Wide-K packed load covers 32 AQ4 values, hence four
-        // independent group8 scales, while preserving the same aligned 16-row / M=128 grid.
+    fn aq4_wmma_group8_target_shape_contracts_have_exact_full_tile_grids() {
+        // The served group8 projections use exact 16-row output tiles. Each 16-byte Wide-K
+        // packed load covers 32 AQ4 values, hence four independent group8 scales, while
+        // preserving the same aligned M=128 grid.
         for (family, rows, cols, expected_grid_x) in [
             ("attn_o + linear_attn_out", 4_096_usize, 4_096, 256),
             ("attn_k + attn_v", 1_024, 4_096, 64),
