@@ -1097,6 +1097,50 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_sigmoid_gate_f32(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream);
 
+/*
+ * Experimental, direct-only gfx1201 rocWMMA cold-prefill implementation. It is intentionally
+ * not connected to the production paged-attention registry. The prototype accepts the same
+ * paged F32 buffer layouts as the scalar reader, but only Qwen3.5-9B's exact geometry:
+ * Q=16, KV=4, head_dim=value_dim=256, and a 256-token page. It uses FP16 Q/K staging and FP32
+ * online softmax/output accumulation, so validate it against the scalar reader before use.
+ */
+ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *k_cache_buffer,
+    const ullm_runtime_buffer *v_cache_buffer,
+    const ullm_runtime_buffer *block_table_buffer,
+    size_t cached_prefix_len,
+    size_t m,
+    size_t block_size,
+    size_t cache_blocks,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim,
+    float softmax_scale,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/* As above, then applies the Qwen3.5 self-attention output gate, sigmoid(gate), to the final
+ * normalized F32 attention output. The gate ABI is [M,q_heads,head_dim]. */
+ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *gate_buffer,
+    const ullm_runtime_buffer *k_cache_buffer,
+    const ullm_runtime_buffer *v_cache_buffer,
+    const ullm_runtime_buffer *block_table_buffer,
+    size_t cached_prefix_len,
+    size_t m,
+    size_t block_size,
+    size_t cache_blocks,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim,
+    float softmax_scale,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
 ullm_status ullm_runtime_linear_attn_qkv_prepare_f32(
     const ullm_runtime_buffer *qkv_buffer,
     const ullm_runtime_buffer *conv_weight_buffer,

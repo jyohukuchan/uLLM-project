@@ -1124,3 +1124,372 @@
             assert_eq!(le_bytes_to_f32s(&output_bytes), vec![42.0_f32; m * q_heads * value_dim]);
         }
     }
+
+    #[allow(clippy::type_complexity)]
+    fn qwen35_paged_causal_gqa_wmma_prototype_fixture(
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+        const CACHED_PREFIX_LEN: usize = 1_920;
+        const M: usize = 128;
+        const BLOCK_SIZE: usize = 256;
+        const CACHE_BLOCKS: usize = 16;
+        const Q_HEADS: usize = 16;
+        const KV_HEADS: usize = 4;
+        const HEAD_DIM: usize = 256;
+        const VALUE_DIM: usize = 256;
+        const TOTAL_CONTEXT: usize = CACHED_PREFIX_LEN + M;
+
+        // Deliberately non-identity pages exercise the physical KV indirection used by the
+        // production cache. The 2048-token context occupies eight pages in the 16-page cache.
+        let block_table_values = vec![9_u32, 3, 14, 1, 12, 5, 15, 7];
+        assert_eq!(block_table_values.len(), TOTAL_CONTEXT / BLOCK_SIZE);
+
+        let mut seed = 0x6a09_e667_u32;
+        let mut next_unit = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed as f32 / u32::MAX as f32
+        };
+        // Bounded inputs make the FP16 Q/K staging allowance measurable while leaving a wrong
+        // head mapping, transpose, causal mask, or gate far outside the test tolerance.
+        let q_values = (0..M * Q_HEADS * HEAD_DIM)
+            .map(|_| (next_unit() * 2.0 - 1.0) * 0.5)
+            .collect::<Vec<_>>();
+        let gate_values = (0..M * Q_HEADS * VALUE_DIM)
+            .map(|_| next_unit() * 6.0 - 3.0)
+            .collect::<Vec<_>>();
+        let physical_tokens = CACHE_BLOCKS * BLOCK_SIZE;
+        let mut k_cache_values = vec![0.0_f32; physical_tokens * KV_HEADS * HEAD_DIM];
+        let mut v_cache_values = vec![0.0_f32; physical_tokens * KV_HEADS * VALUE_DIM];
+        for logical in 0..TOTAL_CONTEXT {
+            let physical = block_table_values[logical / BLOCK_SIZE] as usize * BLOCK_SIZE
+                + logical % BLOCK_SIZE;
+            for kv_head in 0..KV_HEADS {
+                let k_base = (physical * KV_HEADS + kv_head) * HEAD_DIM;
+                let v_base = (physical * KV_HEADS + kv_head) * VALUE_DIM;
+                for dim in 0..HEAD_DIM {
+                    k_cache_values[k_base + dim] = (next_unit() * 2.0 - 1.0) * 0.5;
+                }
+                for value in 0..VALUE_DIM {
+                    v_cache_values[v_base + value] = (next_unit() * 2.0 - 1.0) * 0.75;
+                }
+            }
+        }
+        (q_values, gate_values, k_cache_values, v_cache_values, block_table_values)
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL=1"]
+    fn hip_paged_causal_gqa_wmma_prototype_qwen35_l2048_matches_scalar_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL=1 before running this GPU differential test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+
+        const CACHED_PREFIX_LEN: usize = 1_920;
+        const M: usize = 128;
+        const BLOCK_SIZE: usize = 256;
+        const CACHE_BLOCKS: usize = 16;
+        const Q_HEADS: usize = 16;
+        const KV_HEADS: usize = 4;
+        const HEAD_DIM: usize = 256;
+        const VALUE_DIM: usize = 256;
+        const SOFTMAX_SCALE: f32 = 0.0625;
+        let (q_values, gate_values, k_cache_values, v_cache_values, block_table_values) =
+            qwen35_paged_causal_gqa_wmma_prototype_fixture();
+
+        let mut context = RuntimeContext::create(device_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let mut q = context.alloc_buffer(q_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let mut gate = context.alloc_buffer(gate_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let mut k_cache = context
+            .alloc_buffer(k_cache_values.len() * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut v_cache = context
+            .alloc_buffer(v_cache_values.len() * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut block_table = context
+            .alloc_buffer(block_table_values.len() * std::mem::size_of::<u32>())
+            .unwrap();
+        let mut scalar_output = context
+            .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut prototype_output = context
+            .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
+            .unwrap();
+        q.copy_from_host(0, &f32s_to_le_bytes(&q_values), Some(&mut stream)).unwrap();
+        gate.copy_from_host(0, &f32s_to_le_bytes(&gate_values), Some(&mut stream)).unwrap();
+        k_cache
+            .copy_from_host(0, &f32s_to_le_bytes(&k_cache_values), Some(&mut stream))
+            .unwrap();
+        v_cache
+            .copy_from_host(0, &f32s_to_le_bytes(&v_cache_values), Some(&mut stream))
+            .unwrap();
+        block_table
+            .copy_from_host(0, &u32s_to_le_bytes(&block_table_values), Some(&mut stream))
+            .unwrap();
+        stream.synchronize().unwrap();
+
+        // This is the existing production scalar direct API and therefore includes its exact
+        // paged indexing, per-source online-softmax order, and final sigmoid output gate.
+        paged_causal_gqa_chunk_sigmoid_gate_f32(
+            &q,
+            &gate,
+            &k_cache,
+            &v_cache,
+            &block_table,
+            CACHED_PREFIX_LEN,
+            M,
+            BLOCK_SIZE,
+            CACHE_BLOCKS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            VALUE_DIM,
+            SOFTMAX_SCALE,
+            &mut scalar_output,
+            Some(&mut stream),
+        )
+        .unwrap();
+        paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+            &q,
+            &gate,
+            &k_cache,
+            &v_cache,
+            &block_table,
+            CACHED_PREFIX_LEN,
+            M,
+            BLOCK_SIZE,
+            CACHE_BLOCKS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            VALUE_DIM,
+            SOFTMAX_SCALE,
+            &mut prototype_output,
+            Some(&mut stream),
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let mut scalar_bytes = vec![0_u8; M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>()];
+        let mut prototype_bytes =
+            vec![0_u8; M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>()];
+        scalar_output
+            .copy_to_host(0, &mut scalar_bytes, Some(&mut stream))
+            .unwrap();
+        prototype_output
+            .copy_to_host(0, &mut prototype_bytes, Some(&mut stream))
+            .unwrap();
+        stream.synchronize().unwrap();
+        let scalar = le_bytes_to_f32s(&scalar_bytes);
+        let prototype = le_bytes_to_f32s(&prototype_bytes);
+        assert!(scalar.iter().all(|value| value.is_finite()));
+        assert!(prototype.iter().all(|value| value.is_finite()));
+        for (index, (actual, expected)) in prototype.iter().zip(&scalar).enumerate() {
+            // Only Q and K are rounded to FP16; WMMA and AV accumulation, online max/sum, V,
+            // normalization, and sigmoid gate remain FP32. 0.005 absolute + 1% relative is a
+            // bounded FP16-score/long-softmax allowance, not a generic pure-F32 fidelity bar.
+            let tolerance = 5e-3_f32 + 1e-2_f32 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "index={index}: prototype={actual} scalar={expected} tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING=1"]
+    fn hip_paged_causal_gqa_wmma_prototype_qwen35_l2048_timing_vs_scalar_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING=1 before running this GPU timing test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+
+        const M: usize = 128;
+        const BLOCK_SIZE: usize = 256;
+        const CACHE_BLOCKS: usize = 16;
+        const Q_HEADS: usize = 16;
+        const KV_HEADS: usize = 4;
+        const HEAD_DIM: usize = 256;
+        const VALUE_DIM: usize = 256;
+        const SOFTMAX_SCALE: f32 = 0.0625;
+        const PREFILL_CHUNKS: usize = 16;
+        const WARMUP_ITERATIONS: usize = 3;
+        const TIMED_ITERATIONS: usize = 20;
+        let (q_values, gate_values, k_cache_values, v_cache_values, block_table_values) =
+            qwen35_paged_causal_gqa_wmma_prototype_fixture();
+
+        let mut context = RuntimeContext::create(device_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let mut q = context.alloc_buffer(q_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let mut gate = context.alloc_buffer(gate_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let mut k_cache = context
+            .alloc_buffer(k_cache_values.len() * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut v_cache = context
+            .alloc_buffer(v_cache_values.len() * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut block_table = context
+            .alloc_buffer(block_table_values.len() * std::mem::size_of::<u32>())
+            .unwrap();
+        let mut scalar_output = context
+            .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
+            .unwrap();
+        let mut prototype_output = context
+            .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
+            .unwrap();
+        q.copy_from_host(0, &f32s_to_le_bytes(&q_values), Some(&mut stream)).unwrap();
+        gate.copy_from_host(0, &f32s_to_le_bytes(&gate_values), Some(&mut stream)).unwrap();
+        k_cache
+            .copy_from_host(0, &f32s_to_le_bytes(&k_cache_values), Some(&mut stream))
+            .unwrap();
+        v_cache
+            .copy_from_host(0, &f32s_to_le_bytes(&v_cache_values), Some(&mut stream))
+            .unwrap();
+        block_table
+            .copy_from_host(0, &u32s_to_le_bytes(&block_table_values), Some(&mut stream))
+            .unwrap();
+        stream.synchronize().unwrap();
+
+        // Compile/load both independent HIPRTC modules before timing, matching the AQ4 prototype
+        // timing discipline. Each timed iteration walks all sixteen M=128 chunks of a 2048-token
+        // cold prefill; Q/Gate values are reused only to avoid host copies, not to change shape.
+        for _ in 0..WARMUP_ITERATIONS {
+            for chunk in 0..PREFILL_CHUNKS {
+                paged_causal_gqa_chunk_sigmoid_gate_f32(
+                    &q,
+                    &gate,
+                    &k_cache,
+                    &v_cache,
+                    &block_table,
+                    chunk * M,
+                    M,
+                    BLOCK_SIZE,
+                    CACHE_BLOCKS,
+                    Q_HEADS,
+                    KV_HEADS,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    SOFTMAX_SCALE,
+                    &mut scalar_output,
+                    Some(&mut stream),
+                )
+                .unwrap();
+            }
+        }
+        stream.synchronize().unwrap();
+        for _ in 0..WARMUP_ITERATIONS {
+            for chunk in 0..PREFILL_CHUNKS {
+                paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+                    &q,
+                    &gate,
+                    &k_cache,
+                    &v_cache,
+                    &block_table,
+                    chunk * M,
+                    M,
+                    BLOCK_SIZE,
+                    CACHE_BLOCKS,
+                    Q_HEADS,
+                    KV_HEADS,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    SOFTMAX_SCALE,
+                    &mut prototype_output,
+                    Some(&mut stream),
+                )
+                .unwrap();
+            }
+        }
+        stream.synchronize().unwrap();
+
+        let scalar_started = std::time::Instant::now();
+        for _ in 0..TIMED_ITERATIONS {
+            for chunk in 0..PREFILL_CHUNKS {
+                paged_causal_gqa_chunk_sigmoid_gate_f32(
+                    &q,
+                    &gate,
+                    &k_cache,
+                    &v_cache,
+                    &block_table,
+                    chunk * M,
+                    M,
+                    BLOCK_SIZE,
+                    CACHE_BLOCKS,
+                    Q_HEADS,
+                    KV_HEADS,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    SOFTMAX_SCALE,
+                    &mut scalar_output,
+                    Some(&mut stream),
+                )
+                .unwrap();
+            }
+        }
+        stream.synchronize().unwrap();
+        let scalar_elapsed = scalar_started.elapsed();
+
+        let prototype_started = std::time::Instant::now();
+        for _ in 0..TIMED_ITERATIONS {
+            for chunk in 0..PREFILL_CHUNKS {
+                paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+                    &q,
+                    &gate,
+                    &k_cache,
+                    &v_cache,
+                    &block_table,
+                    chunk * M,
+                    M,
+                    BLOCK_SIZE,
+                    CACHE_BLOCKS,
+                    Q_HEADS,
+                    KV_HEADS,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    SOFTMAX_SCALE,
+                    &mut prototype_output,
+                    Some(&mut stream),
+                )
+                .unwrap();
+            }
+        }
+        stream.synchronize().unwrap();
+        let prototype_elapsed = prototype_started.elapsed();
+
+        let scalar_ms = scalar_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+        let prototype_ms = prototype_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+        let total_prefill_tokens = PREFILL_CHUNKS * M;
+        let attended_tokens = total_prefill_tokens * (total_prefill_tokens + 1) / 2;
+        // Counts FMA as two FLOPs for both QK and AV; softmax/gating overhead is intentionally
+        // excluded, so this is comparable useful-attention math rather than a hardware peak claim.
+        // `attended_tokens` already sums all query rows in all sixteen chunks, so this is the
+        // useful work for one complete self-attention layer prefill, not one M=128 launch.
+        let flops_per_prefill = 2.0_f64
+            * Q_HEADS as f64
+            * attended_tokens as f64
+            * (HEAD_DIM + VALUE_DIM) as f64;
+        let scalar_tflops = flops_per_prefill / (scalar_ms / 1_000.0) / 1.0e12;
+        let prototype_tflops = flops_per_prefill / (prototype_ms / 1_000.0) / 1.0e12;
+        assert!(scalar_ms.is_finite() && scalar_ms > 0.0);
+        assert!(prototype_ms.is_finite() && prototype_ms > 0.0);
+        eprintln!(
+            "paged causal GQA WMMA prototype timing Q=16 KV=4 dim=256 L=2048 (one self-attention layer, 16xM=128): scalar={scalar_ms:.3} ms ({scalar_tflops:.3} TFLOPS), wmma-qk={prototype_ms:.3} ms ({prototype_tflops:.3} TFLOPS), speedup={:.3}x",
+            scalar_ms / prototype_ms
+        );
+    }

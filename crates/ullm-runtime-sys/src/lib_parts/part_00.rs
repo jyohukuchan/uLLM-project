@@ -975,6 +975,41 @@ unsafe extern "C" {
         output: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(
+        q: *const RawRuntimeBuffer,
+        k_cache: *const RawRuntimeBuffer,
+        v_cache: *const RawRuntimeBuffer,
+        block_table: *const RawRuntimeBuffer,
+        cached_prefix_len: usize,
+        m: usize,
+        block_size: usize,
+        cache_blocks: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        value_dim: usize,
+        softmax_scale: f32,
+        output: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
+    fn ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+        q: *const RawRuntimeBuffer,
+        gate: *const RawRuntimeBuffer,
+        k_cache: *const RawRuntimeBuffer,
+        v_cache: *const RawRuntimeBuffer,
+        block_table: *const RawRuntimeBuffer,
+        cached_prefix_len: usize,
+        m: usize,
+        block_size: usize,
+        cache_blocks: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        value_dim: usize,
+        softmax_scale: f32,
+        output: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_linear_attn_qkv_prepare_f32(
         qkv_buffer: *const RawRuntimeBuffer,
         conv_weight_buffer: *const RawRuntimeBuffer,
@@ -6293,6 +6328,16 @@ fn paged_causal_gqa_chunk_sizes(
     Ok((q_bytes, output_bytes, q_bytes, k_bytes, v_bytes, table_bytes))
 }
 
+fn paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+    block_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    value_dim: usize,
+) -> bool {
+    block_size == 256 && q_heads == 16 && kv_heads == 4 && head_dim == 256 && value_dim == 256
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn paged_causal_gqa_chunk_f32(
     q: &RuntimeBuffer,
@@ -6381,6 +6426,144 @@ pub fn paged_causal_gqa_chunk_sigmoid_gate_f32(
     let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
     status_to_result(unsafe {
         ullm_runtime_paged_causal_gqa_chunk_sigmoid_gate_f32(
+            q.raw.as_ptr(),
+            gate.raw.as_ptr(),
+            k_cache.raw.as_ptr(),
+            v_cache.raw.as_ptr(),
+            block_table.raw.as_ptr(),
+            cached_prefix_len,
+            m,
+            block_size,
+            cache_blocks,
+            q_heads,
+            kv_heads,
+            head_dim,
+            value_dim,
+            softmax_scale,
+            output.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Direct-only gfx1201 prototype for Qwen3.5-9B paged cold-prefill attention. This API is
+/// deliberately not selected by the production operation registry; it stages Q/K through FP16
+/// rocWMMA tiles and should be differentially validated against `paged_causal_gqa_chunk_f32`.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_causal_gqa_chunk_wmma_prototype_f32(
+    q: &RuntimeBuffer,
+    k_cache: &RuntimeBuffer,
+    v_cache: &RuntimeBuffer,
+    block_table: &RuntimeBuffer,
+    cached_prefix_len: usize,
+    m: usize,
+    block_size: usize,
+    cache_blocks: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+    output: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if !paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+        block_size, q_heads, kv_heads, head_dim, value_dim,
+    ) {
+        return Err(
+            "paged causal GQA WMMA prototype requires block=256, Q=16, KV=4, and head/value dim=256"
+                .to_string(),
+        );
+    }
+    if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
+        return Err(
+            "paged causal GQA WMMA prototype softmax scale must be finite and greater than zero"
+                .to_string(),
+        );
+    }
+    let (q_bytes, output_bytes, _, k_bytes, v_bytes, table_bytes) = paged_causal_gqa_chunk_sizes(
+        cached_prefix_len, m, block_size, cache_blocks, q_heads, kv_heads, head_dim, value_dim,
+    )?;
+    check_copy_range(0, q_bytes, q.size()?)?;
+    check_copy_range(0, k_bytes, k_cache.size()?)?;
+    check_copy_range(0, v_bytes, v_cache.size()?)?;
+    check_copy_range(0, table_bytes, block_table.size()?)?;
+    check_copy_range(0, output_bytes, output.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(
+            q.raw.as_ptr(),
+            k_cache.raw.as_ptr(),
+            v_cache.raw.as_ptr(),
+            block_table.raw.as_ptr(),
+            cached_prefix_len,
+            m,
+            block_size,
+            cache_blocks,
+            q_heads,
+            kv_heads,
+            head_dim,
+            value_dim,
+            softmax_scale,
+            output.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+    q: &RuntimeBuffer,
+    gate: &RuntimeBuffer,
+    k_cache: &RuntimeBuffer,
+    v_cache: &RuntimeBuffer,
+    block_table: &RuntimeBuffer,
+    cached_prefix_len: usize,
+    m: usize,
+    block_size: usize,
+    cache_blocks: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    value_dim: usize,
+    softmax_scale: f32,
+    output: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if !paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+        block_size, q_heads, kv_heads, head_dim, value_dim,
+    ) {
+        return Err(
+            "paged causal GQA WMMA prototype requires block=256, Q=16, KV=4, and head/value dim=256"
+                .to_string(),
+        );
+    }
+    if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
+        return Err(
+            "paged causal GQA WMMA prototype softmax scale must be finite and greater than zero"
+                .to_string(),
+        );
+    }
+    let (q_bytes, output_bytes, gate_bytes, k_bytes, v_bytes, table_bytes) =
+        paged_causal_gqa_chunk_sizes(
+            cached_prefix_len,
+            m,
+            block_size,
+            cache_blocks,
+            q_heads,
+            kv_heads,
+            head_dim,
+            value_dim,
+        )?;
+    check_copy_range(0, q_bytes, q.size()?)?;
+    check_copy_range(0, gate_bytes, gate.size()?)?;
+    check_copy_range(0, k_bytes, k_cache.size()?)?;
+    check_copy_range(0, v_bytes, v_cache.size()?)?;
+    check_copy_range(0, table_bytes, block_table.size()?)?;
+    check_copy_range(0, output_bytes, output.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
             q.raw.as_ptr(),
             gate.raw.as_ptr(),
             k_cache.raw.as_ptr(),

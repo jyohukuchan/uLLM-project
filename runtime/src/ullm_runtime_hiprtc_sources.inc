@@ -6162,6 +6162,273 @@ extern "C" __global__ void ullm_paged_causal_gqa_chunk_f32_kernel(
 )";
     }
 
+    // Validate-first gfx1201 cold-prefill experiment. This intentionally lives in a separate
+    // rocWMMA HIPRTC module from paged_chunk_kernel_source(), so adding rocWMMA headers/options
+    // cannot perturb the production scalar paged reader's compilation or dispatch.
+    static const char *paged_causal_gqa_chunk_wmma_prototype_kernel_source() {
+        return R"(
+#include <rocwmma/rocwmma.hpp>
+
+extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel(
+    const float *q,
+    const float *gate,
+    const float *k_cache,
+    const float *v_cache,
+    const unsigned int *block_table,
+    unsigned long long cached_prefix_len,
+    unsigned long long m,
+    unsigned long long block_size,
+    unsigned long long cache_blocks,
+    unsigned long long table_entries,
+    unsigned long long q_heads,
+    unsigned long long kv_heads,
+    unsigned long long head_dim,
+    unsigned long long value_dim,
+    float softmax_scale,
+    float *output) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using namespace rocwmma;
+    constexpr unsigned int kQueryTile = 16u;
+    constexpr unsigned int kSourceTile = 16u;
+    constexpr unsigned int kWmmaK = 16u;
+    constexpr unsigned int kQHeads = 16u;
+    constexpr unsigned int kKvHeads = 4u;
+    constexpr unsigned int kGqaRatio = kQHeads / kKvHeads;
+    constexpr unsigned int kHeadDim = 256u;
+    constexpr unsigned int kValueDim = 256u;
+    constexpr unsigned int kPageTokens = 256u;
+    constexpr unsigned int kThreads = 256u;
+    constexpr unsigned int kValuesPerThread =
+        (kQueryTile * kValueDim) / kThreads;
+    static_assert(kQueryTile == kSourceTile && kQueryTile == kWmmaK,
+                  "rocWMMA QK tile must be 16x16x16");
+    static_assert(kThreads % 32u == 0u, "prototype requires whole wave32 groups");
+    static_assert(kValuesPerThread == 16u,
+                  "prototype assigns one 16-value vector to each thread");
+
+    using FragA = fragment<matrix_a, kQueryTile, kSourceTile, kWmmaK, float16_t, row_major>;
+    using FragB = fragment<matrix_b, kQueryTile, kSourceTile, kWmmaK, float16_t, col_major>;
+    using FragC =
+        fragment<accumulator, kQueryTile, kSourceTile, kWmmaK, float32_t, row_major>;
+
+    constexpr unsigned int kQTileLdsBytes =
+        kQueryTile * kHeadDim * sizeof(float16_t);
+    constexpr unsigned int kKTileLdsBytes =
+        kSourceTile * kHeadDim * sizeof(float16_t);
+    constexpr unsigned int kVTileLdsBytes = kSourceTile * kValueDim * sizeof(float);
+    constexpr unsigned int kScoresLdsBytes = kQueryTile * kSourceTile * sizeof(float);
+    constexpr unsigned int kRowStateLdsBytes = 3u * kQueryTile * sizeof(float);
+    constexpr unsigned int kStaticLdsBytes =
+        kQTileLdsBytes + kKTileLdsBytes + kVTileLdsBytes + kScoresLdsBytes +
+        kRowStateLdsBytes;
+    static_assert(kStaticLdsBytes == 33984u, "prototype LDS accounting drifted");
+    static_assert(kStaticLdsBytes <= 64u * 1024u,
+                  "prototype must fit the gfx1201 64 KiB LDS budget");
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned long long q_head = static_cast<unsigned long long>(blockIdx.y);
+    const unsigned long long row_base =
+        static_cast<unsigned long long>(blockIdx.x) * kQueryTile;
+    if (q_head >= q_heads || row_base >= m || q_heads != kQHeads || kv_heads != kKvHeads ||
+        head_dim != kHeadDim || value_dim != kValueDim || block_size != kPageTokens ||
+        cache_blocks == 0ull || table_entries == 0ull || blockDim.x != kThreads) {
+        return;
+    }
+
+    // This is deliberately one Q head per CTA: q_head / 4 implements Qwen3.5's GQA=4 mapping.
+    const unsigned long long kv_head = q_head / kGqaRatio;
+    const unsigned long long remaining_rows = m - row_base;
+    const unsigned int rows_in_tile = remaining_rows < kQueryTile ?
+        static_cast<unsigned int>(remaining_rows) : kQueryTile;
+    // The longest causal row in this CTA is its final valid query row, not merely the tile width.
+    const unsigned long long max_cache_len = cached_prefix_len + row_base + rows_in_tile;
+    // A wave spans two 16-value groups across all 16 rows. At each AV inner-loop step, the
+    // 16 lanes for a value group therefore broadcast the same V element from LDS instead of
+    // striding through a pair of shared-memory banks.
+    const unsigned int output_row = tid % kQueryTile;
+    const unsigned int value_base = (tid / kQueryTile) * kValuesPerThread;
+
+    __shared__ __attribute__((aligned(16))) float16_t q_tile[kQueryTile * kHeadDim];
+    __shared__ __attribute__((aligned(16))) float16_t k_tile[kSourceTile * kHeadDim];
+    __shared__ __attribute__((aligned(16))) float v_tile[kSourceTile * kValueDim];
+    // Holds raw QK scores until the row leaders perform online softmax, then holds weights.
+    __shared__ float scores[kQueryTile * kSourceTile];
+    __shared__ float row_max[kQueryTile];
+    __shared__ float row_sum[kQueryTile];
+    __shared__ float row_old_scale[kQueryTile];
+
+    // Keeping the 16 output values per thread in registers saves 16 KiB of LDS versus a shared
+    // accumulator. AV stays FP32/scalar in v1; see the source comment below for the WMMA follow-up.
+    float output_acc[kValuesPerThread] = {};
+
+    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+        const unsigned int row_in_tile = index / kHeadDim;
+        const unsigned int dim = index - row_in_tile * kHeadDim;
+        const unsigned long long row = row_base + row_in_tile;
+        q_tile[index] = row < m ?
+            static_cast<float16_t>(q[(row * q_heads + q_head) * kHeadDim + dim]) :
+            static_cast<float16_t>(0.0f);
+    }
+    if (tid < kQueryTile) {
+        row_max[tid] = -3.4028234663852886e38f;
+        row_sum[tid] = 0.0f;
+        row_old_scale[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // Each source tile begins at a multiple of 16. With the prototype's fixed 256-token page,
+    // no tile crosses a page boundary, so one block-table lookup indexes all staged K/V values.
+    for (unsigned long long source_tile_start = 0ull;
+         source_tile_start < max_cache_len;
+         source_tile_start += kSourceTile) {
+        const unsigned long long logical_block = source_tile_start / kPageTokens;
+        const unsigned long long physical_tile_base =
+            static_cast<unsigned long long>(block_table[logical_block]) * kPageTokens +
+            (source_tile_start & (kPageTokens - 1u));
+
+        for (unsigned int index = tid; index < kSourceTile * kHeadDim; index += kThreads) {
+            const unsigned int source_in_tile = index / kHeadDim;
+            const unsigned int dim = index - source_in_tile * kHeadDim;
+            const unsigned long long source = source_tile_start + source_in_tile;
+            if (source < max_cache_len) {
+                const unsigned long long physical = physical_tile_base + source_in_tile;
+                k_tile[index] = static_cast<float16_t>(
+                    k_cache[(physical * kKvHeads + kv_head) * kHeadDim + dim]);
+                v_tile[source_in_tile * kValueDim + dim] =
+                    v_cache[(physical * kKvHeads + kv_head) * kValueDim + dim];
+            } else {
+                k_tile[index] = static_cast<float16_t>(0.0f);
+                v_tile[source_in_tile * kValueDim + dim] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Wave 0 computes Q[16,256] * K[16,256]^T. q_tile is row-major [M,K], while the
+        // source-major k_tile is exactly the column-major [K,N] storage requested by FragB.
+        if (tid < 32u) {
+            FragA a;
+            FragB b;
+            FragC c;
+            fill_fragment(c, 0.0f);
+#pragma unroll
+            for (unsigned int dim_base = 0u; dim_base < kHeadDim; dim_base += kWmmaK) {
+                load_matrix_sync(a, q_tile + dim_base, kHeadDim);
+                load_matrix_sync(b, k_tile + dim_base, kHeadDim);
+                mma_sync(c, a, b, c);
+            }
+            store_matrix_sync(scores, c, kSourceTile);
+        }
+        __syncthreads();
+
+        // FlashAttention online state is per query row. Causal positions are represented as
+        // negative infinity / zero weight before the max/sum update, including tail padding.
+        if (tid < kQueryTile) {
+            const unsigned int row_in_tile = tid;
+            if (row_in_tile < rows_in_tile) {
+                const unsigned long long causal_limit =
+                    cached_prefix_len + row_base + row_in_tile + 1ull;
+                float tile_max = -3.4028234663852886e38f;
+#pragma unroll
+                for (unsigned int source_in_tile = 0u;
+                     source_in_tile < kSourceTile;
+                     ++source_in_tile) {
+                    const unsigned long long source = source_tile_start + source_in_tile;
+                    const float score = source < causal_limit ?
+                        scores[row_in_tile * kSourceTile + source_in_tile] * softmax_scale :
+                        -3.4028234663852886e38f;
+                    tile_max = score > tile_max ? score : tile_max;
+                }
+                const float old_max = row_max[row_in_tile];
+                const float new_max = old_max > tile_max ? old_max : tile_max;
+                const float old_scale = old_max <= -3.0e38f ?
+                    0.0f : expf(old_max - new_max);
+                float tile_sum = 0.0f;
+#pragma unroll
+                for (unsigned int source_in_tile = 0u;
+                     source_in_tile < kSourceTile;
+                     ++source_in_tile) {
+                    const unsigned long long source = source_tile_start + source_in_tile;
+                    const float weight = source < causal_limit ?
+                        expf(scores[row_in_tile * kSourceTile + source_in_tile] *
+                                 softmax_scale - new_max) :
+                        0.0f;
+                    scores[row_in_tile * kSourceTile + source_in_tile] = weight;
+                    tile_sum += weight;
+                }
+                row_old_scale[row_in_tile] = old_scale;
+                row_sum[row_in_tile] = row_sum[row_in_tile] * old_scale + tile_sum;
+                row_max[row_in_tile] = new_max;
+            } else {
+                row_old_scale[row_in_tile] = 0.0f;
+#pragma unroll
+                for (unsigned int source_in_tile = 0u;
+                     source_in_tile < kSourceTile;
+                     ++source_in_tile) {
+                    scores[row_in_tile * kSourceTile + source_in_tile] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        const float old_scale = row_old_scale[output_row];
+#pragma unroll
+        for (unsigned int value = 0u; value < kValuesPerThread; ++value) {
+            output_acc[value] *= old_scale;
+        }
+#pragma unroll
+        for (unsigned int source_in_tile = 0u;
+             source_in_tile < kSourceTile;
+             ++source_in_tile) {
+            const float weight = scores[output_row * kSourceTile + source_in_tile];
+#pragma unroll
+            for (unsigned int value = 0u; value < kValuesPerThread; ++value) {
+                output_acc[value] += weight *
+                    v_tile[source_in_tile * kValueDim + value_base + value];
+            }
+        }
+        // AV intentionally remains scalar FP32 for v1. A WMMA AV follow-up needs an explicit
+        // softmax-weight FP16 conversion and a safe [K,N] V transpose/layout, which would add a
+        // second precision change and is not appropriate before this QK-only path is validated.
+        __syncthreads();
+    }
+
+    if (output_row < rows_in_tile) {
+        const unsigned long long row = row_base + output_row;
+        const unsigned long long output_base =
+            (row * q_heads + q_head) * kValueDim + value_base;
+        const float denominator = row_sum[output_row];
+#pragma unroll
+        for (unsigned int value = 0u; value < kValuesPerThread; ++value) {
+            float result = output_acc[value] / denominator;
+            if (gate != nullptr) {
+                const float gate_value = gate[output_base + value];
+                result *= 1.0f / (1.0f + expf(-gate_value));
+            }
+            output[output_base + value] = result;
+        }
+    }
+#else
+    (void)q;
+    (void)gate;
+    (void)k_cache;
+    (void)v_cache;
+    (void)block_table;
+    (void)cached_prefix_len;
+    (void)m;
+    (void)block_size;
+    (void)cache_blocks;
+    (void)table_entries;
+    (void)q_heads;
+    (void)kv_heads;
+    (void)head_dim;
+    (void)value_dim;
+    (void)softmax_scale;
+    (void)output;
+#endif
+}
+)";
+    }
+
     static const char *depthwise_conv1d_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_depthwise_conv1d_f32_kernel(

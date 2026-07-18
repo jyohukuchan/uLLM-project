@@ -4392,6 +4392,94 @@ HipPagedChunkKernelCache &hip_paged_chunk_kernel_cache() {
     return cache;
 }
 
+// Kept separate from HipPagedChunkKernelCache so the production scalar paged reader keeps its
+// original HIPRTC source, compile options, loaded module, and dispatch behavior.
+class HipPagedCausalGqaChunkWmmaPrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+
+        // The public prototype guard is exact gfx1201. Do not silently fall back to another
+        // gfx12 code object if this one fails to compile or load on the target R9700.
+        const std::string arch = "gfx1201";
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_paged_causal_gqa_chunk_wmma_prototype_kernel(
+                arch,
+                &code,
+                &compile_error)) {
+            append_error(
+                error,
+                compile_error.empty() ?
+                    "failed to build paged causal GQA WMMA prototype HIP kernel" : compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for " + arch);
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for " + arch);
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        loaded->arch = arch;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+        std::string arch;
+    };
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipPagedCausalGqaChunkWmmaPrototypeKernelCache &
+hip_paged_causal_gqa_chunk_wmma_prototype_kernel_cache() {
+    static HipPagedCausalGqaChunkWmmaPrototypeKernelCache cache;
+    return cache;
+}
+
+bool paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+    const std::string &arch,
+    size_t block_size,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim) {
+    return arch == "gfx1201" && block_size == 256u && q_heads == 16u && kv_heads == 4u &&
+        head_dim == 256u && value_dim == 256u;
+}
+
 bool paged_kv_write_chunk_f32_hip_kernel(
     const ullm_runtime_buffer *k_buffer,
     const ullm_runtime_buffer *v_buffer,
@@ -4543,6 +4631,112 @@ bool paged_causal_gqa_chunk_f32_hip_kernel(
             device_id)) {
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for f32 paged causal GQA chunk";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool paged_causal_gqa_chunk_wmma_prototype_f32_hip_kernel(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *gate_buffer,
+    const ullm_runtime_buffer *k_cache_buffer,
+    const ullm_runtime_buffer *v_cache_buffer,
+    const ullm_runtime_buffer *block_table_buffer,
+    size_t cached_prefix_len,
+    size_t m,
+    size_t block_size,
+    size_t cache_blocks,
+    size_t block_table_entries,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim,
+    float softmax_scale,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = q_buffer->hip_device_id;
+    if (!paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(device_id),
+            block_size,
+            q_heads,
+            kv_heads,
+            head_dim,
+            value_dim)) {
+        if (error != nullptr) {
+            *error =
+                "paged causal GQA WMMA prototype requires gfx1201, block=256, Q=16, KV=4, and head/value dim=256";
+        }
+        return false;
+    }
+    if (m == 0u || m > std::numeric_limits<size_t>::max() - 15u) {
+        if (error != nullptr) {
+            *error = "paged causal GQA WMMA prototype query tile grid overflows";
+        }
+        return false;
+    }
+    const size_t grid_x = (m + 15u) / 16u;
+    const size_t grid_y = q_heads;
+    if (grid_x == 0u || grid_y == 0u ||
+        grid_x > static_cast<size_t>(std::numeric_limits<unsigned int>::max()) ||
+        grid_y > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+        if (error != nullptr) {
+            *error = "paged causal GQA WMMA prototype dimensions exceed HIP grid limit";
+        }
+        return false;
+    }
+    void *function = hip_paged_causal_gqa_chunk_wmma_prototype_kernel_cache().function_for_device(
+        device_id,
+        error);
+    if (function == nullptr) {
+        return false;
+    }
+
+    unsigned long long kernel_cached_prefix_len = static_cast<unsigned long long>(cached_prefix_len);
+    unsigned long long kernel_m = static_cast<unsigned long long>(m);
+    unsigned long long kernel_block_size = static_cast<unsigned long long>(block_size);
+    unsigned long long kernel_cache_blocks = static_cast<unsigned long long>(cache_blocks);
+    unsigned long long kernel_table_entries = static_cast<unsigned long long>(block_table_entries);
+    unsigned long long kernel_q_heads = static_cast<unsigned long long>(q_heads);
+    unsigned long long kernel_kv_heads = static_cast<unsigned long long>(kv_heads);
+    unsigned long long kernel_head_dim = static_cast<unsigned long long>(head_dim);
+    unsigned long long kernel_value_dim = static_cast<unsigned long long>(value_dim);
+    void *q_ptr = q_buffer->ptr;
+    void *gate_ptr = gate_buffer == nullptr ? nullptr : gate_buffer->ptr;
+    void *k_ptr = k_cache_buffer->ptr;
+    void *v_ptr = v_cache_buffer->ptr;
+    void *table_ptr = block_table_buffer->ptr;
+    void *output_ptr = output_buffer->ptr;
+    void *kernel_params[] = {
+        &q_ptr,
+        &gate_ptr,
+        &k_ptr,
+        &v_ptr,
+        &table_ptr,
+        &kernel_cached_prefix_len,
+        &kernel_m,
+        &kernel_block_size,
+        &kernel_cache_blocks,
+        &kernel_table_entries,
+        &kernel_q_heads,
+        &kernel_kv_heads,
+        &kernel_head_dim,
+        &kernel_value_dim,
+        &softmax_scale,
+        &output_ptr,
+    };
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel_2d(
+            function,
+            static_cast<unsigned int>(grid_x),
+            static_cast<unsigned int>(grid_y),
+            256u,
+            kernel_params,
+            hip_stream,
+            device_id)) {
+        if (error != nullptr) {
+            *error = "hipModuleLaunchKernel failed for paged causal GQA WMMA prototype";
         }
         return false;
     }
