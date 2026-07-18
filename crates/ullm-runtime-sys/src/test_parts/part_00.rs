@@ -153,6 +153,75 @@
     }
 
     #[test]
+    fn aq4_wmma_prototype_post_accumulation_factors_match_aq4_decode_formula() {
+        // The WMMA prototype stages only codebook[nibble] * group_scale in FP16. tensor_scale
+        // and the optional row scale are intentionally applied after the FP32 accumulator so
+        // they are not redundantly multiplied for every K element.
+        let rows = 2_usize;
+        let cols = 32_usize;
+        let group_size = 16_usize;
+        let tensor_scale = 0.75_f32;
+        let codebook = [
+            -0.50_f32, -0.42, -0.35, -0.27, -0.19, -0.11, -0.04, 0.03, 0.09, 0.16, 0.24, 0.31, 0.38,
+            0.44, 0.48, 0.50,
+        ];
+        let scale_values = [0.50_f32, 0.625, 0.75, 0.875];
+        let scale_indices = [0_u8, 3, 1, 2];
+        let indices = [
+            0x10_u8, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
+            0x23, 0x01, 0x13, 0x57, 0x9b, 0xdf, 0x24, 0x68, 0xac, 0xe0, 0x0e, 0xca, 0x86, 0x42, 0xfd,
+            0xb9, 0x75, 0x31,
+        ];
+        let inputs = [
+            [
+                -0.98_f32, -0.91, -0.84, -0.77, -0.70, -0.63, -0.56, -0.49, -0.42, -0.35, -0.28, -0.21,
+                -0.14, -0.07, 0.00, 0.07, 0.14, 0.21, 0.28, 0.35, 0.42, 0.49, 0.56, 0.63, 0.70, 0.77,
+                0.84, 0.91, 0.98, -0.12, 0.34, -0.56,
+            ],
+            [
+                0.73_f32, -0.61, 0.49, -0.37, 0.25, -0.13, 0.01, 0.11, -0.23, 0.35, -0.47, 0.59, -0.71,
+                0.83, -0.95, 0.87, -0.79, 0.67, -0.55, 0.43, -0.31, 0.19, -0.07, 0.15, -0.27, 0.39,
+                -0.51, 0.63, -0.75, 0.87, -0.99, 0.45,
+            ],
+        ];
+        // A count smaller than rows is intentional: row 0 gets a post-factor and row 1 gets
+        // the ABI's implicit multiplier of one.
+        let row_scales = [1.125_f32];
+
+        for input in inputs {
+            for row in 0..rows {
+                let mut direct_sum = 0.0_f32;
+                let mut factored_sum = 0.0_f32;
+                for col in 0..cols {
+                    let element = row * cols + col;
+                    let packed = indices[element / 2];
+                    let nibble = if element.is_multiple_of(2) {
+                        packed & 0x0f
+                    } else {
+                        (packed >> 4) & 0x0f
+                    };
+                    let group = element / group_size;
+                    let decoded_without_tensor =
+                        codebook[nibble as usize] * scale_values[scale_indices[group] as usize];
+                    direct_sum += decoded_without_tensor * tensor_scale * input[col];
+                    factored_sum += decoded_without_tensor * input[col];
+                }
+                let row_scale = if row < row_scales.len() {
+                    row_scales[row]
+                } else {
+                    1.0
+                };
+                let direct = direct_sum * row_scale;
+                let factored = factored_sum * tensor_scale * row_scale;
+                assert!(
+                    (direct - factored).abs() <= 1e-5,
+                    "row={row}: direct={direct} factored={factored}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn smoke_adds_f32_values() {
         let out = smoke_add_f32(&[1.0, 2.5, -3.0], &[4.0, -1.5, 3.5]).unwrap();
         assert_eq!(out, vec![5.0, 1.0, 0.5]);

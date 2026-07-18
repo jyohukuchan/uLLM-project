@@ -1135,6 +1135,179 @@ extern "C" __global__ void ullm_aq4_gemm_register_bm8_group8_f32_kernel(
 )";
     }
 
+    // Experimental gfx1201-only AQ4 WMMA path for the dominant M=128 MLP projections.
+    // It intentionally lives in a separate HIPRTC source/module from the production register
+    // kernels so the prototype cannot perturb their compile or dispatch behavior.
+    static const char *aq4_matvec_wmma_prototype_kernel_source() {
+        return R"(
+#include <rocwmma/rocwmma.hpp>
+
+extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
+    const unsigned char *indices,
+    const unsigned char *scale_indices,
+    const float *codebook,
+    const float *scale_values,
+    const float *input,
+    const float *row_scales,
+    unsigned long long scale_count,
+    unsigned long long group_size,
+    float tensor_scale,
+    unsigned long long row_scale_count,
+    unsigned long long rows,
+    unsigned long long cols,
+    unsigned long long batch_count,
+    float *output) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using namespace rocwmma;
+    constexpr unsigned int kTileRows = 16u;
+    constexpr unsigned int kTileCols = 16u;
+    constexpr unsigned int kWmmaK = 16u;
+    constexpr unsigned int kWideK = 32u;
+    constexpr unsigned int kBatchTile = 128u;
+    constexpr unsigned int kWavesPerBlock = kBatchTile / kTileCols;
+    constexpr unsigned int kThreads = kWavesPerBlock * 32u;
+    static_assert(kThreads == 256u, "AQ4 WMMA prototype expects eight wave32s");
+    static_assert(kWideK == 2u * kWmmaK, "AQ4 Wide-K path requires two WMMA K tiles");
+
+    // `uint4` makes the paired group16 (32 AQ4 elements = 16 bytes) source load explicit.
+    // Target geometry guarantees 16-byte alignment: the allocation base, every row stride,
+    // and every k_base are all multiples of 16 bytes.
+    typedef unsigned int ullm_aq4_wmma_uint4 __attribute__((ext_vector_type(4)));
+    typedef float ullm_aq4_wmma_float4 __attribute__((ext_vector_type(4)));
+    using FragA = fragment<matrix_a, kTileRows, kTileCols, kWmmaK, float16_t, row_major>;
+    using FragB = fragment<matrix_b, kTileRows, kTileCols, kWmmaK, float16_t, col_major>;
+    using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;
+
+    __shared__ __attribute__((aligned(16))) float16_t weight_tile[kTileRows * kWideK];
+    // B is [K, M] column-major. Each of the eight waves owns one adjacent 16-column slice.
+    __shared__ __attribute__((aligned(16))) float16_t input_tile[kBatchTile * kWideK];
+    // Store through rocWMMA's row-major fragment API, then transpose to the ABI's [batch][row]
+    // order explicitly. This avoids relying on the documented raw-gfx12 WMMA lane mapping.
+    __shared__ __attribute__((aligned(16))) float output_tile[
+        kWavesPerBlock * kTileRows * kTileCols];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int wave = tid >> 5;
+    const unsigned long long row_base = static_cast<unsigned long long>(blockIdx.x) * kTileRows;
+    const unsigned long long batch_base = static_cast<unsigned long long>(blockIdx.y) * kBatchTile;
+
+    // The public prototype ABI admits only these exact shapes. Keep a uniform device-side guard
+    // as a fail-closed backstop if a caller bypasses host validation.
+    if (group_size != 16ull || batch_count != kBatchTile ||
+        !((rows == 12288ull && cols == 4096ull) ||
+          (rows == 4096ull && cols == 12288ull))) {
+        return;
+    }
+
+    FragC c;
+    fill_fragment(c, 0.0f);
+    const unsigned long long groups_per_row = cols / 16ull;
+
+    // Wide-K: every iteration covers two adjacent group16s. One loader thread per output row
+    // performs a 128-bit packed AQ4 load, decodes its two independent group scales to FP16 LDS,
+    // then every wave consumes the same A tile with two K=16 WMMA instructions.
+    for (unsigned long long k_base = 0ull; k_base < cols; k_base += kWideK) {
+        if (tid < kTileRows) {
+            const unsigned long long row = row_base + tid;
+            const unsigned long long group_base = row * groups_per_row + k_base / 16ull;
+            const unsigned int scale_index0 = static_cast<unsigned int>(scale_indices[group_base]);
+            const unsigned int scale_index1 =
+                static_cast<unsigned int>(scale_indices[group_base + 1ull]);
+            // HIP-side metadata validation deliberately avoids a D2H barrier. Match the existing
+            // register kernel's fail-closed handling of malformed scale indices.
+            const float group_scale0 =
+                scale_index0 < scale_count ? scale_values[scale_index0] : 0.0f;
+            const float group_scale1 =
+                scale_index1 < scale_count ? scale_values[scale_index1] : 0.0f;
+            const unsigned long long byte_offset = (row * cols + k_base) >> 1;
+            const ullm_aq4_wmma_uint4 packed_words =
+                *reinterpret_cast<const ullm_aq4_wmma_uint4 *>(indices + byte_offset);
+#pragma unroll
+            for (unsigned int word_index = 0u; word_index < 4u; ++word_index) {
+                const unsigned int word = static_cast<unsigned int>(packed_words[word_index]);
+#pragma unroll
+                for (unsigned int byte_index = 0u; byte_index < 4u; ++byte_index) {
+                    const unsigned int packed_byte = (word >> (byte_index * 8u)) & 0xffu;
+                    const unsigned int local_k = word_index * 8u + byte_index * 2u;
+                    const float group_scale = local_k < 16u ? group_scale0 : group_scale1;
+                    weight_tile[tid * kWideK + local_k] = static_cast<float16_t>(
+                        codebook[packed_byte & 0x0fu] * group_scale);
+                    weight_tile[tid * kWideK + local_k + 1u] = static_cast<float16_t>(
+                        codebook[(packed_byte >> 4u) & 0x0fu] * group_scale);
+                }
+            }
+        }
+
+        // Convert the batch-major FP32 input to the logical B=[K, M] col-major FP16 tile.
+        // Four adjacent K values are loaded at a time, so the activation path also uses 128-bit
+        // global transactions under the exact M=128/K-multiple-of-32 prototype contract.
+        for (unsigned int input_vector = tid;
+             input_vector < (kBatchTile * kWideK) / 4u;
+             input_vector += kThreads) {
+            const unsigned int batch_in_tile = input_vector / (kWideK / 4u);
+            const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
+            const unsigned long long input_offset =
+                (batch_base + batch_in_tile) * cols + k_base + k_in_tile;
+            const ullm_aq4_wmma_float4 values =
+                *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);
+            const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;
+            input_tile[shared_offset + 0u] = static_cast<float16_t>(values[0]);
+            input_tile[shared_offset + 1u] = static_cast<float16_t>(values[1]);
+            input_tile[shared_offset + 2u] = static_cast<float16_t>(values[2]);
+            input_tile[shared_offset + 3u] = static_cast<float16_t>(values[3]);
+        }
+        __syncthreads();
+
+        FragA a0;
+        FragA a1;
+        FragB b0;
+        FragB b1;
+        load_matrix_sync(a0, weight_tile, kWideK);
+        load_matrix_sync(a1, weight_tile + kWmmaK, kWideK);
+        const unsigned int wave_input_offset = wave * kTileCols * kWideK;
+        load_matrix_sync(b0, input_tile + wave_input_offset, kWideK);
+        load_matrix_sync(b1, input_tile + wave_input_offset + kWmmaK, kWideK);
+        mma_sync(c, a0, b0, c);
+        mma_sync(c, a1, b1, c);
+        __syncthreads();
+    }
+
+    store_matrix_sync(output_tile + wave * kTileRows * kTileCols, c, kTileCols);
+    __syncthreads();
+
+    for (unsigned int output_index = tid;
+         output_index < kWavesPerBlock * kTileRows * kTileCols;
+         output_index += kThreads) {
+        const unsigned int output_wave = output_index / (kTileRows * kTileCols);
+        const unsigned int output_in_wave = output_index % (kTileRows * kTileCols);
+        const unsigned int local_row = output_in_wave / kTileCols;
+        const unsigned int local_batch = output_in_wave % kTileCols;
+        const unsigned long long row = row_base + local_row;
+        const unsigned long long batch = batch_base + output_wave * kTileCols + local_batch;
+        const float row_scale =
+            row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;
+        output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;
+    }
+#else
+    (void)indices;
+    (void)scale_indices;
+    (void)codebook;
+    (void)scale_values;
+    (void)input;
+    (void)row_scales;
+    (void)scale_count;
+    (void)group_size;
+    (void)tensor_scale;
+    (void)row_scale_count;
+    (void)rows;
+    (void)cols;
+    (void)batch_count;
+    (void)output;
+#endif
+}
+)";
+    }
+
     static const char *aq4_matvec_top1_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_aq4_matvec_top1_f32_kernel(

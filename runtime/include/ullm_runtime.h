@@ -287,6 +287,28 @@ ullm_status ullm_runtime_aq4_matvec_batch_register_bm8_group8_f32(
     ullm_runtime_stream *stream);
 
 /*
+ * Experimental direct rocWMMA AQ4 GEMM prototype. This additive ABI is intentionally not part
+ * of dispatch: it accepts only gfx1201, AQ4 group16, M=128, and the 12288x4096 / 4096x12288
+ * MLP projection shapes. It returns an error instead of falling back for every other geometry.
+ */
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t batch_count,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
  * Classifies the active AQ4 batch path, including explicit experiment environment gates,
  * without launching or timing a kernel.
  * device_index follows ullm_runtime_context_create: 0 is CPU and HIP devices start at 1.

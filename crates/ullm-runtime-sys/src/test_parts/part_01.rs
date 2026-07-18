@@ -1437,6 +1437,425 @@
     }
 
     #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_DIFFERENTIAL=1"]
+    fn hip_aq4_wmma_prototype_m128_mlp_shapes_match_cpu_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_DIFFERENTIAL").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_DIFFERENTIAL=1 before running this GPU differential test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+        let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut seed = 0x510e_527f_u32;
+        let mut next_unit = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed as f32) / (u32::MAX as f32)
+        };
+        for &(rows, cols) in &[(12_288_usize, 4_096_usize), (4_096, 12_288)] {
+            let batch_count = 128_usize;
+            let elements = rows * cols;
+            let index_bytes = elements / 2;
+            let groups = elements / 16;
+            let scale_count = 7_usize;
+            let mut indices = vec![0_u8; index_bytes];
+            for byte in &mut indices {
+                let low = (next_unit() * 16.0) as u8 & 0x0f;
+                let high = (next_unit() * 16.0) as u8 & 0x0f;
+                *byte = low | (high << 4);
+            }
+            let scale_indices: Vec<u8> = (0..groups)
+                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .collect();
+            let codebook_values: Vec<f32> = (0..16).map(|_| next_unit() - 0.5).collect();
+            let scale_values: Vec<f32> = (0..scale_count).map(|_| 0.5 + next_unit() * 0.5).collect();
+            let input_values: Vec<f32> = (0..batch_count * cols)
+                .map(|_| next_unit() * 2.0 - 1.0)
+                .collect();
+            // Exercise both post-accumulation row-scale cases across the two target projection
+            // orientations: the gate/up shape has scales, and down uses the null-pointer path.
+            let use_row_scales = rows == 12_288;
+            let row_scales: Vec<f32> = (0..rows).map(|_| 0.75 + next_unit() * 0.5).collect();
+            let row_scale_count = if use_row_scales { rows } else { 0 };
+            let tensor_scale = 0.75_f32;
+
+            let expected = {
+                let mut cpu_context = RuntimeContext::create(0).unwrap();
+                let mut cpu_stream = cpu_context.create_stream().unwrap();
+                let mut cpu_index = cpu_context.alloc_buffer(index_bytes).unwrap();
+                let mut cpu_scale = cpu_context.alloc_buffer(groups).unwrap();
+                let mut cpu_codebook = cpu_context
+                    .alloc_buffer(16 * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut cpu_scale_values = cpu_context
+                    .alloc_buffer(scale_count * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut cpu_input = cpu_context
+                    .alloc_buffer(input_values.len() * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut cpu_row_scale = if use_row_scales {
+                    Some(
+                        cpu_context
+                            .alloc_buffer(rows * std::mem::size_of::<f32>())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let mut cpu_output = cpu_context
+                    .alloc_buffer(batch_count * rows * std::mem::size_of::<f32>())
+                    .unwrap();
+                cpu_index
+                    .copy_from_host(0, &indices, Some(&mut cpu_stream))
+                    .unwrap();
+                cpu_scale
+                    .copy_from_host(0, &scale_indices, Some(&mut cpu_stream))
+                    .unwrap();
+                cpu_codebook
+                    .copy_from_host(
+                        0,
+                        &f32s_to_le_bytes(&codebook_values),
+                        Some(&mut cpu_stream),
+                    )
+                    .unwrap();
+                cpu_scale_values
+                    .copy_from_host(0, &f32s_to_le_bytes(&scale_values), Some(&mut cpu_stream))
+                    .unwrap();
+                cpu_input
+                    .copy_from_host(0, &f32s_to_le_bytes(&input_values), Some(&mut cpu_stream))
+                    .unwrap();
+                if let Some(row_scale) = cpu_row_scale.as_mut() {
+                    row_scale
+                        .copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut cpu_stream))
+                        .unwrap();
+                }
+                cpu_stream.synchronize().unwrap();
+                aq4_matvec_batch_f32(
+                    &cpu_index,
+                    &cpu_scale,
+                    &cpu_codebook,
+                    &cpu_scale_values,
+                    &cpu_input,
+                    cpu_row_scale.as_ref(),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    row_scale_count,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut cpu_output,
+                    Some(&mut cpu_stream),
+                )
+                .unwrap();
+                cpu_stream.synchronize().unwrap();
+                let mut expected_bytes = vec![0_u8; batch_count * rows * std::mem::size_of::<f32>()];
+                cpu_output
+                    .copy_to_host(0, &mut expected_bytes, Some(&mut cpu_stream))
+                    .unwrap();
+                cpu_stream.synchronize().unwrap();
+                le_bytes_to_f32s(&expected_bytes)
+            };
+
+            let actual = {
+                let mut hip_context = RuntimeContext::create(device_index).unwrap();
+                let mut hip_stream = hip_context.create_stream().unwrap();
+                let mut hip_index = hip_context.alloc_buffer(index_bytes).unwrap();
+                let mut hip_scale = hip_context.alloc_buffer(groups).unwrap();
+                let mut hip_codebook = hip_context
+                    .alloc_buffer(16 * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut hip_scale_values = hip_context
+                    .alloc_buffer(scale_count * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut hip_input = hip_context
+                    .alloc_buffer(input_values.len() * std::mem::size_of::<f32>())
+                    .unwrap();
+                let mut hip_row_scale = if use_row_scales {
+                    Some(
+                        hip_context
+                            .alloc_buffer(rows * std::mem::size_of::<f32>())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let mut hip_output = hip_context
+                    .alloc_buffer(batch_count * rows * std::mem::size_of::<f32>())
+                    .unwrap();
+                hip_index
+                    .copy_from_host(0, &indices, Some(&mut hip_stream))
+                    .unwrap();
+                hip_scale
+                    .copy_from_host(0, &scale_indices, Some(&mut hip_stream))
+                    .unwrap();
+                hip_codebook
+                    .copy_from_host(
+                        0,
+                        &f32s_to_le_bytes(&codebook_values),
+                        Some(&mut hip_stream),
+                    )
+                    .unwrap();
+                hip_scale_values
+                    .copy_from_host(0, &f32s_to_le_bytes(&scale_values), Some(&mut hip_stream))
+                    .unwrap();
+                hip_input
+                    .copy_from_host(0, &f32s_to_le_bytes(&input_values), Some(&mut hip_stream))
+                    .unwrap();
+                if let Some(row_scale) = hip_row_scale.as_mut() {
+                    row_scale
+                        .copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut hip_stream))
+                        .unwrap();
+                }
+                hip_stream.synchronize().unwrap();
+                aq4_matvec_batch_wmma_prototype_f32(
+                    &hip_index,
+                    &hip_scale,
+                    &hip_codebook,
+                    &hip_scale_values,
+                    &hip_input,
+                    hip_row_scale.as_ref(),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    row_scale_count,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut hip_output,
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+                hip_stream.synchronize().unwrap();
+                let mut actual_bytes = vec![0_u8; batch_count * rows * std::mem::size_of::<f32>()];
+                hip_output
+                    .copy_to_host(0, &mut actual_bytes, Some(&mut hip_stream))
+                    .unwrap();
+                hip_stream.synchronize().unwrap();
+                le_bytes_to_f32s(&actual_bytes)
+            };
+
+            // Both decoded weights and activations are rounded to FP16 before WMMA, while the
+            // accumulator is FP32. The bounded differential inputs make 0.05 absolute + 1%
+            // relative error a deliberate FP16 staging allowance, not a general production
+            // fidelity criterion; it remains far below a layout, transpose, or scale-factor bug.
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                let tolerance = 5e-2_f32 + 1e-2_f32 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "rows={rows} cols={cols} index={index}: actual={actual} expected={expected} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_TIMING=1"]
+    fn hip_aq4_wmma_prototype_m128_timing_vs_register_bm8_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_TIMING").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_TIMING=1 before running this GPU timing test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+        let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const WARMUP_ITERATIONS: usize = 3;
+        const TIMED_ITERATIONS: usize = 20;
+        let mut seed = 0x1f83_d9ab_u32;
+        let mut next_unit = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed as f32) / (u32::MAX as f32)
+        };
+        for &(rows, cols) in &[(12_288_usize, 4_096_usize), (4_096, 12_288)] {
+            let batch_count = 128_usize;
+            let elements = rows * cols;
+            let index_bytes = elements / 2;
+            let groups = elements / 16;
+            let scale_count = 7_usize;
+            let mut indices = vec![0_u8; index_bytes];
+            for byte in &mut indices {
+                let low = (next_unit() * 16.0) as u8 & 0x0f;
+                let high = (next_unit() * 16.0) as u8 & 0x0f;
+                *byte = low | (high << 4);
+            }
+            let scale_indices: Vec<u8> = (0..groups)
+                .map(|_| (next_unit() * scale_count as f32) as u8)
+                .collect();
+            let codebook_values: Vec<f32> = (0..16).map(|_| next_unit() - 0.5).collect();
+            let scale_values: Vec<f32> = (0..scale_count).map(|_| 0.5 + next_unit() * 0.5).collect();
+            let input_values: Vec<f32> = (0..batch_count * cols)
+                .map(|_| next_unit() * 2.0 - 1.0)
+                .collect();
+            let row_scales: Vec<f32> = (0..rows).map(|_| 0.75 + next_unit() * 0.5).collect();
+            let tensor_scale = 0.75_f32;
+
+            let mut hip_context = RuntimeContext::create(device_index).unwrap();
+            let mut hip_stream = hip_context.create_stream().unwrap();
+            let mut hip_index = hip_context.alloc_buffer(index_bytes).unwrap();
+            let mut hip_scale = hip_context.alloc_buffer(groups).unwrap();
+            let mut hip_codebook = hip_context
+                .alloc_buffer(16 * std::mem::size_of::<f32>())
+                .unwrap();
+            let mut hip_scale_values = hip_context
+                .alloc_buffer(scale_count * std::mem::size_of::<f32>())
+                .unwrap();
+            let mut hip_input = hip_context
+                .alloc_buffer(input_values.len() * std::mem::size_of::<f32>())
+                .unwrap();
+            let mut hip_row_scale = hip_context
+                .alloc_buffer(rows * std::mem::size_of::<f32>())
+                .unwrap();
+            let mut hip_output = hip_context
+                .alloc_buffer(batch_count * rows * std::mem::size_of::<f32>())
+                .unwrap();
+            hip_index
+                .copy_from_host(0, &indices, Some(&mut hip_stream))
+                .unwrap();
+            hip_scale
+                .copy_from_host(0, &scale_indices, Some(&mut hip_stream))
+                .unwrap();
+            hip_codebook
+                .copy_from_host(
+                    0,
+                    &f32s_to_le_bytes(&codebook_values),
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+            hip_scale_values
+                .copy_from_host(0, &f32s_to_le_bytes(&scale_values), Some(&mut hip_stream))
+                .unwrap();
+            hip_input
+                .copy_from_host(0, &f32s_to_le_bytes(&input_values), Some(&mut hip_stream))
+                .unwrap();
+            hip_row_scale
+                .copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut hip_stream))
+                .unwrap();
+            hip_stream.synchronize().unwrap();
+
+            // Compile/load both modules and reach steady-state allocations before wall timing.
+            for _ in 0..WARMUP_ITERATIONS {
+                aq4_matvec_batch_register_bm8_f32(
+                    &hip_index,
+                    &hip_scale,
+                    &hip_codebook,
+                    &hip_scale_values,
+                    &hip_input,
+                    Some(&hip_row_scale),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    rows,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut hip_output,
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+            }
+            hip_stream.synchronize().unwrap();
+            for _ in 0..WARMUP_ITERATIONS {
+                aq4_matvec_batch_wmma_prototype_f32(
+                    &hip_index,
+                    &hip_scale,
+                    &hip_codebook,
+                    &hip_scale_values,
+                    &hip_input,
+                    Some(&hip_row_scale),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    rows,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut hip_output,
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+            }
+            hip_stream.synchronize().unwrap();
+
+            let register_started = std::time::Instant::now();
+            for _ in 0..TIMED_ITERATIONS {
+                aq4_matvec_batch_register_bm8_f32(
+                    &hip_index,
+                    &hip_scale,
+                    &hip_codebook,
+                    &hip_scale_values,
+                    &hip_input,
+                    Some(&hip_row_scale),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    rows,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut hip_output,
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+            }
+            hip_stream.synchronize().unwrap();
+            let register_elapsed = register_started.elapsed();
+
+            let wmma_started = std::time::Instant::now();
+            for _ in 0..TIMED_ITERATIONS {
+                aq4_matvec_batch_wmma_prototype_f32(
+                    &hip_index,
+                    &hip_scale,
+                    &hip_codebook,
+                    &hip_scale_values,
+                    &hip_input,
+                    Some(&hip_row_scale),
+                    scale_count,
+                    16,
+                    tensor_scale,
+                    rows,
+                    rows,
+                    cols,
+                    batch_count,
+                    &mut hip_output,
+                    Some(&mut hip_stream),
+                )
+                .unwrap();
+            }
+            hip_stream.synchronize().unwrap();
+            let wmma_elapsed = wmma_started.elapsed();
+
+            let register_ms = register_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+            let wmma_ms = wmma_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+            let flops_per_launch = 2.0_f64 * rows as f64 * cols as f64 * batch_count as f64;
+            let register_tflops = flops_per_launch / (register_ms / 1_000.0) / 1.0e12;
+            let wmma_tflops = flops_per_launch / (wmma_ms / 1_000.0) / 1.0e12;
+            assert!(register_ms.is_finite() && register_ms > 0.0);
+            assert!(wmma_ms.is_finite() && wmma_ms > 0.0);
+            eprintln!(
+                "AQ4 WMMA prototype timing rows={rows} cols={cols} M={batch_count}: register-bm8={register_ms:.3} ms ({register_tflops:.2} TFLOPS), wmma={wmma_ms:.3} ms ({wmma_tflops:.2} TFLOPS), speedup={:.3}x",
+                register_ms / wmma_ms
+            );
+        }
+    }
+
+    #[test]
     fn first_hip_aq4_matvec_top1_f32_writes_partial_maximum_when_available() {
         if device_count().unwrap() < 2 {
             return;
