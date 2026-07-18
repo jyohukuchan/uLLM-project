@@ -31,10 +31,24 @@ MAX_PROFILE_TOTAL_BYTES = 512 * 1024 * 1024
 FAMILIES: dict[str, tuple[str, ...]] = {
     "runtime_support": (r"__amd_rocclr_", r"memset", r"fillbuffer", r"copybuffer"),
     "embedding": (r"bf16.*row", r"embedding"),
+    # Fused Qwen3.5 validation/write kernels cross ordinary operator-family
+    # boundaries.  Keep them in their own bucket instead of letting a generic
+    # RoPE or attention rule claim part of their work.
+    "paged_validation": (
+        r"(?:^|_)paged_?kv_?write(?:_|$)",
+        r"(?:^|_)qwen35_?qk_?norm_?rope(?:_|$)",
+    ),
     "aq4_projection": (r"aq4.*(?:matvec|gemm|projection|register.*bm8)", r"(?:matvec|gemm).*aq4"),
-    "attention": (r"paged.*(?:attn|attention|causal.*gqa|decode)", r"qk.*norm.*rope"),
+    "attention": (r"paged.*(?:attn|attention|causal.*gqa|decode)",),
     "recurrent": (r"linear.*attn", r"gated.*delta", r"recurrent", r"qkv.*prepare"),
-    "normalization": (r"rmsnorm", r"rms.*norm", r"silu.*mul", r"sigmoid.*mul", r"rope", r"(?:^|_)add(?:_|$)"),
+    "normalization": (
+        r"rmsnorm",
+        r"rms.*norm",
+        r"^(?!.*aq4.*(?:matvec|gemm|projection|register.*bm8)).*silu.*mul",
+        r"sigmoid.*mul",
+        r"^(?!.*(?:qwen35.*qk.*norm.*rope|paged.*kv.*write)).*rope",
+        r"^(?!.*aq4.*(?:matvec|gemm|projection|register.*bm8)).*(?:^|_)add(?:_|$)",
+    ),
     "head": (r"top1", r"lm.*head", r"argmax"),
 }
 COMPILED = {family: tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns) for family, patterns in FAMILIES.items()}
