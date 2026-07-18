@@ -1009,6 +1009,16 @@ impl PackageAq4ResidentMatvec {
                             output_buffer,
                             stream,
                         ),
+                    ExecutableOperation::HipAq4GemmWmmaF32 => started.execute_aq4_gemm_wmma_f32(
+                        aq4.index_buffer,
+                        aq4.scale_buffer,
+                        aq4.codebook_buffer,
+                        aq4.scale_values_buffer,
+                        input_buffer,
+                        aq4.row_scale_buffer,
+                        output_buffer,
+                        stream,
+                    ),
                     other => Err(format!(
                         "{label} AQ4 matvec batch plan selected incompatible executable {other:?}"
                     )),

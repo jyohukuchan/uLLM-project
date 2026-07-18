@@ -1195,7 +1195,7 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
             cols,
             batch_count)) {
         set_error(
-            "AQ4 WMMA prototype requires exact gfx1201, M=128, and a 12288x4096 or 4096x12288 MLP shape");
+            "AQ4 WMMA prototype requires exact gfx1201, group16, M=128, rows divisible by 16, and cols divisible by 32");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u ||

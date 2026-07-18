@@ -1438,7 +1438,7 @@
 
     #[test]
     #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_DIFFERENTIAL=1"]
-    fn hip_aq4_wmma_prototype_m128_mlp_shapes_match_cpu_when_enabled() {
+    fn hip_aq4_wmma_prototype_m128_group16_model_shapes_match_cpu_when_enabled() {
         assert_eq!(
             std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_DIFFERENTIAL").as_deref(),
             Ok("1"),
@@ -1460,8 +1460,16 @@
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed as f32) / (u32::MAX as f32)
         };
-        for &(rows, cols) in &[(12_288_usize, 4_096_usize), (4_096, 12_288)] {
+        for &(family, rows, cols, use_row_scales) in &[
+            ("attn_q + linear_attn_qkv", 8_192_usize, 4_096, true),
+            ("linear_attn_z", 4_096, 4_096, false),
+            ("linear_attn_a + linear_attn_b", 32, 4_096, true),
+            ("mlp_gate + mlp_up", 12_288, 4_096, true),
+            ("mlp_down", 4_096, 12_288, false),
+        ] {
             let batch_count = 128_usize;
+            assert_eq!(rows % 16, 0, "{family} must fill WMMA row tiles");
+            assert_eq!(cols % 32, 0, "{family} must fill Wide-K pairs");
             let elements = rows * cols;
             let index_bytes = elements / 2;
             let groups = elements / 16;
@@ -1480,9 +1488,8 @@
             let input_values: Vec<f32> = (0..batch_count * cols)
                 .map(|_| next_unit() * 2.0 - 1.0)
                 .collect();
-            // Exercise both post-accumulation row-scale cases across the two target projection
-            // orientations: the gate/up shape has scales, and down uses the null-pointer path.
-            let use_row_scales = rows == 12_288;
+            // Exercise both post-accumulation row-scale cases while covering every group16
+            // production projection dimension. The false cases use the ABI's null-pointer path.
             let row_scales: Vec<f32> = (0..rows).map(|_| 0.75 + next_unit() * 0.5).collect();
             let row_scale_count = if use_row_scales { rows } else { 0 };
             let tensor_scale = 0.75_f32;
@@ -1651,7 +1658,7 @@
                 let tolerance = 5e-2_f32 + 1e-2_f32 * expected.abs();
                 assert!(
                     (actual - expected).abs() <= tolerance,
-                    "rows={rows} cols={cols} index={index}: actual={actual} expected={expected} tolerance={tolerance}"
+                    "family={family} rows={rows} cols={cols} index={index}: actual={actual} expected={expected} tolerance={tolerance}"
                 );
             }
         }
@@ -1659,7 +1666,7 @@
 
     #[test]
     #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_TIMING=1"]
-    fn hip_aq4_wmma_prototype_m128_timing_vs_register_bm8_when_enabled() {
+    fn hip_aq4_wmma_prototype_m128_group16_model_shapes_timing_vs_register_bm8_when_enabled() {
         assert_eq!(
             std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_TIMING").as_deref(),
             Ok("1"),
@@ -1683,8 +1690,16 @@
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed as f32) / (u32::MAX as f32)
         };
-        for &(rows, cols) in &[(12_288_usize, 4_096_usize), (4_096, 12_288)] {
+        for &(family, rows, cols) in &[
+            ("attn_q + linear_attn_qkv", 8_192_usize, 4_096),
+            ("linear_attn_z", 4_096, 4_096),
+            ("linear_attn_a + linear_attn_b", 32, 4_096),
+            ("mlp_gate + mlp_up", 12_288, 4_096),
+            ("mlp_down", 4_096, 12_288),
+        ] {
             let batch_count = 128_usize;
+            assert_eq!(rows % 16, 0, "{family} must fill WMMA row tiles");
+            assert_eq!(cols % 32, 0, "{family} must fill Wide-K pairs");
             let elements = rows * cols;
             let index_bytes = elements / 2;
             let groups = elements / 16;
@@ -1849,7 +1864,7 @@
             assert!(register_ms.is_finite() && register_ms > 0.0);
             assert!(wmma_ms.is_finite() && wmma_ms > 0.0);
             eprintln!(
-                "AQ4 WMMA prototype timing rows={rows} cols={cols} M={batch_count}: register-bm8={register_ms:.3} ms ({register_tflops:.2} TFLOPS), wmma={wmma_ms:.3} ms ({wmma_tflops:.2} TFLOPS), speedup={:.3}x",
+                "AQ4 WMMA prototype timing family={family} rows={rows} cols={cols} M={batch_count}: register-bm8={register_ms:.3} ms ({register_tflops:.2} TFLOPS), wmma={wmma_ms:.3} ms ({wmma_tflops:.2} TFLOPS), speedup={:.3}x",
                 register_ms / wmma_ms
             );
         }

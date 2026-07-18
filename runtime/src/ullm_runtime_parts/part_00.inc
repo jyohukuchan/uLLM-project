@@ -51,8 +51,8 @@ constexpr unsigned int kAq4RegisterThreads = 256u;
 static_assert(
     kAq4RegisterRowsPerBlock * kAq4RegisterLanesPerRow == kAq4RegisterThreads,
     "AQ4 register tile must map eight lanes to each row");
-// The WMMA prototype deliberately covers only the dominant prefill MLP geometries. Its one
-// workgroup contains eight wave32s, each producing a 16x16 column slice of a 16x128 output tile.
+// One WMMA workgroup contains eight wave32s, each producing a 16x16 column slice of a
+// group16/M=128 output tile with 16 rows and 128 batch columns.
 constexpr unsigned int kAq4WmmaPrototypeBm = 128u;
 constexpr unsigned int kAq4WmmaPrototypeBn = 16u;
 constexpr unsigned int kAq4WmmaPrototypeBk = 32u;
@@ -3992,12 +3992,12 @@ bool aq4_matvec_batch_wmma_prototype_shape_is_supported(
     size_t rows,
     size_t cols,
     size_t batch_count) {
-    // This is deliberately narrower than the production register path. The 16-byte AQ4
-    // Wide-K load assumes K is a multiple of 32 and the two named MLP projection geometries
-    // keep all row strides aligned for both packed-index and float4 activation loads.
+    // The paired group16 Wide-K source load requires K divisible by 32. That also makes every
+    // packed-index row stride and every FP32 input row stride 16-byte aligned. Complete 16-row
+    // tiles let the launch use an exact row grid, including rows=32 -> grid_x=2.
     return arch == "gfx1201" && group_size == kAq4RegisterGroup16 &&
-        batch_count == kAq4WmmaPrototypeBm &&
-        ((rows == 12288u && cols == 4096u) || (rows == 4096u && cols == 12288u));
+        batch_count == kAq4WmmaPrototypeBm && rows != 0u && cols != 0u &&
+        rows % kAq4WmmaPrototypeBn == 0u && cols % kAq4WmmaPrototypeBk == 0u;
 }
 
 Aq4MatvecBatchDispatchKind aq4_matvec_batch_dispatch_kind_for_device(
@@ -4249,7 +4249,7 @@ bool aq4_matvec_batch_f32_wmma_prototype_hip_kernel(
             cols,
             batch_count)) {
         if (error != nullptr) {
-            *error = "AQ4 WMMA prototype requires gfx1201, group16, M=128, and a target MLP shape";
+            *error = "AQ4 WMMA prototype requires gfx1201, group16, M=128, rows divisible by 16, and cols divisible by 32";
         }
         return false;
     }

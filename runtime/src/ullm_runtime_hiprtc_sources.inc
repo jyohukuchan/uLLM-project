@@ -1135,9 +1135,9 @@ extern "C" __global__ void ullm_aq4_gemm_register_bm8_group8_f32_kernel(
 )";
     }
 
-    // Experimental gfx1201-only AQ4 WMMA path for the dominant M=128 MLP projections.
+    // gfx1201-only AQ4 WMMA path for group16 M=128 projections.
     // It intentionally lives in a separate HIPRTC source/module from the production register
-    // kernels so the prototype cannot perturb their compile or dispatch behavior.
+    // kernels so its rocWMMA compile requirements cannot perturb their compile behavior.
     static const char *aq4_matvec_wmma_prototype_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>
@@ -1191,11 +1191,11 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
     const unsigned long long row_base = static_cast<unsigned long long>(blockIdx.x) * kTileRows;
     const unsigned long long batch_base = static_cast<unsigned long long>(blockIdx.y) * kBatchTile;
 
-    // The public prototype ABI admits only these exact shapes. Keep a uniform device-side guard
-    // as a fail-closed backstop if a caller bypasses host validation.
-    if (group_size != 16ull || batch_count != kBatchTile ||
-        !((rows == 12288ull && cols == 4096ull) ||
-          (rows == 4096ull && cols == 12288ull))) {
+    // Keep a uniform device-side guard as a fail-closed backstop if a caller bypasses host
+    // validation. `cols % 32 == 0` preserves paired group16 Wide-K loads and 16-byte source
+    // alignment; `rows % 16 == 0` gives every workgroup a complete output row tile.
+    if (group_size != 16ull || batch_count != kBatchTile || rows == 0ull || cols == 0ull ||
+        (rows % kTileRows) != 0ull || (cols % kWideK) != 0ull) {
         return;
     }
 

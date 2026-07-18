@@ -287,9 +287,9 @@ ullm_status ullm_runtime_aq4_matvec_batch_register_bm8_group8_f32(
     ullm_runtime_stream *stream);
 
 /*
- * Experimental direct rocWMMA AQ4 GEMM prototype. This additive ABI is intentionally not part
- * of dispatch: it accepts only gfx1201, AQ4 group16, M=128, and the 12288x4096 / 4096x12288
- * MLP projection shapes. It returns an error instead of falling back for every other geometry.
+ * Direct gfx1201 rocWMMA AQ4 group16 GEMM for M=128. This additive ABI never falls back and
+ * accepts only nonzero shapes with rows divisible by 16 and cols divisible by 32; those
+ * constraints preserve complete 16-row output tiles and the Wide-K 16-byte source loads.
  */
 ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
     const ullm_runtime_buffer *index_buffer,

@@ -1874,10 +1874,10 @@ pub fn aq4_matvec_batch_register_bm8_group8_f32(
     })
 }
 
-/// Directly invokes the experimental gfx1201 rocWMMA AQ4 M=128 MLP prototype.
+/// Directly invokes the gfx1201 rocWMMA AQ4 group16 M=128 kernel.
 ///
 /// This forced path has no dispatch or environment dependency and never falls back. It only
-/// admits group16 and the 12288x4096 / 4096x12288 production MLP projection geometries.
+/// admits nonzero group16 shapes with rows divisible by 16 and cols divisible by 32.
 #[allow(clippy::too_many_arguments)]
 pub fn aq4_matvec_batch_wmma_prototype_f32(
     index_buffer: &RuntimeBuffer,
@@ -1905,8 +1905,11 @@ pub fn aq4_matvec_batch_wmma_prototype_f32(
     if batch_count != 128 {
         return Err("AQ4 WMMA prototype requires batch count M=128".to_string());
     }
-    if !matches!((rows, cols), (12_288, 4_096) | (4_096, 12_288)) {
-        return Err("AQ4 WMMA prototype requires a 12288x4096 or 4096x12288 MLP shape".to_string());
+    if rows == 0 || cols == 0 || !rows.is_multiple_of(16) || !cols.is_multiple_of(32) {
+        return Err(
+            "AQ4 WMMA prototype requires nonzero rows divisible by 16 and cols divisible by 32"
+                .to_string(),
+        );
     }
     if !tensor_scale.is_finite() || tensor_scale <= 0.0 {
         return Err(

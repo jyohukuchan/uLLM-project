@@ -222,6 +222,33 @@
     }
 
     #[test]
+    fn aq4_wmma_group16_model_shape_contracts_have_exact_full_tile_grids() {
+        // `grid.x = rows / 16` and `grid.y = M / 128` are exact only after the production
+        // divisibility checks. The 32-row linear_attn_a/b case is deliberately included: it
+        // must launch two row tiles, not be rounded up from an MLP-specific grid assumption.
+        for (family, rows, cols, expected_grid_x) in [
+            ("attn_q + linear_attn_qkv", 8_192_usize, 4_096, 512),
+            ("linear_attn_z", 4_096, 4_096, 256),
+            ("linear_attn_a + linear_attn_b", 32, 4_096, 2),
+            ("mlp_gate + mlp_up", 12_288, 4_096, 768),
+            ("mlp_down", 4_096, 12_288, 256),
+        ] {
+            assert_eq!(rows % 16, 0, "{family} row tiles");
+            assert_eq!(cols % 32, 0, "{family} Wide-K groups");
+            assert_eq!(rows / 16, expected_grid_x, "{family} grid.x");
+            assert_eq!(128 / 128, 1, "{family} grid.y");
+            // Two adjacent group16s occupy 32 nibbles / 16 bytes. The packed weights and the
+            // FP32 activation rows therefore satisfy the vector-load alignment contract.
+            assert_eq!((cols / 2) % 16, 0, "{family} packed AQ4 stride");
+            assert_eq!(
+                (cols * std::mem::size_of::<f32>()) % 16,
+                0,
+                "{family} activation stride"
+            );
+        }
+    }
+
+    #[test]
     fn smoke_adds_f32_values() {
         let out = smoke_add_f32(&[1.0, 2.5, -3.0], &[4.0, -1.5, 3.5]).unwrap();
         assert_eq!(out, vec![5.0, 1.0, 0.5]);
