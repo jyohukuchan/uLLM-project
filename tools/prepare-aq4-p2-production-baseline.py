@@ -645,7 +645,7 @@ def legacy_case(case: dict[str, Any], tokens: list[int], *, oracle: bool = False
             "backend": "hip",
             "name": "AMD Radeon Graphics",
             "architecture": "gfx1201",
-            "runtime_device_index": 0,
+            "runtime_device_index": 1,
         },
         "control_id": "aq4_0_target",
         "control": {
