@@ -1294,6 +1294,166 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
     return ULLM_STATUS_OK;
 }
 
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v2_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t batch_count,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    if (index_buffer == nullptr || scale_buffer == nullptr || codebook_buffer == nullptr ||
+        scale_values_buffer == nullptr || input_buffer == nullptr || output_buffer == nullptr) {
+        set_error("AQ4 WMMA prototype v2 received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (scale_count == 0u) {
+        set_error("AQ4 WMMA prototype v2 scale table is empty");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (group_size != kAq4RegisterGroup16) {
+        set_error("AQ4 WMMA prototype v2 requires group size 16");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch_count != kAq4WmmaPrototypeBm) {
+        set_error("AQ4 WMMA prototype v2 requires batch count M=128");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(tensor_scale) || tensor_scale <= 0.0f) {
+        set_error("AQ4 WMMA prototype v2 tensor scale must be finite and greater than zero");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!buffers_share_backend(index_buffer, scale_buffer) ||
+        !buffers_share_backend(index_buffer, codebook_buffer) ||
+        !buffers_share_backend(index_buffer, scale_values_buffer) ||
+        !buffers_share_backend(index_buffer, input_buffer) ||
+        !buffers_share_backend(index_buffer, output_buffer) ||
+        (row_scale_buffer != nullptr && !buffers_share_backend(index_buffer, row_scale_buffer))) {
+        set_error("AQ4 WMMA prototype v2 buffers belong to different backends or devices");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!stream_matches_buffer(output_buffer, stream)) {
+        set_error("AQ4 WMMA prototype v2 stream belongs to a different backend or device");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (index_buffer->backend != BackendKind::Hip) {
+        set_error("AQ4 WMMA prototype v2 requires a HIP gfx1201 backend");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!aq4_matvec_batch_wmma_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(index_buffer->hip_device_id),
+            group_size,
+            rows,
+            cols,
+            batch_count)) {
+        set_error(
+            "AQ4 WMMA prototype v2 requires exact gfx1201, group16, M=128, rows divisible by 16, and cols divisible by 32");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u ||
+        (reinterpret_cast<std::uintptr_t>(input_buffer->ptr) & 15u) != 0u) {
+        set_error("AQ4 WMMA prototype v2 requires 16-byte-aligned index and input buffers");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const size_t grid_x = rows / kAq4WmmaPrototypeBn;
+    const size_t grid_y = batch_count / kAq4WmmaPrototypeBm;
+    if (grid_x == 0u || grid_y == 0u ||
+        grid_x > static_cast<size_t>(std::numeric_limits<unsigned int>::max()) ||
+        grid_y > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+        set_error("AQ4 WMMA prototype v2 dimensions exceed HIP grid limit");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / rows) {
+        set_error("AQ4 WMMA prototype v2 matrix element count overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t elements = rows * cols;
+    const size_t required_index_bytes = elements / 2u;
+    const size_t groups = elements / group_size;
+    if (cols > max_size / batch_count || rows > max_size / batch_count ||
+        scale_count > max_size / sizeof(float) || row_scale_count > max_size / sizeof(float)) {
+        set_error("AQ4 WMMA prototype v2 byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t input_elements = cols * batch_count;
+    const size_t output_elements = rows * batch_count;
+    if (input_elements > max_size / sizeof(float) ||
+        output_elements > max_size / sizeof(float)) {
+        set_error("AQ4 WMMA prototype v2 byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t required_input_bytes = input_elements * sizeof(float);
+    const size_t required_output_bytes = output_elements * sizeof(float);
+    const size_t required_scale_value_bytes = scale_count * sizeof(float);
+    const size_t required_row_scale_bytes = row_scale_count * sizeof(float);
+    if (index_buffer->bytes < required_index_bytes) {
+        set_error("AQ4 WMMA prototype v2 index buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (scale_buffer->bytes < groups) {
+        set_error("AQ4 WMMA prototype v2 scale index buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (scale_values_buffer->bytes < required_scale_value_bytes) {
+        set_error("AQ4 WMMA prototype v2 scale value buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (input_buffer->bytes < required_input_bytes) {
+        set_error("AQ4 WMMA prototype v2 input buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (row_scale_buffer != nullptr && row_scale_buffer->bytes < required_row_scale_bytes) {
+        set_error("AQ4 WMMA prototype v2 row scale buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (output_buffer->bytes < required_output_bytes) {
+        set_error("AQ4 WMMA prototype v2 output buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (codebook_buffer->bytes % sizeof(float) != 0u ||
+        codebook_buffer->bytes / sizeof(float) < 16u) {
+        set_error("AQ4 WMMA prototype v2 requires at least 16 f32 codebook entries");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::string hip_kernel_error;
+    if (!aq4_matvec_batch_f32_wmma_prototype_v2_hip_kernel(
+            index_buffer,
+            scale_buffer,
+            codebook_buffer,
+            scale_values_buffer,
+            input_buffer,
+            row_scale_buffer,
+            scale_count,
+            group_size,
+            tensor_scale,
+            row_scale_count,
+            rows,
+            cols,
+            batch_count,
+            output_buffer,
+            stream,
+            &hip_kernel_error)) {
+        set_error(
+            hip_kernel_error.empty() ? "AQ4 WMMA prototype v2 HIP kernel launch failed" :
+                                       hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_aq4_matvec_batch_dispatch_kind ullm_runtime_aq4_matvec_batch_dispatch_kind_for_shape(
     uint32_t device_index,
     size_t group_size,
