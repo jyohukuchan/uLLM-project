@@ -2352,7 +2352,8 @@ impl StartedOperationPlan<'_> {
         .map_err(|error| error.to_string())
     }
 
-    /// Executes the production gfx1201/group16 rocWMMA AQ4 GEMM ABI selected at load time.
+    /// Executes the production double-buffered gfx1201/group16 rocWMMA AQ4 GEMM ABI selected at
+    /// load time.
     ///
     /// This method intentionally has no fallback path: M=128 plans that resolve to WMMA must
     /// fail closed if the independently probed rocWMMA ABI cannot execute.
@@ -7152,6 +7153,46 @@ mod tests {
             before + 1
         );
         probe_fault_checkpoint(18, "aq4-gemm-wmma").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL=1"]
+    fn isolated_hip_aq4_wmma_probe_enables_production_m128_dispatch_when_guarded() {
+        assert_eq!(
+            std::env::var(runtime_feature_environment(RuntimeFeature::HipAq4GemmWmma)).as_deref(),
+            Ok("1")
+        );
+        let hip_index = (1..ullm_runtime_sys::device_count().unwrap())
+            .find(|index| {
+                ullm_runtime_sys::device_info(*index)
+                    .is_ok_and(|info| info.backend == "hip" && info.gcn_arch_name == "gfx1201")
+            })
+            .expect("isolated gfx1201 HIP device");
+        let mut context = ullm_runtime_sys::RuntimeContext::create(hip_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let device =
+            DeviceCapabilities::probe_m1_runtime_context(&mut context, &mut stream).unwrap();
+        assert!(device.runtime_features.contains(RuntimeFeature::HipAq4GemmWmma));
+
+        let geometry = wmma_eligible_aq4_geometry(32, 4_096);
+        let registry = aq4_matvec_batch_production_registry(geometry, &device).unwrap();
+        let request = aq4_matvec_batch_operation_request(
+            ExecutionPhase::ColdPrefill,
+            geometry,
+            128,
+            device,
+            u64::MAX,
+        )
+        .unwrap();
+        let plan = registry.resolve(&request).unwrap();
+        assert_eq!(
+            plan.trace().implementation_id,
+            "hip.aq4-gemm-wmma-f32.gfx1201.group16.m128"
+        );
+        assert_eq!(
+            plan.trace().executable,
+            ExecutableOperation::HipAq4GemmWmmaF32
+        );
     }
 
     #[test]

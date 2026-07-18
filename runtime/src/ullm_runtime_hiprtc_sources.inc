@@ -1135,10 +1135,10 @@ extern "C" __global__ void ullm_aq4_gemm_register_bm8_group8_f32_kernel(
 )";
     }
 
-    // gfx1201-only AQ4 WMMA path for group16 M=128 projections.
-    // It intentionally lives in a separate HIPRTC source/module from the production register
-    // kernels so its rocWMMA compile requirements cannot perturb their compile behavior.
-    static const char *aq4_matvec_wmma_prototype_kernel_source() {
+    // Superseded v1 reference for the gfx1201 AQ4 WMMA group16 M=128 kernel. It is deliberately
+    // not passed to HIPRTC: production uses the double-buffered source below under this same
+    // entry-point ABI. Keep this source to make a controlled future rollback comparison possible.
+    [[maybe_unused]] static const char *aq4_matvec_wmma_prototype_v1_reference_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>
 
@@ -1308,14 +1308,14 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
-    // Experimental v2 of the gfx1201 AQ4 WMMA path. It is intentionally a separate HIPRTC
-    // source/module so compiling this software-pipelined experiment cannot alter the validated
-    // v1 kernel's generated code or production cache.
-    static const char *aq4_matvec_wmma_prototype_v2_kernel_source() {
+    // Production double-buffered gfx1201 AQ4 WMMA path for group16 M=128 projections. It lives
+    // in a separate HIPRTC source/module from the register kernels so rocWMMA compile options do
+    // not perturb their code generation.
+    static const char *aq4_matvec_wmma_prototype_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>
 
-extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
+extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
     const unsigned char *indices,
     const unsigned char *scale_indices,
     const float *codebook,
@@ -1340,12 +1340,12 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
     constexpr unsigned int kStages = 2u;
     constexpr unsigned int kWavesPerBlock = kBatchTile / kTileCols;
     constexpr unsigned int kThreads = kWavesPerBlock * 32u;
-    static_assert(kThreads == 256u, "AQ4 WMMA prototype v2 expects eight wave32s");
+    static_assert(kThreads == 256u, "AQ4 WMMA production kernel expects eight wave32s");
     static_assert(kWideK == 2u * kWmmaK, "AQ4 Wide-K path requires two WMMA K tiles");
-    static_assert(kStages == 2u, "AQ4 WMMA prototype v2 is a ping-pong LDS pipeline");
+    static_assert(kStages == 2u, "AQ4 WMMA production kernel is a ping-pong LDS pipeline");
 
-    typedef unsigned int ullm_aq4_wmma_v2_uint4 __attribute__((ext_vector_type(4)));
-    typedef float ullm_aq4_wmma_v2_float4 __attribute__((ext_vector_type(4)));
+    typedef unsigned int ullm_aq4_wmma_uint4 __attribute__((ext_vector_type(4)));
+    typedef float ullm_aq4_wmma_float4 __attribute__((ext_vector_type(4)));
     using FragA = fragment<matrix_a, kTileRows, kTileCols, kWmmaK, float16_t, row_major>;
     using FragB = fragment<matrix_b, kTileRows, kTileCols, kWmmaK, float16_t, col_major>;
     using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;
@@ -1360,11 +1360,12 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
         kWavesPerBlock * kTileRows * kTileCols * sizeof(float);
     constexpr unsigned int kStaticLdsBytes =
         kWeightTilesLdsBytes + kInputTilesLdsBytes + kOutputTileLdsBytes;
-    static_assert(kStaticLdsBytes == 26624u, "AQ4 WMMA v2 LDS accounting drifted");
-    static_assert(kStaticLdsBytes <= 64u * 1024u, "AQ4 WMMA v2 must fit gfx1201 LDS");
+    static_assert(kStaticLdsBytes == 26624u, "AQ4 WMMA production LDS accounting drifted");
+    static_assert(kStaticLdsBytes <= 64u * 1024u, "AQ4 WMMA production kernel must fit gfx1201 LDS");
 
-    // V2 has two ping-pong LDS stages. A wave first copies the current stage into fragments,
-    // then prefetches its next input vectors to registers while its current WMMA work executes.
+    // The production kernel has two ping-pong LDS stages. A wave first copies the current stage
+    // into fragments, then prefetches its next input vectors to registers while its current WMMA
+    // work executes.
     // The next LDS stage is only published at the transition barrier, so no stage is overwritten
     // while another wave can still be reading it.
     __shared__ __attribute__((aligned(16))) float16_t weight_tiles[
@@ -1388,7 +1389,7 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
     fill_fragment(c, 0.0f);
     const unsigned long long groups_per_row = cols / 16ull;
 
-    // Prime stage 0 exactly as v1 does. From this point on, every nonfinal K iteration prepares
+    // Prime stage 0. From this point on, every nonfinal K iteration prepares
     // the other stage before the next iteration consumes it.
     if (tid < kTileRows) {
         const unsigned long long row = row_base + tid;
@@ -1400,8 +1401,8 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
         const float group_scale1 =
             scale_index1 < scale_count ? scale_values[scale_index1] : 0.0f;
         const unsigned long long byte_offset = (row * cols) >> 1;
-        const ullm_aq4_wmma_v2_uint4 packed_words =
-            *reinterpret_cast<const ullm_aq4_wmma_v2_uint4 *>(indices + byte_offset);
+        const ullm_aq4_wmma_uint4 packed_words =
+            *reinterpret_cast<const ullm_aq4_wmma_uint4 *>(indices + byte_offset);
 #pragma unroll
         for (unsigned int word_index = 0u; word_index < 4u; ++word_index) {
             const unsigned int word = static_cast<unsigned int>(packed_words[word_index]);
@@ -1424,8 +1425,8 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
         const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
         const unsigned long long input_offset =
             (batch_base + batch_in_tile) * cols + k_in_tile;
-        const ullm_aq4_wmma_v2_float4 values =
-            *reinterpret_cast<const ullm_aq4_wmma_v2_float4 *>(input + input_offset);
+        const ullm_aq4_wmma_float4 values =
+            *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);
         const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;
         input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);
         input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);
@@ -1450,8 +1451,8 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
         load_matrix_sync(b, input_tiles[current_stage] + wave_input_offset, kWideK);
 
         const bool has_next = k_base < cols - kWideK;
-        ullm_aq4_wmma_v2_float4 prefetched_input[4];
-        ullm_aq4_wmma_v2_uint4 prefetched_weights;
+        ullm_aq4_wmma_float4 prefetched_input[4];
+        ullm_aq4_wmma_uint4 prefetched_weights;
         float prefetched_group_scale0 = 0.0f;
         float prefetched_group_scale1 = 0.0f;
         if (has_next && tid < kTileRows) {
@@ -1468,7 +1469,7 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
                 scale_index1 < scale_count ? scale_values[scale_index1] : 0.0f;
             const unsigned long long byte_offset = (row * cols + next_k_base) >> 1;
             prefetched_weights =
-                *reinterpret_cast<const ullm_aq4_wmma_v2_uint4 *>(indices + byte_offset);
+                *reinterpret_cast<const ullm_aq4_wmma_uint4 *>(indices + byte_offset);
         }
         if (has_next) {
 #pragma unroll
@@ -1479,7 +1480,7 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
                 const unsigned long long input_offset =
                     (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;
                 prefetched_input[prefetch_index] =
-                    *reinterpret_cast<const ullm_aq4_wmma_v2_float4 *>(input + input_offset);
+                    *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);
             }
         }
 
@@ -1513,7 +1514,7 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_v2_f32_kernel(
                 const unsigned int batch_in_tile = input_vector / (kWideK / 4u);
                 const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
                 const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;
-                const ullm_aq4_wmma_v2_float4 values = prefetched_input[prefetch_index];
+                const ullm_aq4_wmma_float4 values = prefetched_input[prefetch_index];
                 input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);
                 input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);
                 input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);
