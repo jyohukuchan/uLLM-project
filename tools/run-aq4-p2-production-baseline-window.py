@@ -380,7 +380,7 @@ def execute(plan: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         "--served-model-manifest",
         str(manifest),
         "--device-index",
-        "0",
+        "1",
         "--build-git-commit",
         str(load_json(preparation / "identity.json", "preparation identity")["clean_baseline_source"]["git_commit"]),
     ]
