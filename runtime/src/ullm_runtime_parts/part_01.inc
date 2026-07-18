@@ -6048,7 +6048,7 @@ void linear_attn_recurrent_f32_host(
     }
 }
 
-class HipLinearAttnRecurrentKernelCache {
+class HipLinearAttnRecurrentGenericKernelCache {
 public:
     void *function_for_device(int device_id, std::string *error) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -6067,7 +6067,10 @@ public:
         for (const std::string &arch : candidates) {
             std::vector<char> code;
             std::string compile_error;
-            if (!hiprtc_runtime().compile_linear_attn_recurrent_kernel(arch, &code, &compile_error)) {
+            if (!hiprtc_runtime().compile_linear_attn_recurrent_generic_kernel(
+                    arch,
+                    &code,
+                    &compile_error)) {
                 append_error(&compile_errors, compile_error);
                 continue;
             }
@@ -6124,8 +6127,122 @@ private:
     std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
 };
 
-HipLinearAttnRecurrentKernelCache &hip_linear_attn_recurrent_kernel_cache() {
-    static HipLinearAttnRecurrentKernelCache cache;
+HipLinearAttnRecurrentGenericKernelCache &hip_linear_attn_recurrent_generic_kernel_cache() {
+    static HipLinearAttnRecurrentGenericKernelCache cache;
+    return cache;
+}
+
+constexpr size_t kLinearAttnRecurrentShuffleKeyHeads = 16u;
+constexpr size_t kLinearAttnRecurrentShuffleValueHeads = 32u;
+constexpr size_t kLinearAttnRecurrentShuffleKeyDim = 128u;
+constexpr size_t kLinearAttnRecurrentShuffleValueDim = 128u;
+constexpr unsigned int kLinearAttnRecurrentShuffleThreads = 128u;
+
+bool linear_attn_recurrent_shuffle_shape_is_supported(
+    const std::string &arch,
+    size_t key_heads,
+    size_t value_heads,
+    size_t key_dim,
+    size_t value_dim) {
+    return arch == "gfx1201" && key_heads == kLinearAttnRecurrentShuffleKeyHeads &&
+        value_heads == kLinearAttnRecurrentShuffleValueHeads &&
+        key_dim == kLinearAttnRecurrentShuffleKeyDim &&
+        value_dim == kLinearAttnRecurrentShuffleValueDim;
+}
+
+// Keep the exact-shape shuffle implementation in a separate HIPRTC module. Mixing the generic
+// fallback into this source changes its register/LDS allocation, whereas both modules retain the
+// stable ullm_linear_attn_recurrent_f32_kernel entry point and stable public ABI.
+class HipLinearAttnRecurrentShuffleKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        auto failed = failures_.find(device_id);
+        if (failed != failures_.end()) {
+            append_error(error, failed->second);
+            return nullptr;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            return fail(
+                device_id,
+                "linear attention recurrent shuffle requires exact gfx1201 architecture",
+                error);
+        }
+
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_linear_attn_recurrent_kernel(
+                "gfx1201",
+                &code,
+                &compile_error)) {
+            return fail(
+                device_id,
+                compile_error.empty() ?
+                    "failed to build linear attention recurrent shuffle HIP kernel" :
+                    compile_error,
+                error);
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            return fail(
+                device_id,
+                "hipModuleLoadData failed for linear attention recurrent shuffle",
+                error);
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_linear_attn_recurrent_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            return fail(
+                device_id,
+                "hipModuleGetFunction failed for linear attention recurrent shuffle",
+                error);
+        }
+
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+    };
+
+    void *fail(int device_id, const std::string &message, std::string *error) {
+        failures_.emplace(device_id, message);
+        append_error(error, message);
+        return nullptr;
+    }
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+    std::unordered_map<int, std::string> failures_;
+};
+
+HipLinearAttnRecurrentShuffleKernelCache &hip_linear_attn_recurrent_shuffle_kernel_cache() {
+    static HipLinearAttnRecurrentShuffleKernelCache cache;
     return cache;
 }
 
@@ -6145,10 +6262,6 @@ bool linear_attn_recurrent_f32_hip_kernel(
     ullm_runtime_stream *stream,
     std::string *error) {
     const int device_id = q_buffer->hip_device_id;
-    void *function = hip_linear_attn_recurrent_kernel_cache().function_for_device(device_id, error);
-    if (function == nullptr) {
-        return false;
-    }
     if (value_heads > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
         if (error != nullptr) {
             *error = "linear attention recurrent value head count exceeds HIP grid limit";
@@ -6195,6 +6308,42 @@ bool linear_attn_recurrent_f32_hip_kernel(
         "ULLM_LINEAR_ATTN_RECURRENT_BLOCK",
         block_size_from_env("ULLM_LINEAR_ATTN_RECURRENT_DECODE_BLOCK", default_block));
 
+    void *function = nullptr;
+    if (block_size == kLinearAttnRecurrentShuffleThreads &&
+        linear_attn_recurrent_shuffle_shape_is_supported(
+            hip_runtime().device_arch_name(device_id),
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim)) {
+        // Keep the generic module as a safe stable-ABI fallback if the target-specific code
+        // object cannot be built or loaded on a particular HIP installation.
+        std::string shuffle_error;
+        function = hip_linear_attn_recurrent_shuffle_kernel_cache().function_for_device(
+            device_id,
+            &shuffle_error);
+        if (function == nullptr) {
+            function = hip_linear_attn_recurrent_generic_kernel_cache().function_for_device(
+                device_id,
+                error);
+            if (function == nullptr && !shuffle_error.empty()) {
+                if (error != nullptr && !error->empty()) {
+                    error->append("\n");
+                }
+                if (error != nullptr) {
+                    error->append(shuffle_error);
+                }
+            }
+        }
+    } else {
+        function = hip_linear_attn_recurrent_generic_kernel_cache().function_for_device(
+            device_id,
+            error);
+    }
+    if (function == nullptr) {
+        return false;
+    }
+
     void *hip_stream = stream == nullptr ? nullptr : stream->stream;
     if (!hip_runtime().module_launch_kernel(
             function,
@@ -6205,200 +6354,6 @@ bool linear_attn_recurrent_f32_hip_kernel(
             device_id)) {
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for f32 linear attention recurrent";
-        }
-        return false;
-    }
-    return true;
-}
-
-constexpr size_t kLinearAttnRecurrentShufflePrototypeKeyHeads = 16u;
-constexpr size_t kLinearAttnRecurrentShufflePrototypeValueHeads = 32u;
-constexpr size_t kLinearAttnRecurrentShufflePrototypeKeyDim = 128u;
-constexpr size_t kLinearAttnRecurrentShufflePrototypeValueDim = 128u;
-constexpr unsigned int kLinearAttnRecurrentShufflePrototypeThreads = 128u;
-
-bool linear_attn_recurrent_shuffle_prototype_shape_is_supported(
-    const std::string &arch,
-    size_t key_heads,
-    size_t value_heads,
-    size_t key_dim,
-    size_t value_dim) {
-    return arch == "gfx1201" && key_heads == kLinearAttnRecurrentShufflePrototypeKeyHeads &&
-        value_heads == kLinearAttnRecurrentShufflePrototypeValueHeads &&
-        key_dim == kLinearAttnRecurrentShufflePrototypeKeyDim &&
-        value_dim == kLinearAttnRecurrentShufflePrototypeValueDim;
-}
-
-// This cache is deliberately separate from the production recurrent module so loading the
-// experimental shuffle source cannot change the served kernel's HIPRTC code object or dispatch.
-class HipLinearAttnRecurrentShufflePrototypeKernelCache {
-public:
-    void *function_for_device(int device_id, std::string *error) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = modules_.find(device_id);
-        if (found != modules_.end()) {
-            return found->second->function;
-        }
-        auto failed = failures_.find(device_id);
-        if (failed != failures_.end()) {
-            append_error(error, failed->second);
-            return nullptr;
-        }
-        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
-            append_error(
-                error,
-                "linear attention recurrent shuffle prototype requires exact gfx1201 architecture");
-            return nullptr;
-        }
-
-        std::vector<char> code;
-        std::string compile_error;
-        if (!hiprtc_runtime().compile_linear_attn_recurrent_shuffle_prototype_kernel(
-                "gfx1201",
-                &code,
-                &compile_error)) {
-            return fail(
-                device_id,
-                compile_error.empty() ?
-                    "failed to build linear attention recurrent shuffle prototype HIP kernel" :
-                    compile_error,
-                error);
-        }
-        void *module = nullptr;
-        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
-            return fail(
-                device_id,
-                "hipModuleLoadData failed for linear attention recurrent shuffle prototype",
-                error);
-        }
-        void *function = nullptr;
-        if (!hip_runtime().module_get_function(
-                &function,
-                module,
-                "ullm_linear_attn_recurrent_shuffle_prototype_f32_kernel",
-                device_id)) {
-            hip_runtime().module_unload(module, device_id);
-            return fail(
-                device_id,
-                "hipModuleGetFunction failed for linear attention recurrent shuffle prototype",
-                error);
-        }
-
-        auto loaded = std::make_unique<LoadedModule>();
-        loaded->module = module;
-        loaded->function = function;
-        void *result = loaded->function;
-        modules_.emplace(device_id, std::move(loaded));
-        return result;
-    }
-
-private:
-    struct LoadedModule {
-        void *module = nullptr;
-        void *function = nullptr;
-    };
-
-    void *fail(int device_id, const std::string &message, std::string *error) {
-        failures_.emplace(device_id, message);
-        append_error(error, message);
-        return nullptr;
-    }
-
-    static void append_error(std::string *error, const std::string &message) {
-        if (error == nullptr || message.empty()) {
-            return;
-        }
-        if (!error->empty()) {
-            error->append("\n");
-        }
-        error->append(message);
-    }
-
-    std::mutex mutex_;
-    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
-    std::unordered_map<int, std::string> failures_;
-};
-
-HipLinearAttnRecurrentShufflePrototypeKernelCache &
-hip_linear_attn_recurrent_shuffle_prototype_kernel_cache() {
-    static HipLinearAttnRecurrentShufflePrototypeKernelCache cache;
-    return cache;
-}
-
-bool linear_attn_recurrent_shuffle_prototype_f32_hip_kernel(
-    const ullm_runtime_buffer *q_buffer,
-    const ullm_runtime_buffer *k_buffer,
-    const ullm_runtime_buffer *v_buffer,
-    const ullm_runtime_buffer *gate_buffer,
-    const ullm_runtime_buffer *beta_buffer,
-    size_t key_heads,
-    size_t value_heads,
-    size_t sequence_len,
-    size_t key_dim,
-    size_t value_dim,
-    ullm_runtime_buffer *state_buffer,
-    ullm_runtime_buffer *output_buffer,
-    ullm_runtime_stream *stream,
-    std::string *error) {
-    const int device_id = q_buffer->hip_device_id;
-    if (!linear_attn_recurrent_shuffle_prototype_shape_is_supported(
-            hip_runtime().device_arch_name(device_id),
-            key_heads,
-            value_heads,
-            key_dim,
-            value_dim)) {
-        if (error != nullptr) {
-            *error =
-                "linear attention recurrent shuffle prototype requires gfx1201 and Qwen3.5 16/32 heads with key/value dim 128";
-        }
-        return false;
-    }
-    void *function = hip_linear_attn_recurrent_shuffle_prototype_kernel_cache().function_for_device(
-        device_id,
-        error);
-    if (function == nullptr) {
-        return false;
-    }
-
-    unsigned long long kernel_key_heads = static_cast<unsigned long long>(key_heads);
-    unsigned long long kernel_value_heads = static_cast<unsigned long long>(value_heads);
-    unsigned long long kernel_sequence_len = static_cast<unsigned long long>(sequence_len);
-    unsigned long long kernel_key_dim = static_cast<unsigned long long>(key_dim);
-    unsigned long long kernel_value_dim = static_cast<unsigned long long>(value_dim);
-    void *q_ptr = q_buffer->ptr;
-    void *k_ptr = k_buffer->ptr;
-    void *v_ptr = v_buffer->ptr;
-    void *gate_ptr = gate_buffer->ptr;
-    void *beta_ptr = beta_buffer->ptr;
-    void *state_ptr = state_buffer->ptr;
-    void *output_ptr = output_buffer->ptr;
-    void *kernel_params[] = {
-        &q_ptr,
-        &k_ptr,
-        &v_ptr,
-        &gate_ptr,
-        &beta_ptr,
-        &kernel_key_heads,
-        &kernel_value_heads,
-        &kernel_sequence_len,
-        &kernel_key_dim,
-        &kernel_value_dim,
-        &state_ptr,
-        &output_ptr,
-    };
-    constexpr unsigned int grid_size = static_cast<unsigned int>(
-        kLinearAttnRecurrentShufflePrototypeValueHeads *
-        kLinearAttnRecurrentShufflePrototypeValueDim);
-    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
-    if (!hip_runtime().module_launch_kernel(
-            function,
-            grid_size,
-            kLinearAttnRecurrentShufflePrototypeThreads,
-            kernel_params,
-            hip_stream,
-            device_id)) {
-        if (error != nullptr) {
-            *error = "hipModuleLaunchKernel failed for linear attention recurrent shuffle prototype";
         }
         return false;
     }

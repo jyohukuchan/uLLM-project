@@ -1204,14 +1204,14 @@ public:
             error);
     }
 
-    bool compile_linear_attn_recurrent_shuffle_prototype_kernel(
+    bool compile_linear_attn_recurrent_generic_kernel(
         const std::string &arch,
         std::vector<char> *code,
         std::string *error) {
         return compile_kernel(
             arch,
-            linear_attn_recurrent_shuffle_prototype_kernel_source(),
-            "ullm_linear_attn_recurrent_shuffle_prototype_f32.hip",
+            linear_attn_recurrent_generic_kernel_source(),
+            "ullm_linear_attn_recurrent_generic_f32.hip",
             code,
             error);
     }
