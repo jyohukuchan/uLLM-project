@@ -34,6 +34,7 @@ enum ProbeFaultStage {
     PagedDecodeSplit = 16,
     Aq4RegisterBm8Group8 = 17,
     Aq4GemmWmma = 18,
+    PagedCausalGqaChunkWmma = 19,
 }
 
 type ProbeCacheKey = (u8, Option<String>, i32, u32, u64);
@@ -56,8 +57,8 @@ fn probe_cache_key(capabilities: &DeviceCapabilities) -> ProbeCacheKey {
 }
 
 #[cfg(test)]
-static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 19] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 19];
+static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 20] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 20];
 
 #[cfg(test)]
 std::thread_local! {
@@ -355,6 +356,8 @@ pub enum RuntimeFeature {
     HipAq4RegisterBm8Group8 = 13,
     /// Direct gfx1201/group16 rocWMMA AQ4 GEMM ABI capability for M=128.
     HipAq4GemmWmma = 14,
+    /// Direct gfx1201 rocWMMA-QK ABI for Qwen3.5 paged causal GQA M=128 prefill chunks.
+    HipPagedCausalGqaChunkWmma = 15,
 }
 
 /// Canonical production guard for a probed runtime feature.
@@ -387,6 +390,9 @@ pub const fn runtime_feature_environment(feature: RuntimeFeature) -> &'static st
             "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL"
         }
         RuntimeFeature::HipAq4GemmWmma => "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL",
+        RuntimeFeature::HipPagedCausalGqaChunkWmma => {
+            "ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_WMMA_KERNEL"
+        }
     }
 }
 
@@ -426,6 +432,7 @@ impl DeviceCapabilities {
                 RuntimeFeature::HipPagedDecodeAttentionSplit,
                 RuntimeFeature::HipAq4RegisterBm8Group8,
                 RuntimeFeature::HipAq4GemmWmma,
+                RuntimeFeature::HipPagedCausalGqaChunkWmma,
             ] {
                 if std::env::var_os(runtime_feature_environment(feature)).as_deref()
                     == Some(std::ffi::OsStr::new("1"))
@@ -571,6 +578,7 @@ impl DeviceCapabilities {
             || policy.contains(RuntimeFeature::HipFusedQkNormRopePagedKvWrite)
             || policy.contains(RuntimeFeature::HipPagedKvWriteChunk)
             || policy.contains(RuntimeFeature::HipPagedCausalGqaChunk)
+            || policy.contains(RuntimeFeature::HipPagedCausalGqaChunkWmma)
             || policy.contains(RuntimeFeature::HipPagedDecodeAttentionSplit);
         if paged_cache_probe_needed {
             let mut k_cache = zeros(context, stream, 16 * 256 * 4 * 256)?;
@@ -794,6 +802,35 @@ impl DeviceCapabilities {
                 )?;
                 probe_fault_checkpoint(14, "paged-causal-gqa-chunk")?;
                 proven = proven.with(RuntimeFeature::HipPagedCausalGqaChunk);
+            }
+            if policy.contains(RuntimeFeature::HipPagedCausalGqaChunkWmma) {
+                // Probe the served Qwen3.5 gated cold-prefill ABI at its exclusive M=128
+                // dispatch width. This must compile, load, launch, and synchronize before the
+                // WMMA feature becomes eligible for registry resolution.
+                const CHUNK: usize = 128;
+                let q = zeros(context, stream, CHUNK * 16 * 256)?;
+                let gate = zeros(context, stream, CHUNK * 16 * 256)?;
+                let mut output = zeros(context, stream, CHUNK * 16 * 256)?;
+                ullm_runtime_sys::paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+                    &q,
+                    &gate,
+                    &k_cache,
+                    &v_cache,
+                    &table,
+                    0,
+                    CHUNK,
+                    256,
+                    16,
+                    16,
+                    4,
+                    256,
+                    256,
+                    1.0 / 256.0_f32.sqrt(),
+                    &mut output,
+                    Some(stream),
+                )?;
+                probe_fault_checkpoint(19, "paged-causal-gqa-wmma")?;
+                proven = proven.with(RuntimeFeature::HipPagedCausalGqaChunkWmma);
             }
         }
         if policy.contains(RuntimeFeature::HipQkNormRopeBatch) {
@@ -1275,6 +1312,7 @@ pub enum ExecutableOperation {
     HipPagedDecodeAttentionSplitSigmoidGateF32(PagedDecodeSourceTile),
     HipPagedCausalGqaChunkF32,
     HipPagedCausalGqaChunkSigmoidGateF32,
+    HipPagedCausalGqaChunkWmmaSigmoidGateF32,
 }
 
 /// Exact load-time request emitted from validated package geometry and served capabilities.
@@ -2850,6 +2888,72 @@ impl StartedOperationPlan<'_> {
         .map_err(|error| error.to_string())
     }
 
+    /// Executes the exclusive gfx1201/Qwen3.5 M=128 WMMA-QK cold-prefill ABI selected at load
+    /// time. AV intentionally remains in the kernel's reviewed scalar FP32 path.
+    ///
+    /// There is no execution-time fallback: a plan admitted to this ABI has already required a
+    /// separately probed WMMA feature, so an ABI failure must remain visible to the caller.
+    pub fn execute_paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+        self,
+        q: &ullm_runtime_sys::RuntimeBuffer,
+        gate: &ullm_runtime_sys::RuntimeBuffer,
+        k_cache: &ullm_runtime_sys::RuntimeBuffer,
+        v_cache: &ullm_runtime_sys::RuntimeBuffer,
+        block_table: &ullm_runtime_sys::RuntimeBuffer,
+        cached_prefix_len: usize,
+        output: &mut ullm_runtime_sys::RuntimeBuffer,
+        stream: &mut ullm_runtime_sys::RuntimeStream,
+    ) -> Result<(), String> {
+        let (q_heads, kv_heads, head_dim, value_dim, block_size, cache_blocks, chunk_width) = self
+            .paged_chunk_geometry(
+                true,
+                ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
+            )?;
+        let plan = self.plan();
+        if plan.device.backend != OperationBackend::Hip
+            || plan.device.architecture.as_deref() != Some("gfx1201")
+            || chunk_width != 128
+            || q_heads != 16
+            || kv_heads != 4
+            || head_dim != 256
+            || value_dim != 256
+            || block_size != 256
+        {
+            return Err(format!(
+                "resolved backend operation {} is not a gfx1201/Qwen3.5/M=128 paged causal GQA WMMA operation",
+                plan.implementation_id
+            ));
+        }
+        let cache_limit = block_size
+            .checked_mul(cache_blocks)
+            .ok_or_else(|| "resolved paged GQA WMMA cache capacity overflows".to_string())?;
+        if cached_prefix_len
+            .checked_add(chunk_width)
+            .is_none_or(|end| end > cache_limit)
+        {
+            return Err("resolved paged GQA WMMA has an incompatible cache prefix".into());
+        }
+        ullm_runtime_sys::paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+            q,
+            gate,
+            k_cache,
+            v_cache,
+            block_table,
+            cached_prefix_len,
+            chunk_width,
+            block_size,
+            cache_blocks,
+            q_heads,
+            kv_heads,
+            head_dim,
+            value_dim,
+            1.0_f32 / (head_dim as f32).sqrt(),
+            output,
+            Some(stream),
+        )
+        .map_err(|error| error.to_string())
+    }
+
     fn paged_geometry(
         &self,
         expected_gate: bool,
@@ -3119,6 +3223,13 @@ fn validate_descriptor(descriptor: &ImplementationDescriptor) -> Result<(), Stri
                 sigmoid_gate: true, ..
             },
             ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32,
+        ) => true,
+        (
+            OperationKind::PagedCausalGqaRead,
+            OperationGeometry::PagedCausalGqaRead {
+                sigmoid_gate: true, ..
+            },
+            ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
         ) => true,
         _ => false,
     };
@@ -4365,71 +4476,113 @@ pub fn paged_causal_gqa_chunk_production_registry(
                 .ok_or_else(|| "paged GQA chunk workspace overflows".to_string())?,
         )
         .ok_or_else(|| "paged GQA chunk workspace overflows".to_string())?;
-    let (backend, architecture, required_features, id) = paged_chunk_backend_binding(
-        device,
-        RuntimeFeature::HipPagedCausalGqaChunk,
-        if sigmoid_gate {
-            "host.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128"
-        } else {
-            "host.paged-causal-gqa-chunk-f32.m2-m128"
-        },
-        if sigmoid_gate {
-            "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128"
-        } else {
-            "hip.paged-causal-gqa-chunk-f32.m2-m128"
-        },
-    )?;
-    let executable = if sigmoid_gate {
+    // The production WMMA ABI is deliberately exclusive only at the fully validated Qwen3.5
+    // gated M=128 point. Scalar remains the descriptor for all tails, other geometries, and
+    // other architectures. Matching M=128 has no scalar fallback: its independently guarded
+    // WMMA probe must succeed before the registry may resolve it.
+    let wmma_eligible = device.backend == OperationBackend::Hip
+        && device.architecture.as_deref() == Some("gfx1201")
+        && sigmoid_gate
+        && q_heads == 16
+        && kv_heads == 4
+        && head_dim == 256
+        && value_dim == 256
+        && block_size == 256;
+    let scalar_executable = if sigmoid_gate {
         ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32
     } else {
         ExecutableOperation::HipPagedCausalGqaChunkF32
     };
-    let paged_kv = StateResourceSet::from_resource(StateResource::PagedKvCache);
-    BackendOperationRegistry::new(vec![ImplementationDescriptor {
-        id,
-        semantic_version: "1.0.0",
-        kind: OperationKind::PagedCausalGqaRead,
-        phases: PhaseSet::ALL_CURRENT,
-        input_layout: TensorLayout::TokensHidden,
-        output_layout: TensorLayout::TokensHidden,
-        weight_layout: None,
-        state_layout: OperationStateLayout::PagedKvBlocks,
-        activation_format: NumericalFormat::F32,
-        value_format: NumericalFormat::F32,
-        weight_format: None,
-        state_format: NumericalFormat::F32,
-        geometry,
-        minimum_batch_width: 1,
-        maximum_batch_width: 1,
-        minimum_chunk_width: 2,
-        maximum_chunk_width: 128,
-        backend,
-        architecture,
-        device_name: None,
-        minimum_abi_version: 1,
-        required_features,
-        workspace: WorkspaceFormula {
-            fixed_persistent_bytes: persistent_bytes,
-            fixed_temporary_bytes: 0,
-            temporary_bytes_per_batch_item: 0,
-            temporary_bytes_per_chunk_token,
-            maximum_total_bytes,
-        },
-        state_effect: StateEffect {
-            reads: paged_kv,
-            writes: StateResourceSet::EMPTY,
-            prepares: StateResourceSet::EMPTY,
-            commits: StateResourceSet::EMPTY,
-            update_mode: StateUpdateMode::ReadOnly,
-            externally_visible_before_commit: false,
-        },
-        promotion: PromotionStatus::Production,
-        priority: 100,
-        fallback_id: None,
-        deterministic: true,
-        executable,
-        runtime_build: env!("CARGO_PKG_VERSION"),
-    }])
+    let scalar_required_features = match device.backend {
+        OperationBackend::Host => RuntimeFeatureSet::EMPTY,
+        OperationBackend::Hip => {
+            RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunk)
+        }
+    };
+    let scalar_id = match (device.backend, sigmoid_gate, wmma_eligible) {
+        (OperationBackend::Host, true, _) => "host.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128",
+        (OperationBackend::Host, false, _) => "host.paged-causal-gqa-chunk-f32.m2-m128",
+        (OperationBackend::Hip, true, true) => {
+            "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m127"
+        }
+        (OperationBackend::Hip, true, false) => {
+            "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128"
+        }
+        (OperationBackend::Hip, false, _) => "hip.paged-causal-gqa-chunk-f32.m2-m128",
+    };
+    let scalar_maximum_chunk_width = if wmma_eligible { 127 } else { 128 };
+    let descriptor = |minimum_chunk_width,
+                      maximum_chunk_width,
+                      id,
+                      required_features,
+                      executable,
+                      architecture| {
+        ImplementationDescriptor {
+            id,
+            semantic_version: "1.0.0",
+            kind: OperationKind::PagedCausalGqaRead,
+            phases: PhaseSet::ALL_CURRENT,
+            input_layout: TensorLayout::TokensHidden,
+            output_layout: TensorLayout::TokensHidden,
+            weight_layout: None,
+            state_layout: OperationStateLayout::PagedKvBlocks,
+            activation_format: NumericalFormat::F32,
+            value_format: NumericalFormat::F32,
+            weight_format: None,
+            state_format: NumericalFormat::F32,
+            geometry,
+            minimum_batch_width: 1,
+            maximum_batch_width: 1,
+            minimum_chunk_width,
+            maximum_chunk_width,
+            backend: device.backend,
+            architecture,
+            device_name: None,
+            minimum_abi_version: 1,
+            required_features,
+            workspace: WorkspaceFormula {
+                fixed_persistent_bytes: persistent_bytes,
+                fixed_temporary_bytes: 0,
+                temporary_bytes_per_batch_item: 0,
+                temporary_bytes_per_chunk_token,
+                maximum_total_bytes,
+            },
+            state_effect: StateEffect {
+                reads: StateResourceSet::from_resource(StateResource::PagedKvCache),
+                writes: StateResourceSet::EMPTY,
+                prepares: StateResourceSet::EMPTY,
+                commits: StateResourceSet::EMPTY,
+                update_mode: StateUpdateMode::ReadOnly,
+                externally_visible_before_commit: false,
+            },
+            promotion: PromotionStatus::Production,
+            priority: 100,
+            fallback_id: None,
+            deterministic: true,
+            executable,
+            runtime_build: env!("CARGO_PKG_VERSION"),
+        }
+    };
+    let mut descriptors = Vec::with_capacity(if wmma_eligible { 2 } else { 1 });
+    descriptors.push(descriptor(
+        2,
+        scalar_maximum_chunk_width,
+        scalar_id,
+        scalar_required_features,
+        scalar_executable,
+        None,
+    ));
+    if wmma_eligible {
+        descriptors.push(descriptor(
+            128,
+            128,
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128",
+            RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunkWmma),
+            ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
+            Some("gfx1201"),
+        ));
+    }
+    BackendOperationRegistry::new(descriptors)
 }
 
 /// Builds the appropriate paged chunk registry while retaining the semantic operation kind.
@@ -5231,7 +5384,8 @@ mod tests {
                 .with(RuntimeFeature::HipAq4RegisterBm8)
                 .with(RuntimeFeature::HipPagedDecodeAttentionSplit)
                 .with(RuntimeFeature::HipAq4RegisterBm8Group8)
-                .with(RuntimeFeature::HipAq4GemmWmma),
+                .with(RuntimeFeature::HipAq4GemmWmma)
+                .with(RuntimeFeature::HipPagedCausalGqaChunkWmma),
             workspace_capacity_bytes: u64::MAX,
         }
     }
@@ -5416,6 +5570,18 @@ mod tests {
             block_size: 4,
             cache_blocks: 1,
             sigmoid_gate,
+        }
+    }
+
+    fn wmma_paged_gqa_geometry() -> OperationGeometry {
+        OperationGeometry::PagedCausalGqaRead {
+            q_heads: 16,
+            kv_heads: 4,
+            head_dim: 256,
+            value_dim: 256,
+            block_size: 256,
+            cache_blocks: 16,
+            sigmoid_gate: true,
         }
     }
 
@@ -5926,13 +6092,29 @@ mod tests {
 
         let mut wrong_architecture = test_hip_capabilities();
         wrong_architecture.architecture = Some("gfx1100".into());
-        assert!(
-            paged_causal_gqa_chunk_production_registry(
-                paged_gqa_geometry(false),
-                &wrong_architecture
+        let wrong_architecture_reader = paged_causal_gqa_chunk_production_registry(
+            paged_gqa_geometry(false),
+            &wrong_architecture,
+        )
+        .unwrap();
+        let trace = wrong_architecture_reader
+            .resolve(
+                &paged_causal_gqa_chunk_operation_request(
+                    ExecutionPhase::Decode,
+                    paged_gqa_geometry(false),
+                    2,
+                    wrong_architecture,
+                    u64::MAX,
+                )
+                .unwrap(),
             )
-            .is_err()
+            .unwrap()
+            .trace();
+        assert_eq!(
+            trace.executable,
+            ExecutableOperation::HipPagedCausalGqaChunkF32
         );
+        assert_eq!(trace.device.architecture.as_deref(), Some("gfx1100"));
         assert_eq!(
             reader
                 .implementations()
@@ -5985,6 +6167,153 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn qwen35_wmma_paged_chunk_registry_reserves_m128_and_keeps_scalar_fallbacks() {
+        let geometry = wmma_paged_gqa_geometry();
+        let device = test_hip_capabilities();
+        let registry = paged_causal_gqa_chunk_production_registry(geometry, &device).unwrap();
+        assert_eq!(registry.implementations().len(), 2);
+        let scalar = registry
+            .implementations()
+            .iter()
+            .find(|descriptor| {
+                descriptor.executable == ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32
+            })
+            .unwrap();
+        assert_eq!(scalar.minimum_chunk_width, 2);
+        assert_eq!(scalar.maximum_chunk_width, 127);
+        assert_eq!(
+            scalar.required_features,
+            RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunk)
+        );
+        let wmma = registry
+            .implementations()
+            .iter()
+            .find(|descriptor| {
+                descriptor.executable
+                    == ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32
+            })
+            .unwrap();
+        assert_eq!(wmma.minimum_chunk_width, 128);
+        assert_eq!(wmma.maximum_chunk_width, 128);
+        assert_eq!(
+            wmma.id,
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128"
+        );
+        assert_eq!(
+            wmma.required_features,
+            RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunkWmma)
+        );
+
+        for (width, executable) in [
+            (2, ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32),
+            (
+                127,
+                ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32,
+            ),
+            (
+                128,
+                ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
+            ),
+        ] {
+            let trace = registry
+                .resolve(
+                    &paged_causal_gqa_chunk_operation_request(
+                        ExecutionPhase::ColdPrefill,
+                        geometry,
+                        width,
+                        device.clone(),
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .trace();
+            assert_eq!(trace.executable, executable);
+        }
+
+        let mut missing_wmma = device.clone();
+        missing_wmma.runtime_features =
+            RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunk);
+        let missing_wmma_registry =
+            paged_causal_gqa_chunk_production_registry(geometry, &missing_wmma).unwrap();
+        assert!(
+            missing_wmma_registry
+                .resolve(
+                    &paged_causal_gqa_chunk_operation_request(
+                        ExecutionPhase::ColdPrefill,
+                        geometry,
+                        128,
+                        missing_wmma.clone(),
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                )
+                .is_err(),
+            "the exact M=128 WMMA dispatch must fail closed without its own proven feature"
+        );
+        assert!(
+            missing_wmma_registry
+                .resolve(
+                    &paged_causal_gqa_chunk_operation_request(
+                        ExecutionPhase::ColdPrefill,
+                        geometry,
+                        127,
+                        missing_wmma,
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                )
+                .is_ok()
+        );
+
+        let mut other_architecture = device.clone();
+        other_architecture.architecture = Some("gfx1100".into());
+        let other_architecture_registry =
+            paged_causal_gqa_chunk_production_registry(geometry, &other_architecture).unwrap();
+        let trace = other_architecture_registry
+            .resolve(
+                &paged_causal_gqa_chunk_operation_request(
+                    ExecutionPhase::ColdPrefill,
+                    geometry,
+                    128,
+                    other_architecture,
+                    u64::MAX,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .trace();
+        assert_eq!(
+            trace.executable,
+            ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32
+        );
+
+        let mut other_geometry = geometry;
+        if let OperationGeometry::PagedCausalGqaRead { block_size, .. } = &mut other_geometry {
+            *block_size = 128;
+        }
+        let other_geometry_registry =
+            paged_causal_gqa_chunk_production_registry(other_geometry, &device).unwrap();
+        let trace = other_geometry_registry
+            .resolve(
+                &paged_causal_gqa_chunk_operation_request(
+                    ExecutionPhase::ColdPrefill,
+                    other_geometry,
+                    128,
+                    device,
+                    u64::MAX,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .trace();
+        assert_eq!(
+            trace.executable,
+            ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32
+        );
     }
 
     #[test]
@@ -7097,6 +7426,11 @@ mod tests {
                 14,
                 "paged-causal-gqa-chunk",
             ),
+            (
+                ProbeFaultStage::PagedCausalGqaChunkWmma,
+                19,
+                "paged-causal-gqa-wmma",
+            ),
             (ProbeFaultStage::PagedDecodeSplit, 16, "paged-decode-split"),
             (ProbeFaultStage::Synchronize, 8, "synchronize"),
         ] {
@@ -7156,6 +7490,22 @@ mod tests {
     }
 
     #[test]
+    fn paged_causal_gqa_wmma_feature_environment_and_fault_checkpoint_are_exact() {
+        assert_eq!(
+            runtime_feature_environment(RuntimeFeature::HipPagedCausalGqaChunkWmma),
+            "ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_WMMA_KERNEL"
+        );
+        let before = M1_PROBE_CHECKPOINT_COUNTS[19].load(std::sync::atomic::Ordering::Acquire);
+        force_probe_failure(ProbeFaultStage::PagedCausalGqaChunkWmma);
+        assert!(probe_fault_checkpoint(19, "paged-causal-gqa-wmma").is_err());
+        assert_eq!(
+            M1_PROBE_CHECKPOINT_COUNTS[19].load(std::sync::atomic::Ordering::Acquire),
+            before + 1
+        );
+        probe_fault_checkpoint(19, "paged-causal-gqa-wmma").unwrap();
+    }
+
+    #[test]
     #[ignore = "requires an isolated gfx1201 HIP device and ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL=1"]
     fn isolated_hip_aq4_wmma_probe_enables_production_m128_dispatch_when_guarded() {
         assert_eq!(
@@ -7192,6 +7542,53 @@ mod tests {
         assert_eq!(
             plan.trace().executable,
             ExecutableOperation::HipAq4GemmWmmaF32
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_WMMA_KERNEL=1"]
+    fn isolated_hip_paged_causal_gqa_wmma_probe_enables_production_m128_dispatch_when_guarded() {
+        assert_eq!(
+            std::env::var(runtime_feature_environment(
+                RuntimeFeature::HipPagedCausalGqaChunkWmma
+            ))
+            .as_deref(),
+            Ok("1")
+        );
+        let hip_index = (1..ullm_runtime_sys::device_count().unwrap())
+            .find(|index| {
+                ullm_runtime_sys::device_info(*index)
+                    .is_ok_and(|info| info.backend == "hip" && info.gcn_arch_name == "gfx1201")
+            })
+            .expect("isolated gfx1201 HIP device");
+        let mut context = ullm_runtime_sys::RuntimeContext::create(hip_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let device =
+            DeviceCapabilities::probe_m1_runtime_context(&mut context, &mut stream).unwrap();
+        assert!(
+            device
+                .runtime_features
+                .contains(RuntimeFeature::HipPagedCausalGqaChunkWmma)
+        );
+
+        let geometry = wmma_paged_gqa_geometry();
+        let registry = paged_causal_gqa_chunk_production_registry(geometry, &device).unwrap();
+        let request = paged_causal_gqa_chunk_operation_request(
+            ExecutionPhase::ColdPrefill,
+            geometry,
+            128,
+            device,
+            u64::MAX,
+        )
+        .unwrap();
+        let plan = registry.resolve(&request).unwrap();
+        assert_eq!(
+            plan.trace().implementation_id,
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128"
+        );
+        assert_eq!(
+            plan.trace().executable,
+            ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32
         );
     }
 
@@ -7390,6 +7787,7 @@ mod tests {
             "ULLM_REQUIRE_HIP_LINEAR_ATTN_RECURRENT_SEQUENCE_KERNEL",
             "ULLM_REQUIRE_HIP_PAGED_KV_WRITE_CHUNK_KERNEL",
             "ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_CHUNK_KERNEL",
+            "ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_WMMA_KERNEL",
             "ULLM_REQUIRE_HIP_QWEN35_QK_NORM_ROPE_BATCH_KERNEL",
             "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_KERNEL",
             "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL",
@@ -7411,6 +7809,7 @@ mod tests {
             ProbeFaultStage::Aq4RegisterBm8,
             ProbeFaultStage::Aq4RegisterBm8Group8,
             ProbeFaultStage::Aq4GemmWmma,
+            ProbeFaultStage::PagedCausalGqaChunkWmma,
             ProbeFaultStage::QkvPrepareBatch,
             ProbeFaultStage::RecurrentSequence,
             ProbeFaultStage::Synchronize,

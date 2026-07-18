@@ -1126,7 +1126,7 @@
     }
 
     #[allow(clippy::type_complexity)]
-    fn qwen35_paged_causal_gqa_wmma_prototype_fixture(
+    fn qwen35_paged_causal_gqa_wmma_production_fixture(
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
         const CACHED_PREFIX_LEN: usize = 1_920;
         const M: usize = 128;
@@ -1177,12 +1177,43 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL=1"]
-    fn hip_paged_causal_gqa_wmma_prototype_qwen35_l2048_matches_scalar_when_enabled() {
+    fn paged_causal_gqa_wmma_production_abi_rejects_non_m128_before_buffer_validation() {
+        let mut context = RuntimeContext::create(0).unwrap();
+        let q = context.alloc_buffer(1).unwrap();
+        let gate = context.alloc_buffer(1).unwrap();
+        let k_cache = context.alloc_buffer(1).unwrap();
+        let v_cache = context.alloc_buffer(1).unwrap();
+        let block_table = context.alloc_buffer(1).unwrap();
+        let mut output = context.alloc_buffer(1).unwrap();
+        let error = paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+            &q,
+            &gate,
+            &k_cache,
+            &v_cache,
+            &block_table,
+            0,
+            127,
+            256,
+            1,
+            16,
+            4,
+            256,
+            256,
+            0.0625,
+            &mut output,
+            None,
+        )
+        .expect_err("the production WMMA ABI must reserve M=128");
+        assert!(error.contains("M=128"), "unexpected error: {error}");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_DIFFERENTIAL=1"]
+    fn hip_paged_causal_gqa_wmma_qwen35_l2048_matches_scalar_when_enabled() {
         assert_eq!(
-            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL").as_deref(),
+            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_DIFFERENTIAL").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_DIFFERENTIAL=1 before running this GPU differential test"
+            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_DIFFERENTIAL=1 before running this GPU differential test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -1202,7 +1233,7 @@
         const VALUE_DIM: usize = 256;
         const SOFTMAX_SCALE: f32 = 0.0625;
         let (q_values, gate_values, k_cache_values, v_cache_values, block_table_values) =
-            qwen35_paged_causal_gqa_wmma_prototype_fixture();
+            qwen35_paged_causal_gqa_wmma_production_fixture();
 
         let mut context = RuntimeContext::create(device_index).unwrap();
         let mut stream = context.create_stream().unwrap();
@@ -1220,7 +1251,7 @@
         let mut scalar_output = context
             .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
             .unwrap();
-        let mut prototype_output = context
+        let mut wmma_output = context
             .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
             .unwrap();
         q.copy_from_host(0, &f32s_to_le_bytes(&q_values), Some(&mut stream)).unwrap();
@@ -1257,7 +1288,7 @@
             Some(&mut stream),
         )
         .unwrap();
-        paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+        paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
             &q,
             &gate,
             &k_cache,
@@ -1272,45 +1303,45 @@
             HEAD_DIM,
             VALUE_DIM,
             SOFTMAX_SCALE,
-            &mut prototype_output,
+            &mut wmma_output,
             Some(&mut stream),
         )
         .unwrap();
         stream.synchronize().unwrap();
 
         let mut scalar_bytes = vec![0_u8; M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>()];
-        let mut prototype_bytes =
+        let mut wmma_bytes =
             vec![0_u8; M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>()];
         scalar_output
             .copy_to_host(0, &mut scalar_bytes, Some(&mut stream))
             .unwrap();
-        prototype_output
-            .copy_to_host(0, &mut prototype_bytes, Some(&mut stream))
+        wmma_output
+            .copy_to_host(0, &mut wmma_bytes, Some(&mut stream))
             .unwrap();
         stream.synchronize().unwrap();
         let scalar = le_bytes_to_f32s(&scalar_bytes);
-        let prototype = le_bytes_to_f32s(&prototype_bytes);
+        let wmma = le_bytes_to_f32s(&wmma_bytes);
         assert!(scalar.iter().all(|value| value.is_finite()));
-        assert!(prototype.iter().all(|value| value.is_finite()));
-        for (index, (actual, expected)) in prototype.iter().zip(&scalar).enumerate() {
+        assert!(wmma.iter().all(|value| value.is_finite()));
+        for (index, (actual, expected)) in wmma.iter().zip(&scalar).enumerate() {
             // Only Q and K are rounded to FP16; WMMA and AV accumulation, online max/sum, V,
             // normalization, and sigmoid gate remain FP32. 0.005 absolute + 1% relative is a
             // bounded FP16-score/long-softmax allowance, not a generic pure-F32 fidelity bar.
             let tolerance = 5e-3_f32 + 1e-2_f32 * expected.abs();
             assert!(
                 (actual - expected).abs() <= tolerance,
-                "index={index}: prototype={actual} scalar={expected} tolerance={tolerance}"
+                "index={index}: wmma={actual} scalar={expected} tolerance={tolerance}"
             );
         }
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING=1"]
-    fn hip_paged_causal_gqa_wmma_prototype_qwen35_l2048_timing_vs_scalar_when_enabled() {
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_TIMING=1"]
+    fn hip_paged_causal_gqa_wmma_qwen35_l2048_timing_vs_scalar_when_enabled() {
         assert_eq!(
-            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING").as_deref(),
+            std::env::var("ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_TIMING").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_PROTOTYPE_TIMING=1 before running this GPU timing test"
+            "set ULLM_RUN_PAGED_CAUSAL_GQA_WMMA_TIMING=1 before running this GPU timing test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -1332,7 +1363,7 @@
         const WARMUP_ITERATIONS: usize = 3;
         const TIMED_ITERATIONS: usize = 20;
         let (q_values, gate_values, k_cache_values, v_cache_values, block_table_values) =
-            qwen35_paged_causal_gqa_wmma_prototype_fixture();
+            qwen35_paged_causal_gqa_wmma_production_fixture();
 
         let mut context = RuntimeContext::create(device_index).unwrap();
         let mut stream = context.create_stream().unwrap();
@@ -1350,7 +1381,7 @@
         let mut scalar_output = context
             .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
             .unwrap();
-        let mut prototype_output = context
+        let mut wmma_output = context
             .alloc_buffer(M * Q_HEADS * VALUE_DIM * std::mem::size_of::<f32>())
             .unwrap();
         q.copy_from_host(0, &f32s_to_le_bytes(&q_values), Some(&mut stream)).unwrap();
@@ -1366,7 +1397,7 @@
             .unwrap();
         stream.synchronize().unwrap();
 
-        // Compile/load both independent HIPRTC modules before timing, matching the AQ4 prototype
+        // Compile/load both independent HIPRTC modules before timing, matching the AQ4 WMMA
         // timing discipline. Each timed iteration walks all sixteen M=128 chunks of a 2048-token
         // cold prefill; Q/Gate values are reused only to avoid host copies, not to change shape.
         for _ in 0..WARMUP_ITERATIONS {
@@ -1395,7 +1426,7 @@
         stream.synchronize().unwrap();
         for _ in 0..WARMUP_ITERATIONS {
             for chunk in 0..PREFILL_CHUNKS {
-                paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+                paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
                     &q,
                     &gate,
                     &k_cache,
@@ -1410,7 +1441,7 @@
                     HEAD_DIM,
                     VALUE_DIM,
                     SOFTMAX_SCALE,
-                    &mut prototype_output,
+                    &mut wmma_output,
                     Some(&mut stream),
                 )
                 .unwrap();
@@ -1445,10 +1476,10 @@
         stream.synchronize().unwrap();
         let scalar_elapsed = scalar_started.elapsed();
 
-        let prototype_started = std::time::Instant::now();
+        let wmma_started = std::time::Instant::now();
         for _ in 0..TIMED_ITERATIONS {
             for chunk in 0..PREFILL_CHUNKS {
-                paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
+                paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
                     &q,
                     &gate,
                     &k_cache,
@@ -1463,17 +1494,17 @@
                     HEAD_DIM,
                     VALUE_DIM,
                     SOFTMAX_SCALE,
-                    &mut prototype_output,
+                    &mut wmma_output,
                     Some(&mut stream),
                 )
                 .unwrap();
             }
         }
         stream.synchronize().unwrap();
-        let prototype_elapsed = prototype_started.elapsed();
+        let wmma_elapsed = wmma_started.elapsed();
 
         let scalar_ms = scalar_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
-        let prototype_ms = prototype_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+        let wmma_ms = wmma_elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
         let total_prefill_tokens = PREFILL_CHUNKS * M;
         let attended_tokens = total_prefill_tokens * (total_prefill_tokens + 1) / 2;
         // Counts FMA as two FLOPs for both QK and AV; softmax/gating overhead is intentionally
@@ -1485,11 +1516,11 @@
             * attended_tokens as f64
             * (HEAD_DIM + VALUE_DIM) as f64;
         let scalar_tflops = flops_per_prefill / (scalar_ms / 1_000.0) / 1.0e12;
-        let prototype_tflops = flops_per_prefill / (prototype_ms / 1_000.0) / 1.0e12;
+        let wmma_tflops = flops_per_prefill / (wmma_ms / 1_000.0) / 1.0e12;
         assert!(scalar_ms.is_finite() && scalar_ms > 0.0);
-        assert!(prototype_ms.is_finite() && prototype_ms > 0.0);
+        assert!(wmma_ms.is_finite() && wmma_ms > 0.0);
         eprintln!(
-            "paged causal GQA WMMA prototype timing Q=16 KV=4 dim=256 L=2048 (one self-attention layer, 16xM=128): scalar={scalar_ms:.3} ms ({scalar_tflops:.3} TFLOPS), wmma-qk={prototype_ms:.3} ms ({prototype_tflops:.3} TFLOPS), speedup={:.3}x",
-            scalar_ms / prototype_ms
+            "paged causal GQA WMMA production timing Q=16 KV=4 dim=256 L=2048 (one self-attention layer, 16xM=128): scalar={scalar_ms:.3} ms ({scalar_tflops:.3} TFLOPS), wmma-qk={wmma_ms:.3} ms ({wmma_tflops:.3} TFLOPS), speedup={:.3}x",
+            scalar_ms / wmma_ms
         );
     }

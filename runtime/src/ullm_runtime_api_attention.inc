@@ -2957,10 +2957,10 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_sigmoid_gate_f32(
         stream);
 }
 
-// This is intentionally separate from paged_causal_gqa_chunk_f32_impl: the scalar production
-// reader keeps its current CPU fallback and HIP module unchanged while the direct-only prototype
-// validates the exact Qwen3.5-9B/gfx1201 shape before loading its own rocWMMA module.
-static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
+// This remains intentionally separate from paged_causal_gqa_chunk_f32_impl: the scalar reader
+// keeps its CPU fallback and HIP module unchanged while the production WMMA reader loads its own
+// gfx1201 rocWMMA module for the validated Qwen3.5-9B M=128 cold-prefill shape.
+static ullm_status paged_causal_gqa_chunk_wmma_f32_impl(
     const ullm_runtime_buffer *q_buffer,
     const ullm_runtime_buffer *gate_buffer,
     const ullm_runtime_buffer *k_cache_buffer,
@@ -2981,19 +2981,19 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
         block_table_buffer == nullptr || output_buffer == nullptr || q_buffer == output_buffer ||
         (gate_buffer != nullptr &&
          (gate_buffer == output_buffer || gate_buffer == q_buffer))) {
-        set_error("paged causal GQA WMMA prototype received a null or aliased pointer");
+        set_error("paged causal GQA WMMA received a null or aliased pointer");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
-    if (m == 0u || m > 128u || cache_blocks == 0u) {
-        set_error("paged causal GQA WMMA prototype width must be in 1..128 and cache blocks nonzero");
+    if (m != 128u || cache_blocks == 0u) {
+        set_error("paged causal GQA WMMA requires M=128 and nonzero cache blocks");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if (gate_buffer != nullptr && head_dim != value_dim) {
-        set_error("paged causal GQA WMMA prototype gated ABI requires head_dim == value_dim");
+        set_error("paged causal GQA WMMA gated ABI requires head_dim == value_dim");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if (!std::isfinite(softmax_scale) || softmax_scale <= 0.0f) {
-        set_error("paged causal GQA WMMA prototype softmax scale must be finite and greater than zero");
+        set_error("paged causal GQA WMMA softmax scale must be finite and greater than zero");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if ((gate_buffer != nullptr && !buffers_share_backend(q_buffer, gate_buffer)) ||
@@ -3001,18 +3001,18 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
         !buffers_share_backend(q_buffer, v_cache_buffer) ||
         !buffers_share_backend(q_buffer, block_table_buffer) ||
         !buffers_share_backend(q_buffer, output_buffer)) {
-        set_error("paged causal GQA WMMA prototype buffers belong to different backends or devices");
+        set_error("paged causal GQA WMMA buffers belong to different backends or devices");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if (!stream_matches_buffer(output_buffer, stream)) {
-        set_error("paged causal GQA WMMA prototype stream belongs to a different backend or device");
+        set_error("paged causal GQA WMMA stream belongs to a different backend or device");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if (q_buffer->backend != BackendKind::Hip) {
-        set_error("paged causal GQA WMMA prototype requires a HIP gfx1201 backend");
+        set_error("paged causal GQA WMMA requires a HIP gfx1201 backend");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
-    if (!paged_causal_gqa_chunk_wmma_prototype_shape_is_supported(
+    if (!paged_causal_gqa_chunk_wmma_shape_is_supported(
             hip_runtime().device_arch_name(q_buffer->hip_device_id),
             block_size,
             q_heads,
@@ -3020,38 +3020,38 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
             head_dim,
             value_dim)) {
         set_error(
-            "paged causal GQA WMMA prototype requires exact gfx1201, block=256, Q=16, KV=4, and head/value dim=256");
+            "paged causal GQA WMMA requires exact gfx1201, block=256, Q=16, KV=4, and head/value dim=256");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
 
     const size_t max_size = std::numeric_limits<size_t>::max();
     if (cached_prefix_len > max_size - m || cache_blocks > max_size / block_size) {
-        set_error("paged causal GQA WMMA prototype context or physical cache size overflows");
+        set_error("paged causal GQA WMMA context or physical cache size overflows");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t total_context = cached_prefix_len + m;
     const size_t physical_tokens = cache_blocks * block_size;
     if (total_context > physical_tokens) {
-        set_error("paged causal GQA WMMA prototype context exceeds physical cache capacity");
+        set_error("paged causal GQA WMMA context exceeds physical cache capacity");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t table_entries = (total_context - 1u) / block_size + 1u;
     if (m > max_size / q_heads || q_heads > max_size / head_dim ||
         q_heads > max_size / value_dim || kv_heads > max_size / physical_tokens) {
-        set_error("paged causal GQA WMMA prototype element count overflows");
+        set_error("paged causal GQA WMMA element count overflows");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t q_heads_per_chunk = m * q_heads;
     if (q_heads_per_chunk > max_size / head_dim ||
         q_heads_per_chunk > max_size / value_dim) {
-        set_error("paged causal GQA WMMA prototype element count overflows");
+        set_error("paged causal GQA WMMA element count overflows");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t q_elements = q_heads_per_chunk * head_dim;
     const size_t output_elements = q_heads_per_chunk * value_dim;
     const size_t cache_heads = physical_tokens * kv_heads;
     if (head_dim > max_size / cache_heads || value_dim > max_size / cache_heads) {
-        set_error("paged causal GQA WMMA prototype cache element count overflows");
+        set_error("paged causal GQA WMMA cache element count overflows");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t k_elements = cache_heads * head_dim;
@@ -3059,7 +3059,7 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
     if (q_elements > max_size / sizeof(float) || output_elements > max_size / sizeof(float) ||
         k_elements > max_size / sizeof(float) || v_elements > max_size / sizeof(float) ||
         table_entries > max_size / sizeof(std::uint32_t)) {
-        set_error("paged causal GQA WMMA prototype byte size overflows");
+        set_error("paged causal GQA WMMA byte size overflows");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     const size_t q_bytes = q_elements * sizeof(float);
@@ -3071,7 +3071,7 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
         v_cache_buffer->bytes < v_bytes || block_table_buffer->bytes < table_bytes ||
         output_buffer->bytes < output_bytes ||
         (gate_buffer != nullptr && gate_buffer->bytes < output_bytes)) {
-        set_error("paged causal GQA WMMA prototype buffer is too small");
+        set_error("paged causal GQA WMMA buffer is too small");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
 
@@ -3080,12 +3080,12 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
         table_entries,
         cache_blocks,
         stream,
-        "paged causal GQA WMMA prototype");
+        "paged causal GQA WMMA");
     if (table_status != ULLM_STATUS_OK) {
         return table_status;
     }
     std::string hip_error;
-    if (paged_causal_gqa_chunk_wmma_prototype_f32_hip_kernel(
+    if (paged_causal_gqa_chunk_wmma_f32_hip_kernel(
             q_buffer,
             gate_buffer,
             k_cache_buffer,
@@ -3108,9 +3108,84 @@ static ullm_status paged_causal_gqa_chunk_wmma_prototype_f32_impl(
         return ULLM_STATUS_OK;
     }
     set_error(
-        hip_error.empty() ? "paged causal GQA WMMA prototype HIP kernel is unavailable" :
+        hip_error.empty() ? "paged causal GQA WMMA HIP kernel is unavailable" :
                             hip_error.c_str());
     return ULLM_STATUS_RUNTIME_ERROR;
+}
+
+ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_f32(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *k_cache_buffer,
+    const ullm_runtime_buffer *v_cache_buffer,
+    const ullm_runtime_buffer *block_table_buffer,
+    size_t cached_prefix_len,
+    size_t m,
+    size_t block_size,
+    size_t cache_blocks,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim,
+    float softmax_scale,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    return paged_causal_gqa_chunk_wmma_f32_impl(
+        q_buffer,
+        nullptr,
+        k_cache_buffer,
+        v_cache_buffer,
+        block_table_buffer,
+        cached_prefix_len,
+        m,
+        block_size,
+        cache_blocks,
+        q_heads,
+        kv_heads,
+        head_dim,
+        value_dim,
+        softmax_scale,
+        output_buffer,
+        stream);
+}
+
+ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+    const ullm_runtime_buffer *q_buffer,
+    const ullm_runtime_buffer *gate_buffer,
+    const ullm_runtime_buffer *k_cache_buffer,
+    const ullm_runtime_buffer *v_cache_buffer,
+    const ullm_runtime_buffer *block_table_buffer,
+    size_t cached_prefix_len,
+    size_t m,
+    size_t block_size,
+    size_t cache_blocks,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t head_dim,
+    size_t value_dim,
+    float softmax_scale,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    if (gate_buffer == nullptr) {
+        set_error("paged causal GQA WMMA sigmoid gate received a null gate buffer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    return paged_causal_gqa_chunk_wmma_f32_impl(
+        q_buffer,
+        gate_buffer,
+        k_cache_buffer,
+        v_cache_buffer,
+        block_table_buffer,
+        cached_prefix_len,
+        m,
+        block_size,
+        cache_blocks,
+        q_heads,
+        kv_heads,
+        head_dim,
+        value_dim,
+        softmax_scale,
+        output_buffer,
+        stream);
 }
 
 ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(
@@ -3129,9 +3204,8 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(
     float softmax_scale,
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream) {
-    return paged_causal_gqa_chunk_wmma_prototype_f32_impl(
+    return ullm_runtime_paged_causal_gqa_chunk_wmma_f32(
         q_buffer,
-        nullptr,
         k_cache_buffer,
         v_cache_buffer,
         block_table_buffer,
@@ -3165,11 +3239,7 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
     float softmax_scale,
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream) {
-    if (gate_buffer == nullptr) {
-        set_error("paged causal GQA WMMA prototype sigmoid gate received a null gate buffer");
-        return ULLM_STATUS_INVALID_ARGUMENT;
-    }
-    return paged_causal_gqa_chunk_wmma_prototype_f32_impl(
+    return ullm_runtime_paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
         q_buffer,
         gate_buffer,
         k_cache_buffer,

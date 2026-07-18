@@ -1121,14 +1121,14 @@ public:
             error);
     }
 
-    bool compile_paged_causal_gqa_chunk_wmma_prototype_kernel(
+    bool compile_paged_causal_gqa_chunk_wmma_kernel(
         const std::string &arch,
         std::vector<char> *code,
         std::string *error) {
         return compile_kernel(
             arch,
-            paged_causal_gqa_chunk_wmma_prototype_kernel_source(),
-            "ullm_paged_causal_gqa_chunk_wmma_prototype_f32.hip",
+            paged_causal_gqa_chunk_wmma_kernel_source(),
+            "ullm_paged_causal_gqa_chunk_wmma_f32.hip",
             code,
             error,
             rocwmma_include_options());

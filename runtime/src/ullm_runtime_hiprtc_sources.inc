@@ -6162,14 +6162,14 @@ extern "C" __global__ void ullm_paged_causal_gqa_chunk_f32_kernel(
 )";
     }
 
-    // Validate-first gfx1201 cold-prefill experiment. This intentionally lives in a separate
-    // rocWMMA HIPRTC module from paged_chunk_kernel_source(), so adding rocWMMA headers/options
-    // cannot perturb the production scalar paged reader's compilation or dispatch.
-    static const char *paged_causal_gqa_chunk_wmma_prototype_kernel_source() {
+    // Production gfx1201 Qwen3.5 cold-prefill WMMA-QK path. It intentionally lives in a
+    // separate rocWMMA HIPRTC module from paged_chunk_kernel_source(), so adding rocWMMA
+    // headers/options cannot perturb the scalar paged reader's compilation or dispatch.
+    static const char *paged_causal_gqa_chunk_wmma_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>
 
-extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel(
+extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_f32_kernel(
     const float *q,
     const float *gate,
     const float *k_cache,
@@ -6202,9 +6202,9 @@ extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel
         (kQueryTile * kValueDim) / kThreads;
     static_assert(kQueryTile == kSourceTile && kQueryTile == kWmmaK,
                   "rocWMMA QK tile must be 16x16x16");
-    static_assert(kThreads % 32u == 0u, "prototype requires whole wave32 groups");
+    static_assert(kThreads % 32u == 0u, "production kernel requires whole wave32 groups");
     static_assert(kValuesPerThread == 16u,
-                  "prototype assigns one 16-value vector to each thread");
+                  "production kernel assigns one 16-value vector to each thread");
 
     using FragA = fragment<matrix_a, kQueryTile, kSourceTile, kWmmaK, float16_t, row_major>;
     using FragB = fragment<matrix_b, kQueryTile, kSourceTile, kWmmaK, float16_t, col_major>;
@@ -6221,9 +6221,9 @@ extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel
     constexpr unsigned int kStaticLdsBytes =
         kQTileLdsBytes + kKTileLdsBytes + kVTileLdsBytes + kScoresLdsBytes +
         kRowStateLdsBytes;
-    static_assert(kStaticLdsBytes == 33984u, "prototype LDS accounting drifted");
+    static_assert(kStaticLdsBytes == 33984u, "production LDS accounting drifted");
     static_assert(kStaticLdsBytes <= 64u * 1024u,
-                  "prototype must fit the gfx1201 64 KiB LDS budget");
+                  "production kernel must fit the gfx1201 64 KiB LDS budget");
 
     const unsigned int tid = threadIdx.x;
     const unsigned long long q_head = static_cast<unsigned long long>(blockIdx.y);
@@ -6276,7 +6276,7 @@ extern "C" __global__ void ullm_paged_causal_gqa_chunk_wmma_prototype_f32_kernel
     }
     __syncthreads();
 
-    // Each source tile begins at a multiple of 16. With the prototype's fixed 256-token page,
+    // Each source tile begins at a multiple of 16. With the production path's fixed 256-token page,
     // no tile crosses a page boundary, so one block-table lookup indexes all staged K/V values.
     for (unsigned long long source_tile_start = 0ull;
          source_tile_start < max_cache_len;

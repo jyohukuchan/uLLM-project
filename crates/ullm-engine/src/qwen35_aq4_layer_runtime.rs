@@ -3332,19 +3332,38 @@ impl PackageSelfAttnResidentStepLayer {
         };
         self.last_operation_executions[1] =
             Some(reader_plan.execution_record(OperationExecutionStatus::Started));
-        let reader_result = reader_plan
-            .attempt()
-            .start()
-            .execute_paged_causal_gqa_chunk_sigmoid_gate_f32(
-                &workspace.q_rope,
-                &workspace.q_gate,
-                &self.k_cache_buffer,
-                &self.v_cache_buffer,
-                &self.block_table_buffer,
-                cache_start,
-                &mut workspace.attention_output,
-                stream,
-            );
+        let reader_executable = reader_plan.trace().executable;
+        let reader_result = match reader_executable {
+            ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32 => reader_plan
+                .attempt()
+                .start()
+                .execute_paged_causal_gqa_chunk_sigmoid_gate_f32(
+                    &workspace.q_rope,
+                    &workspace.q_gate,
+                    &self.k_cache_buffer,
+                    &self.v_cache_buffer,
+                    &self.block_table_buffer,
+                    cache_start,
+                    &mut workspace.attention_output,
+                    stream,
+                ),
+            ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32 => reader_plan
+                .attempt()
+                .start()
+                .execute_paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
+                    &workspace.q_rope,
+                    &workspace.q_gate,
+                    &self.k_cache_buffer,
+                    &self.v_cache_buffer,
+                    &self.block_table_buffer,
+                    cache_start,
+                    &mut workspace.attention_output,
+                    stream,
+                ),
+            other => Err(format!(
+                "{label} self-attn chunk reader selected incompatible executable {other:?}"
+            )),
+        };
         self.last_operation_executions[1] =
             Some(reader_plan.execution_record(if reader_result.is_ok() {
                 OperationExecutionStatus::Succeeded
