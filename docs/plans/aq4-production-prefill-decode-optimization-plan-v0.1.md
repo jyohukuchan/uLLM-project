@@ -1,6 +1,6 @@
 # AQ4 production prefill/decode optimization plan v0.1
 
-Status: P0 complete; P1 schema/mechanics gate complete; P1-D and real production performance are handed off to P2; active product remains unchanged until P6 unless the explicit P4 prefill-only exception is approved
+Status: P0 complete; P1 schema/mechanics gate complete; P2 normal-window (13/14) and detailed-profile (6/6) capture complete on commit b4d42d9f (decode-c16 has 3/6 structurally unsupported M>context cases, accepted as a known measurement-matrix limitation, see `journal/2026/07/18/aq4-p2-production-baseline-window-execution-v0.1.md`); P2 path-oracle windows (8) not started; baseline JSONL sealing deferred (blocked on decode-c16 status, would require full re-capture to fix); active product remains unchanged until P6 unless the explicit P4 prefill-only exception is approved
 
 ## 前回の要点
 
