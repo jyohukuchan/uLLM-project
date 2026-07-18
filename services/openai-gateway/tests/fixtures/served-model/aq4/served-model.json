@@ -43,7 +43,8 @@
     "arguments": ["--served-model-manifest", "{manifest}"],
     "required_environment": [
       "ULLM_REQUIRE_HIP_AQ4_MATVEC_KERNEL",
-      "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_KERNEL"
+      "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_KERNEL",
+      "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL"
     ],
     "identity": {
       "device": "gfx1201",

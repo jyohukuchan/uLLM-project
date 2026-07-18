@@ -31,6 +31,7 @@ pub const QWEN35_AQ4_REQUIRED_HIP_KERNEL_ENV: &[&str] = &[
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_BATCH_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_KERNEL",
+    "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_PAIR_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_TRIPLE_KERNEL",
@@ -428,6 +429,7 @@ mod tests {
             RuntimeFeature::HipPagedKvWriteChunk,
             RuntimeFeature::HipPagedCausalGqaChunk,
             RuntimeFeature::HipQkNormRopeBatch,
+            RuntimeFeature::HipAq4RegisterBm8Group8,
         ] {
             assert!(unique.contains(runtime_feature_environment(feature)));
         }

@@ -952,7 +952,7 @@ static_assert(
         ULLM_AQ4_REGISTER_THREADS,
     "AQ4 register kernel requires eight lanes per output row");
 
-template <unsigned int BM>
+template <unsigned int BM, unsigned int GROUP_SIZE>
 __device__ __forceinline__ void ullm_aq4_gemm_register_f32_impl(
     const unsigned char *indices,
     const unsigned char *scale_indices,
@@ -969,6 +969,9 @@ __device__ __forceinline__ void ullm_aq4_gemm_register_f32_impl(
     unsigned long long batch_count,
     float *output) {
     static_assert(BM == 4u || BM == 8u, "AQ4 register kernel supports BM4 or BM8");
+    static_assert(
+        GROUP_SIZE == 8u || GROUP_SIZE == 16u,
+        "AQ4 register kernel supports group8 or group16");
     constexpr unsigned int rows_per_block = ULLM_AQ4_REGISTER_ROWS_PER_BLOCK;
     constexpr unsigned int lanes_per_row = ULLM_AQ4_REGISTER_LANES_PER_ROW;
     const unsigned int tid = threadIdx.x;
@@ -980,8 +983,10 @@ __device__ __forceinline__ void ullm_aq4_gemm_register_f32_impl(
     const unsigned long long batch_base = static_cast<unsigned long long>(blockIdx.y) * BM;
     float acc[BM] = {};
 
-    if (row < rows && group_size == 16ull && (cols % 16ull) == 0ull) {
-        const unsigned long long groups_per_row = cols / 16ull;
+    if (row < rows && group_size == static_cast<unsigned long long>(GROUP_SIZE) &&
+        (cols % static_cast<unsigned long long>(GROUP_SIZE)) == 0ull) {
+        const unsigned long long groups_per_row =
+            cols / static_cast<unsigned long long>(GROUP_SIZE);
         const unsigned long long row_offset = row * cols;
         for (unsigned long long group_in_row = lane; group_in_row < groups_per_row;
              group_in_row += lanes_per_row) {
@@ -991,9 +996,11 @@ __device__ __forceinline__ void ullm_aq4_gemm_register_f32_impl(
                 continue;
             }
             const float group_scale = scale_values[scale_index] * tensor_scale;
-            const unsigned long long col_start = group_in_row * 16ull;
+            const unsigned long long col_start =
+                group_in_row * static_cast<unsigned long long>(GROUP_SIZE);
 #pragma unroll
-            for (unsigned int packed_offset = 0; packed_offset < 8u; ++packed_offset) {
+            for (unsigned int packed_offset = 0; packed_offset < GROUP_SIZE / 2u;
+                 ++packed_offset) {
                 const unsigned long long col = col_start + packed_offset * 2u;
                 const unsigned char packed = indices[(row_offset + col) >> 1];
                 const float weight0 = codebook[packed & 0x0f] * group_scale;
@@ -1045,7 +1052,7 @@ extern "C" __global__ void ullm_aq4_gemm_register_bm4_f32_kernel(
     unsigned long long cols,
     unsigned long long batch_count,
     float *output) {
-    ullm_aq4_gemm_register_f32_impl<4u>(
+    ullm_aq4_gemm_register_f32_impl<4u, 16u>(
         indices,
         scale_indices,
         codebook,
@@ -1077,7 +1084,39 @@ extern "C" __global__ void ullm_aq4_gemm_register_bm8_f32_kernel(
     unsigned long long cols,
     unsigned long long batch_count,
     float *output) {
-    ullm_aq4_gemm_register_f32_impl<8u>(
+    ullm_aq4_gemm_register_f32_impl<8u, 16u>(
+        indices,
+        scale_indices,
+        codebook,
+        scale_values,
+        input,
+        row_scales,
+        scale_count,
+        group_size,
+        tensor_scale,
+        row_scale_count,
+        rows,
+        cols,
+        batch_count,
+        output);
+}
+
+extern "C" __global__ void ullm_aq4_gemm_register_bm8_group8_f32_kernel(
+    const unsigned char *indices,
+    const unsigned char *scale_indices,
+    const float *codebook,
+    const float *scale_values,
+    const float *input,
+    const float *row_scales,
+    unsigned long long scale_count,
+    unsigned long long group_size,
+    float tensor_scale,
+    unsigned long long row_scale_count,
+    unsigned long long rows,
+    unsigned long long cols,
+    unsigned long long batch_count,
+    float *output) {
+    ullm_aq4_gemm_register_f32_impl<8u, 8u>(
         indices,
         scale_indices,
         codebook,

@@ -43,6 +43,8 @@ static_assert(kAq4TiledBm * kAq4TiledBn == kAq4TiledThreads, "AQ4 tiled block mu
 static_assert(kAq4TiledBk % 16u == 0u, "AQ4 tiled K tile must preserve group16 geometry");
 constexpr unsigned int kAq4RegisterBm4 = 4u;
 constexpr unsigned int kAq4RegisterBm8 = 8u;
+constexpr unsigned int kAq4RegisterGroup8 = 8u;
+constexpr unsigned int kAq4RegisterGroup16 = 16u;
 constexpr unsigned int kAq4RegisterRowsPerBlock = 32u;
 constexpr unsigned int kAq4RegisterLanesPerRow = 8u;
 constexpr unsigned int kAq4RegisterThreads = 256u;
@@ -3255,16 +3257,25 @@ HipAq4MatvecTiledKernelCache &hip_aq4_matvec_tiled_kernel_cache() {
 
 class HipAq4MatvecRegisterKernelCache {
 public:
-    void *function_for_device(int device_id, unsigned int batch_tile, std::string *error) {
+    void *function_for_device(
+        int device_id,
+        unsigned int batch_tile,
+        size_t group_size,
+        std::string *error) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (batch_tile != kAq4RegisterBm4 && batch_tile != kAq4RegisterBm8) {
-            append_error(error, "AQ4 register GEMM batch tile must be 4 or 8");
+        const bool supported_variant =
+            (batch_tile == kAq4RegisterBm4 && group_size == kAq4RegisterGroup16) ||
+            (batch_tile == kAq4RegisterBm8 &&
+             (group_size == kAq4RegisterGroup8 || group_size == kAq4RegisterGroup16));
+        if (!supported_variant) {
+            append_error(error, "AQ4 register GEMM supports BM4/group16 or BM8/group8/group16");
             return nullptr;
         }
         auto found = modules_.find(device_id);
         if (found != modules_.end()) {
             return batch_tile == kAq4RegisterBm4 ? found->second->function_bm4 :
-                                                   found->second->function_bm8;
+                   group_size == kAq4RegisterGroup8 ? found->second->function_bm8_group8 :
+                                                     found->second->function_bm8;
         }
         auto failed = failures_.find(device_id);
         if (failed != failures_.end()) {
@@ -3297,6 +3308,7 @@ public:
         }
         void *function_bm4 = nullptr;
         void *function_bm8 = nullptr;
+        void *function_bm8_group8 = nullptr;
         if (!hip_runtime().module_get_function(
                 &function_bm4,
                 module,
@@ -3306,6 +3318,11 @@ public:
                 &function_bm8,
                 module,
                 "ullm_aq4_gemm_register_bm8_f32_kernel",
+                device_id) ||
+            !hip_runtime().module_get_function(
+                &function_bm8_group8,
+                module,
+                "ullm_aq4_gemm_register_bm8_group8_f32_kernel",
                 device_id)) {
             hip_runtime().module_unload(module, device_id);
             return fail(
@@ -3318,7 +3335,9 @@ public:
         loaded->module = module;
         loaded->function_bm4 = function_bm4;
         loaded->function_bm8 = function_bm8;
-        void *result = batch_tile == kAq4RegisterBm4 ? function_bm4 : function_bm8;
+        loaded->function_bm8_group8 = function_bm8_group8;
+        void *result = batch_tile == kAq4RegisterBm4 ? function_bm4 :
+                       group_size == kAq4RegisterGroup8 ? function_bm8_group8 : function_bm8;
         modules_.emplace(device_id, std::move(loaded));
         return result;
     }
@@ -3328,6 +3347,7 @@ private:
         void *module = nullptr;
         void *function_bm4 = nullptr;
         void *function_bm8 = nullptr;
+        void *function_bm8_group8 = nullptr;
     };
 
     void *fail(int device_id, const std::string &message, std::string *error) {
@@ -3772,6 +3792,7 @@ enum class Aq4MatvecBatchDispatchKind : uint32_t {
     TiledLds = 1u,
     RegisterBm4 = 2u,
     RegisterBm8 = 3u,
+    RegisterBm8Group8 = 4u,
 };
 
 bool aq4_tiled_experimental_enabled() {
@@ -3831,8 +3852,11 @@ bool aq4_matvec_batch_register_shape_is_supported(
     size_t cols,
     size_t batch_count,
     unsigned int batch_tile) {
-    if ((batch_tile != kAq4RegisterBm4 && batch_tile != kAq4RegisterBm8) ||
-        arch != "gfx1201" || group_size != 16u || batch_count < batch_tile || rows == 0u ||
+    const bool supported_variant =
+        (batch_tile == kAq4RegisterBm4 && group_size == kAq4RegisterGroup16) ||
+        (batch_tile == kAq4RegisterBm8 &&
+         (group_size == kAq4RegisterGroup8 || group_size == kAq4RegisterGroup16));
+    if (!supported_variant || arch != "gfx1201" || batch_count < batch_tile || rows == 0u ||
         cols == 0u || rows % kAq4RegisterRowsPerBlock != 0u || cols % kAq4TiledBk != 0u) {
         return false;
     }
@@ -3868,15 +3892,18 @@ Aq4MatvecBatchDispatchKind aq4_matvec_batch_dispatch_kind_for_device(
             Aq4MatvecBatchDispatchKind::Legacy;
     }
     if (register_setting == Aq4RegisterExperimentalSetting::Bm8) {
-        return aq4_matvec_batch_register_shape_is_supported(
-                   arch,
-                   group_size,
-                   rows,
-                   cols,
-                   batch_count,
-                   kAq4RegisterBm8) ?
-            Aq4MatvecBatchDispatchKind::RegisterBm8 :
-            Aq4MatvecBatchDispatchKind::Legacy;
+        if (!aq4_matvec_batch_register_shape_is_supported(
+                arch,
+                group_size,
+                rows,
+                cols,
+                batch_count,
+                kAq4RegisterBm8)) {
+            return Aq4MatvecBatchDispatchKind::Legacy;
+        }
+        return group_size == kAq4RegisterGroup8 ?
+            Aq4MatvecBatchDispatchKind::RegisterBm8Group8 :
+            Aq4MatvecBatchDispatchKind::RegisterBm8;
     }
     // A present but invalid register setting is fail-closed and suppresses the LDS experiment.
     // With a valid setting, the register experiment always has precedence over the LDS flag.
@@ -3989,15 +4016,22 @@ bool aq4_matvec_batch_f32_register_hip_kernel(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream,
     std::string *error) {
-    if (batch_tile != kAq4RegisterBm4 && batch_tile != kAq4RegisterBm8) {
+    const bool supported_variant =
+        (batch_tile == kAq4RegisterBm4 && group_size == kAq4RegisterGroup16) ||
+        (batch_tile == kAq4RegisterBm8 &&
+         (group_size == kAq4RegisterGroup8 || group_size == kAq4RegisterGroup16));
+    if (!supported_variant) {
         if (error != nullptr) {
-            *error = "AQ4 register GEMM batch tile must be 4 or 8";
+            *error = "AQ4 register GEMM supports BM4/group16 or BM8/group8/group16";
         }
         return false;
     }
     const int device_id = index_buffer->hip_device_id;
-    void *function =
-        hip_aq4_matvec_register_kernel_cache().function_for_device(device_id, batch_tile, error);
+    void *function = hip_aq4_matvec_register_kernel_cache().function_for_device(
+        device_id,
+        batch_tile,
+        group_size,
+        error);
     if (function == nullptr) {
         return false;
     }
