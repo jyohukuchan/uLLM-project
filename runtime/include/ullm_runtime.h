@@ -310,6 +310,29 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
     ullm_runtime_stream *stream);
 
 /*
+ * Direct-only gfx1201 rocWMMA AQ4 group8 M=128 experiment. This additive ABI uses a separate
+ * HIPRTC module and never participates in production dispatch. It accepts only the profiled
+ * 4096x4096 and 1024x4096 projection shapes, rejecting every other backend or geometry without
+ * a fallback.
+ */
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t batch_count,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
  * Classifies the active AQ4 batch path, including explicit experiment environment gates,
  * without launching or timing a kernel.
  * device_index follows ullm_runtime_context_create: 0 is CPU and HIP devices start at 1.

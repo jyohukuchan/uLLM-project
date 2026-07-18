@@ -1562,6 +1562,276 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
+    // Direct-only gfx1201 AQ4 group8 WMMA experiment. It deliberately owns a separate HIPRTC
+    // source/module from the group16 production kernel, so compiling or timing it cannot perturb
+    // the served group16 code object.
+    static const char *aq4_matvec_wmma_group8_prototype_kernel_source() {
+        return R"(
+#include <rocwmma/rocwmma.hpp>
+
+extern "C" __global__ void ullm_aq4_gemm_wmma_group8_prototype_f32_kernel(
+    const unsigned char *indices,
+    const unsigned char *scale_indices,
+    const float *codebook,
+    const float *scale_values,
+    const float *input,
+    const float *row_scales,
+    unsigned long long scale_count,
+    unsigned long long group_size,
+    float tensor_scale,
+    unsigned long long row_scale_count,
+    unsigned long long rows,
+    unsigned long long cols,
+    unsigned long long batch_count,
+    float *output) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using namespace rocwmma;
+    constexpr unsigned int kTileRows = 16u;
+    constexpr unsigned int kTileCols = 16u;
+    constexpr unsigned int kWmmaK = 16u;
+    constexpr unsigned int kWideK = 32u;
+    constexpr unsigned int kBatchTile = 128u;
+    constexpr unsigned int kStages = 2u;
+    constexpr unsigned int kWavesPerBlock = kBatchTile / kTileCols;
+    constexpr unsigned int kThreads = kWavesPerBlock * 32u;
+    static_assert(kThreads == 256u, "AQ4 group8 WMMA prototype expects eight wave32s");
+    static_assert(kWideK == 2u * kWmmaK, "AQ4 group8 Wide-K path requires two WMMA K tiles");
+    static_assert(kStages == 2u, "AQ4 group8 WMMA prototype is a ping-pong LDS pipeline");
+
+    typedef unsigned int ullm_aq4_wmma_group8_uint4 __attribute__((ext_vector_type(4)));
+    typedef float ullm_aq4_wmma_group8_float4 __attribute__((ext_vector_type(4)));
+    using FragA = fragment<matrix_a, kTileRows, kTileCols, kWmmaK, float16_t, row_major>;
+    using FragB = fragment<matrix_b, kTileRows, kTileCols, kWmmaK, float16_t, col_major>;
+    using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;
+
+    constexpr unsigned int kWeightTilesLdsBytes =
+        kStages * kTileRows * kWideK * sizeof(float16_t);
+    constexpr unsigned int kInputTilesLdsBytes =
+        kStages * kBatchTile * kWideK * sizeof(float16_t);
+    constexpr unsigned int kOutputTileLdsBytes =
+        kWavesPerBlock * kTileRows * kTileCols * sizeof(float);
+    constexpr unsigned int kStaticLdsBytes =
+        kWeightTilesLdsBytes + kInputTilesLdsBytes + kOutputTileLdsBytes;
+    static_assert(kStaticLdsBytes == 26624u, "AQ4 group8 WMMA LDS accounting drifted");
+    static_assert(
+        kStaticLdsBytes <= 64u * 1024u,
+        "AQ4 group8 WMMA prototype kernel must fit gfx1201 LDS");
+
+    __shared__ __attribute__((aligned(16))) float16_t weight_tiles[
+        kStages][kTileRows * kWideK];
+    __shared__ __attribute__((aligned(16))) float16_t input_tiles[
+        kStages][kBatchTile * kWideK];
+    __shared__ __attribute__((aligned(16))) float output_tile[
+        kWavesPerBlock * kTileRows * kTileCols];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int wave = tid >> 5;
+    const unsigned long long row_base = static_cast<unsigned long long>(blockIdx.x) * kTileRows;
+    const unsigned long long batch_base =
+        static_cast<unsigned long long>(blockIdx.y) * kBatchTile;
+
+    if (group_size != 8ull || batch_count != kBatchTile || rows == 0ull || cols == 0ull ||
+        (rows % kTileRows) != 0ull || (cols % kWideK) != 0ull) {
+        return;
+    }
+
+    FragC c;
+    fill_fragment(c, 0.0f);
+    const unsigned long long groups_per_row = cols / 8ull;
+
+    // A 16-byte packed-nibble load is 32 AQ4 elements. For group8 that is four consecutive
+    // scale groups, and each uint32 word below contains exactly one eight-element group.
+    if (tid < kTileRows) {
+        const unsigned long long row = row_base + tid;
+        const unsigned long long group_base = row * groups_per_row;
+        const unsigned int scale_index0 = static_cast<unsigned int>(scale_indices[group_base]);
+        const unsigned int scale_index1 =
+            static_cast<unsigned int>(scale_indices[group_base + 1ull]);
+        const unsigned int scale_index2 =
+            static_cast<unsigned int>(scale_indices[group_base + 2ull]);
+        const unsigned int scale_index3 =
+            static_cast<unsigned int>(scale_indices[group_base + 3ull]);
+        const float group_scale0 =
+            scale_index0 < scale_count ? scale_values[scale_index0] : 0.0f;
+        const float group_scale1 =
+            scale_index1 < scale_count ? scale_values[scale_index1] : 0.0f;
+        const float group_scale2 =
+            scale_index2 < scale_count ? scale_values[scale_index2] : 0.0f;
+        const float group_scale3 =
+            scale_index3 < scale_count ? scale_values[scale_index3] : 0.0f;
+        const unsigned long long byte_offset = (row * cols) >> 1;
+        const ullm_aq4_wmma_group8_uint4 packed_words =
+            *reinterpret_cast<const ullm_aq4_wmma_group8_uint4 *>(indices + byte_offset);
+#pragma unroll
+        for (unsigned int word_index = 0u; word_index < 4u; ++word_index) {
+            const unsigned int word = static_cast<unsigned int>(packed_words[word_index]);
+            const float group_scale =
+                word_index == 0u ? group_scale0 :
+                word_index == 1u ? group_scale1 :
+                word_index == 2u ? group_scale2 : group_scale3;
+#pragma unroll
+            for (unsigned int byte_index = 0u; byte_index < 4u; ++byte_index) {
+                const unsigned int packed_byte = (word >> (byte_index * 8u)) & 0xffu;
+                const unsigned int local_k = word_index * 8u + byte_index * 2u;
+                weight_tiles[0][tid * kWideK + local_k] = static_cast<float16_t>(
+                    codebook[packed_byte & 0x0fu] * group_scale);
+                weight_tiles[0][tid * kWideK + local_k + 1u] = static_cast<float16_t>(
+                    codebook[(packed_byte >> 4u) & 0x0fu] * group_scale);
+            }
+        }
+    }
+    for (unsigned int input_vector = tid;
+         input_vector < (kBatchTile * kWideK) / 4u;
+         input_vector += kThreads) {
+        const unsigned int batch_in_tile = input_vector / (kWideK / 4u);
+        const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
+        const unsigned long long input_offset =
+            (batch_base + batch_in_tile) * cols + k_in_tile;
+        const ullm_aq4_wmma_group8_float4 values =
+            *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);
+        const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;
+        input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);
+        input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);
+        input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(values[2]);
+        input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(values[3]);
+    }
+    __syncthreads();
+
+    for (unsigned long long k_base = 0ull; k_base < cols; k_base += kWideK) {
+        const unsigned int current_stage =
+            static_cast<unsigned int>((k_base / kWideK) & 1ull);
+        const unsigned int next_stage = current_stage ^ 1u;
+        const unsigned int wave_input_offset = wave * kTileCols * kWideK;
+
+        FragA a;
+        FragB b;
+        load_matrix_sync(a, weight_tiles[current_stage], kWideK);
+        load_matrix_sync(b, input_tiles[current_stage] + wave_input_offset, kWideK);
+
+        const bool has_next = k_base < cols - kWideK;
+        ullm_aq4_wmma_group8_float4 prefetched_input[4];
+        ullm_aq4_wmma_group8_uint4 prefetched_weights;
+        float prefetched_group_scale0 = 0.0f;
+        float prefetched_group_scale1 = 0.0f;
+        float prefetched_group_scale2 = 0.0f;
+        float prefetched_group_scale3 = 0.0f;
+        if (has_next && tid < kTileRows) {
+            const unsigned long long next_k_base = k_base + kWideK;
+            const unsigned long long row = row_base + tid;
+            const unsigned long long group_base =
+                row * groups_per_row + next_k_base / 8ull;
+            const unsigned int scale_index0 =
+                static_cast<unsigned int>(scale_indices[group_base]);
+            const unsigned int scale_index1 =
+                static_cast<unsigned int>(scale_indices[group_base + 1ull]);
+            const unsigned int scale_index2 =
+                static_cast<unsigned int>(scale_indices[group_base + 2ull]);
+            const unsigned int scale_index3 =
+                static_cast<unsigned int>(scale_indices[group_base + 3ull]);
+            prefetched_group_scale0 =
+                scale_index0 < scale_count ? scale_values[scale_index0] : 0.0f;
+            prefetched_group_scale1 =
+                scale_index1 < scale_count ? scale_values[scale_index1] : 0.0f;
+            prefetched_group_scale2 =
+                scale_index2 < scale_count ? scale_values[scale_index2] : 0.0f;
+            prefetched_group_scale3 =
+                scale_index3 < scale_count ? scale_values[scale_index3] : 0.0f;
+            const unsigned long long byte_offset = (row * cols + next_k_base) >> 1;
+            prefetched_weights =
+                *reinterpret_cast<const ullm_aq4_wmma_group8_uint4 *>(indices + byte_offset);
+        }
+        if (has_next) {
+#pragma unroll
+            for (unsigned int prefetch_index = 0u; prefetch_index < 4u; ++prefetch_index) {
+                const unsigned int input_vector = tid + prefetch_index * kThreads;
+                const unsigned int batch_in_tile = input_vector / (kWideK / 4u);
+                const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
+                const unsigned long long input_offset =
+                    (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;
+                prefetched_input[prefetch_index] =
+                    *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);
+            }
+        }
+
+        mma_sync(c, a, b, c);
+        load_matrix_sync(a, weight_tiles[current_stage] + kWmmaK, kWideK);
+        load_matrix_sync(b, input_tiles[current_stage] + wave_input_offset + kWmmaK, kWideK);
+        mma_sync(c, a, b, c);
+
+        if (has_next) {
+            if (tid < kTileRows) {
+#pragma unroll
+                for (unsigned int word_index = 0u; word_index < 4u; ++word_index) {
+                    const unsigned int word =
+                        static_cast<unsigned int>(prefetched_weights[word_index]);
+                    const float group_scale =
+                        word_index == 0u ? prefetched_group_scale0 :
+                        word_index == 1u ? prefetched_group_scale1 :
+                        word_index == 2u ? prefetched_group_scale2 : prefetched_group_scale3;
+#pragma unroll
+                    for (unsigned int byte_index = 0u; byte_index < 4u; ++byte_index) {
+                        const unsigned int packed_byte = (word >> (byte_index * 8u)) & 0xffu;
+                        const unsigned int local_k = word_index * 8u + byte_index * 2u;
+                        weight_tiles[next_stage][tid * kWideK + local_k] =
+                            static_cast<float16_t>(codebook[packed_byte & 0x0fu] * group_scale);
+                        weight_tiles[next_stage][tid * kWideK + local_k + 1u] =
+                            static_cast<float16_t>(
+                                codebook[(packed_byte >> 4u) & 0x0fu] * group_scale);
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned int prefetch_index = 0u; prefetch_index < 4u; ++prefetch_index) {
+                const unsigned int input_vector = tid + prefetch_index * kThreads;
+                const unsigned int batch_in_tile = input_vector / (kWideK / 4u);
+                const unsigned int k_in_tile = (input_vector % (kWideK / 4u)) * 4u;
+                const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;
+                const ullm_aq4_wmma_group8_float4 values = prefetched_input[prefetch_index];
+                input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);
+                input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);
+                input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);
+                input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(values[3]);
+            }
+            __syncthreads();
+        }
+    }
+
+    store_matrix_sync(output_tile + wave * kTileRows * kTileCols, c, kTileCols);
+    __syncthreads();
+
+    for (unsigned int output_index = tid;
+         output_index < kWavesPerBlock * kTileRows * kTileCols;
+         output_index += kThreads) {
+        const unsigned int output_wave = output_index / (kTileRows * kTileCols);
+        const unsigned int output_in_wave = output_index % (kTileRows * kTileCols);
+        const unsigned int local_row = output_in_wave / kTileCols;
+        const unsigned int local_batch = output_in_wave % kTileCols;
+        const unsigned long long row = row_base + local_row;
+        const unsigned long long batch = batch_base + output_wave * kTileCols + local_batch;
+        const float row_scale =
+            row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;
+        output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;
+    }
+#else
+    (void)indices;
+    (void)scale_indices;
+    (void)codebook;
+    (void)scale_values;
+    (void)input;
+    (void)row_scales;
+    (void)scale_count;
+    (void)group_size;
+    (void)tensor_scale;
+    (void)row_scale_count;
+    (void)rows;
+    (void)cols;
+    (void)batch_count;
+    (void)output;
+#endif
+}
+)";
+    }
+
     static const char *aq4_matvec_top1_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_aq4_matvec_top1_f32_kernel(

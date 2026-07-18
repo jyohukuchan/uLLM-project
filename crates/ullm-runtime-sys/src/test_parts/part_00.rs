@@ -249,6 +249,29 @@
     }
 
     #[test]
+    fn aq4_wmma_group8_prototype_target_shape_contracts_have_exact_full_tile_grids() {
+        // The direct-only group8 experiment is intentionally scoped to the two profiled
+        // projections. Each 16-byte Wide-K packed load covers 32 AQ4 values, hence four
+        // independent group8 scales, while preserving the same aligned 16-row / M=128 grid.
+        for (family, rows, cols, expected_grid_x) in [
+            ("attn_o + linear_attn_out", 4_096_usize, 4_096, 256),
+            ("attn_k + attn_v", 1_024, 4_096, 64),
+        ] {
+            assert_eq!(rows % 16, 0, "{family} row tiles");
+            assert_eq!(cols % 32, 0, "{family} Wide-K groups");
+            assert_eq!(rows / 16, expected_grid_x, "{family} grid.x");
+            assert_eq!(128 / 128, 1, "{family} grid.y");
+            assert_eq!(32 / 8, 4, "{family} group8 scales per packed Wide-K load");
+            assert_eq!((cols / 2) % 16, 0, "{family} packed AQ4 stride");
+            assert_eq!(
+                (cols * std::mem::size_of::<f32>()) % 16,
+                0,
+                "{family} activation stride"
+            );
+        }
+    }
+
+    #[test]
     fn smoke_adds_f32_values() {
         let out = smoke_add_f32(&[1.0, 2.5, -3.0], &[4.0, -1.5, 3.5]).unwrap();
         assert_eq!(out, vec![5.0, 1.0, 0.5]);

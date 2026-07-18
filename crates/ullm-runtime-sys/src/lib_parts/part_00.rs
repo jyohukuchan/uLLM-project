@@ -215,6 +215,23 @@ unsafe extern "C" {
         output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
+        index_buffer: *const RawRuntimeBuffer,
+        scale_buffer: *const RawRuntimeBuffer,
+        codebook_buffer: *const RawRuntimeBuffer,
+        scale_values_buffer: *const RawRuntimeBuffer,
+        input_buffer: *const RawRuntimeBuffer,
+        row_scale_buffer: *const RawRuntimeBuffer,
+        scale_count: usize,
+        group_size: usize,
+        tensor_scale: f32,
+        row_scale_count: usize,
+        rows: usize,
+        cols: usize,
+        batch_count: usize,
+        output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_aq4_matvec_batch_dispatch_kind_for_shape(
         device_index: u32,
         group_size: usize,
@@ -1998,6 +2015,117 @@ pub fn aq4_matvec_batch_wmma_prototype_f32(
         .unwrap_or(std::ptr::null_mut());
     status_to_result(unsafe {
         ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
+            index_buffer.raw.as_ptr(),
+            scale_buffer.raw.as_ptr(),
+            codebook_buffer.raw.as_ptr(),
+            scale_values_buffer.raw.as_ptr(),
+            input_buffer.raw.as_ptr(),
+            row_scale_raw,
+            scale_count,
+            group_size,
+            tensor_scale,
+            row_scale_count,
+            rows,
+            cols,
+            batch_count,
+            output_buffer.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Directly invokes the isolated gfx1201 rocWMMA AQ4 group8 M=128 prototype.
+///
+/// This forced path has no dispatch or environment dependency and never falls back. Its initial
+/// scope is limited to the profiled 4096x4096 and 1024x4096 group8 projection shapes.
+#[allow(clippy::too_many_arguments)]
+pub fn aq4_matvec_batch_wmma_group8_prototype_f32(
+    index_buffer: &RuntimeBuffer,
+    scale_buffer: &RuntimeBuffer,
+    codebook_buffer: &RuntimeBuffer,
+    scale_values_buffer: &RuntimeBuffer,
+    input_buffer: &RuntimeBuffer,
+    row_scale_buffer: Option<&RuntimeBuffer>,
+    scale_count: usize,
+    group_size: usize,
+    tensor_scale: f32,
+    row_scale_count: usize,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+    output_buffer: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if scale_count == 0 {
+        return Err("AQ4 group8 WMMA prototype scale table is empty".to_string());
+    }
+    if group_size != 8 {
+        return Err("AQ4 group8 WMMA prototype requires group size 8".to_string());
+    }
+    if batch_count != 128 {
+        return Err("AQ4 group8 WMMA prototype requires batch count M=128".to_string());
+    }
+    if !matches!((rows, cols), (4_096, 4_096) | (1_024, 4_096)) {
+        return Err(
+            "AQ4 group8 WMMA prototype requires a 4096x4096 or 1024x4096 target shape"
+                .to_string(),
+        );
+    }
+    if !tensor_scale.is_finite() || tensor_scale <= 0.0 {
+        return Err(
+            "AQ4 group8 WMMA prototype tensor scale must be finite and greater than zero"
+                .to_string(),
+        );
+    }
+    let grid_x = rows
+        .checked_div(16)
+        .ok_or_else(|| "AQ4 group8 WMMA prototype row grid is invalid".to_string())?;
+    let grid_y = batch_count
+        .checked_div(128)
+        .ok_or_else(|| "AQ4 group8 WMMA prototype batch grid is invalid".to_string())?;
+    if grid_x == 0 || grid_y == 0 || grid_x > u32::MAX as usize || grid_y > u32::MAX as usize {
+        return Err("AQ4 group8 WMMA prototype dimensions exceed HIP grid limit".to_string());
+    }
+    let elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "AQ4 group8 WMMA prototype matrix element count overflows".to_string())?;
+    let index_bytes = elements / 2;
+    let groups = elements / group_size;
+    let scale_value_bytes = scale_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "AQ4 group8 WMMA prototype scale value byte size overflows".to_string()
+        })?;
+    let input_elements = batch_count
+        .checked_mul(cols)
+        .ok_or_else(|| "AQ4 group8 WMMA prototype input element count overflows".to_string())?;
+    let output_elements = batch_count.checked_mul(rows).ok_or_else(|| {
+        "AQ4 group8 WMMA prototype output element count overflows".to_string()
+    })?;
+    let input_bytes = input_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "AQ4 group8 WMMA prototype input byte size overflows".to_string())?;
+    let output_bytes = output_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "AQ4 group8 WMMA prototype output byte size overflows".to_string())?;
+    let row_scale_bytes = row_scale_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "AQ4 group8 WMMA prototype row scale byte size overflows".to_string())?;
+    check_copy_range(0, index_bytes, index_buffer.size()?)?;
+    check_copy_range(0, groups, scale_buffer.size()?)?;
+    check_copy_range(0, 16 * std::mem::size_of::<f32>(), codebook_buffer.size()?)?;
+    check_copy_range(0, scale_value_bytes, scale_values_buffer.size()?)?;
+    check_copy_range(0, input_bytes, input_buffer.size()?)?;
+    if let Some(row_scale_buffer) = row_scale_buffer {
+        check_copy_range(0, row_scale_bytes, row_scale_buffer.size()?)?;
+    }
+    check_copy_range(0, output_bytes, output_buffer.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    let row_scale_raw = row_scale_buffer
+        .map(|buffer| buffer.raw.as_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    status_to_result(unsafe {
+        ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
             index_buffer.raw.as_ptr(),
             scale_buffer.raw.as_ptr(),
             codebook_buffer.raw.as_ptr(),
