@@ -6426,6 +6426,17 @@ extern "C" __global__ void ullm_linear_attn_recurrent_f32_kernel(
         const unsigned long long key_head = value_head / key_head_group;
         const unsigned long long state_head_offset = value_head * key_dim * value_dim;
 
+        const bool state_register_resident =
+            key_dim <= static_cast<unsigned long long>(blockDim.x);
+        const bool active = static_cast<unsigned long long>(tid) < key_dim;
+        unsigned long long state_index = 0ull;
+        float state_value = 0.0f;
+        if (state_register_resident && active) {
+            const unsigned long long key = tid;
+            state_index = state_head_offset + key * value_dim + value;
+            state_value = state[state_index];
+        }
+
         for (unsigned long long timestep = 0; timestep < sequence_len; ++timestep) {
             const unsigned long long value_head_index = timestep * value_heads + value_head;
             const unsigned long long key_head_index = timestep * key_heads + key_head;
@@ -6434,19 +6445,16 @@ extern "C" __global__ void ullm_linear_attn_recurrent_f32_kernel(
             const float decay = expf(gate[value_head_index]);
             const float beta_value = beta[value_head_index];
 
-            if (key_dim <= static_cast<unsigned long long>(blockDim.x)) {
+            if (state_register_resident) {
                 float current = 0.0f;
                 float decayed = 0.0f;
                 float key_value = 0.0f;
                 float query_value = 0.0f;
-                unsigned long long state_index = 0ull;
-                const bool active = static_cast<unsigned long long>(tid) < key_dim;
                 if (active) {
                     const unsigned long long key = tid;
-                    state_index = state_head_offset + key * value_dim + value;
                     key_value = k[qk_base + key];
                     query_value = q[qk_base + key];
-                    decayed = state[state_index] * decay;
+                    decayed = state_value * decay;
                     current = decayed * key_value;
                 }
                 partial[tid] = current;
@@ -6465,7 +6473,7 @@ extern "C" __global__ void ullm_linear_attn_recurrent_f32_kernel(
                 float sum = 0.0f;
                 if (active) {
                     const float updated = decayed + key_value * v_prime_shared;
-                    state[state_index] = updated;
+                    state_value = updated;
                     sum = updated * query_value;
                 }
                 partial[tid] = sum;
@@ -6522,6 +6530,9 @@ extern "C" __global__ void ullm_linear_attn_recurrent_f32_kernel(
                 output[v_base + value] = partial[0];
             }
             __syncthreads();
+        }
+        if (state_register_resident && active) {
+            state[state_index] = state_value;
         }
         return;
     }

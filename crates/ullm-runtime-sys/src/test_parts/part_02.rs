@@ -601,6 +601,124 @@
         assert_f32s_close(&beta_output_values, &expected_beta, 1e-5);
     }
 
+    struct LinearAttnRecurrentFixture {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        gate: Vec<f32>,
+        beta: Vec<f32>,
+        initial_state: Vec<f32>,
+    }
+
+    fn linear_attn_recurrent_fixture(
+        key_heads: usize,
+        value_heads: usize,
+        sequence_len: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> LinearAttnRecurrentFixture {
+        let qk_elements = sequence_len * key_heads * key_dim;
+        let value_elements = sequence_len * value_heads * value_dim;
+        let gate_beta_elements = sequence_len * value_heads;
+        let state_elements = value_heads * key_dim * value_dim;
+        LinearAttnRecurrentFixture {
+            q: (0..qk_elements)
+                .map(|index| ((index % 29) as f32 - 14.0) * 0.003_906_25)
+                .collect(),
+            k: (0..qk_elements)
+                .map(|index| ((index % 31) as f32 - 15.0) * 0.003_417_968_8)
+                .collect(),
+            v: (0..value_elements)
+                .map(|index| ((index % 37) as f32 - 18.0) * 0.002_929_687_5)
+                .collect(),
+            gate: (0..gate_beta_elements)
+                .map(|index| -0.125 - (index % 7) as f32 * 0.0625)
+                .collect(),
+            beta: (0..gate_beta_elements)
+                .map(|index| 0.125 + (index % 5) as f32 * 0.0625)
+                .collect(),
+            initial_state: (0..state_elements)
+                .map(|index| ((index % 41) as f32 - 20.0) * 0.001_953_125)
+                .collect(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_linear_attn_recurrent_fixture(
+        context: &mut RuntimeContext,
+        stream: &mut RuntimeStream,
+        fixture: &LinearAttnRecurrentFixture,
+        key_heads: usize,
+        value_heads: usize,
+        sequence_len: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let f32_bytes = std::mem::size_of::<f32>();
+        let mut q_buffer = context.alloc_buffer(fixture.q.len() * f32_bytes).unwrap();
+        let mut k_buffer = context.alloc_buffer(fixture.k.len() * f32_bytes).unwrap();
+        let mut v_buffer = context.alloc_buffer(fixture.v.len() * f32_bytes).unwrap();
+        let mut gate_buffer = context.alloc_buffer(fixture.gate.len() * f32_bytes).unwrap();
+        let mut beta_buffer = context.alloc_buffer(fixture.beta.len() * f32_bytes).unwrap();
+        let mut state_buffer = context
+            .alloc_buffer(fixture.initial_state.len() * f32_bytes)
+            .unwrap();
+        let mut output_buffer = context.alloc_buffer(fixture.v.len() * f32_bytes).unwrap();
+
+        q_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.q), Some(&mut *stream))
+            .unwrap();
+        k_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.k), Some(&mut *stream))
+            .unwrap();
+        v_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.v), Some(&mut *stream))
+            .unwrap();
+        gate_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.gate), Some(&mut *stream))
+            .unwrap();
+        beta_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.beta), Some(&mut *stream))
+            .unwrap();
+        state_buffer
+            .copy_from_host(
+                0,
+                &f32s_to_le_bytes(&fixture.initial_state),
+                Some(&mut *stream),
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+
+        linear_attn_recurrent_f32(
+            &q_buffer,
+            &k_buffer,
+            &v_buffer,
+            &gate_buffer,
+            &beta_buffer,
+            key_heads,
+            value_heads,
+            sequence_len,
+            key_dim,
+            value_dim,
+            &mut state_buffer,
+            &mut output_buffer,
+            Some(&mut *stream),
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let mut output_bytes = vec![0_u8; fixture.v.len() * f32_bytes];
+        output_buffer
+            .copy_to_host(0, &mut output_bytes, Some(&mut *stream))
+            .unwrap();
+        let mut state_bytes = vec![0_u8; fixture.initial_state.len() * f32_bytes];
+        state_buffer
+            .copy_to_host(0, &mut state_bytes, Some(&mut *stream))
+            .unwrap();
+        stream.synchronize().unwrap();
+        (le_bytes_to_f32s(&output_bytes), le_bytes_to_f32s(&state_bytes))
+    }
+
     #[test]
     fn first_hip_linear_attn_recurrent_f32_computes_expected_values_when_available() {
         if device_count().unwrap() < 2 {
@@ -706,6 +824,195 @@
         stream.synchronize().unwrap();
         assert_f32s_close(&le_bytes_to_f32s(&output_bytes), &expected_output, 1e-5);
         assert_f32s_close(&le_bytes_to_f32s(&state_bytes), &expected_state, 1e-5);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_DIFFERENTIAL=1"]
+    fn hip_linear_attn_recurrent_register_resident_model_shapes_match_cpu_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_DIFFERENTIAL").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_DIFFERENTIAL=1 before running this GPU differential test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+        let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _block_size = ExperimentalEnvGuard::new("ULLM_LINEAR_ATTN_RECURRENT_BLOCK", Some("128"));
+        let _require_hip =
+            ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_LINEAR_ATTN_RECURRENT_KERNEL", Some("1"));
+
+        const KEY_DIM: usize = 128;
+        const VALUE_DIM: usize = 128;
+        let mut hip_context = RuntimeContext::create(device_index).unwrap();
+        let mut hip_stream = hip_context.create_stream().unwrap();
+        for &(case, key_heads, value_heads, sequence_len) in &[
+            ("production decode", 16_usize, 32_usize, 1_usize),
+            ("production short prefill", 16, 32, 7),
+            ("production M=128", 16, 32, 128),
+            ("ungrouped value heads", 32, 32, 17),
+        ] {
+            let fixture = linear_attn_recurrent_fixture(
+                key_heads,
+                value_heads,
+                sequence_len,
+                KEY_DIM,
+                VALUE_DIM,
+            );
+            let expected = {
+                let mut cpu_context = RuntimeContext::create(0).unwrap();
+                let mut cpu_stream = cpu_context.create_stream().unwrap();
+                run_linear_attn_recurrent_fixture(
+                    &mut cpu_context,
+                    &mut cpu_stream,
+                    &fixture,
+                    key_heads,
+                    value_heads,
+                    sequence_len,
+                    KEY_DIM,
+                    VALUE_DIM,
+                )
+            };
+            let actual = run_linear_attn_recurrent_fixture(
+                &mut hip_context,
+                &mut hip_stream,
+                &fixture,
+                key_heads,
+                value_heads,
+                sequence_len,
+                KEY_DIM,
+                VALUE_DIM,
+            );
+            assert_f32s_close(&actual.0, &expected.0, 1e-4);
+            assert_f32s_close(&actual.1, &expected.1, 1e-4);
+            eprintln!(
+                "linear-attn recurrent register-resident differential passed case={case} key_heads={key_heads} value_heads={value_heads} M={sequence_len} key_dim={KEY_DIM} value_dim={VALUE_DIM}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_TIMING=1"]
+    fn hip_linear_attn_recurrent_register_resident_m128_timing_when_enabled() {
+        assert_eq!(
+            std::env::var("ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_TIMING").as_deref(),
+            Ok("1"),
+            "set ULLM_RUN_LINEAR_ATTN_RECURRENT_REGISTER_TIMING=1 before running this GPU timing test"
+        );
+        let device_index = (1..device_count().unwrap())
+            .find(|&candidate| {
+                device_info(candidate)
+                    .map(|info| info.gcn_arch_name == "gfx1201")
+                    .unwrap_or(false)
+            })
+            .expect("isolated gfx1201 HIP device");
+        let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _block_size = ExperimentalEnvGuard::new("ULLM_LINEAR_ATTN_RECURRENT_BLOCK", Some("128"));
+        let _require_hip =
+            ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_LINEAR_ATTN_RECURRENT_KERNEL", Some("1"));
+
+        const KEY_HEADS: usize = 16;
+        const VALUE_HEADS: usize = 32;
+        const SEQUENCE_LEN: usize = 128;
+        const KEY_DIM: usize = 128;
+        const VALUE_DIM: usize = 128;
+        const WARMUP_ITERATIONS: usize = 3;
+        const TIMED_ITERATIONS: usize = 20;
+        let fixture = linear_attn_recurrent_fixture(
+            KEY_HEADS,
+            VALUE_HEADS,
+            SEQUENCE_LEN,
+            KEY_DIM,
+            VALUE_DIM,
+        );
+        let f32_bytes = std::mem::size_of::<f32>();
+        let mut context = RuntimeContext::create(device_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let mut q_buffer = context.alloc_buffer(fixture.q.len() * f32_bytes).unwrap();
+        let mut k_buffer = context.alloc_buffer(fixture.k.len() * f32_bytes).unwrap();
+        let mut v_buffer = context.alloc_buffer(fixture.v.len() * f32_bytes).unwrap();
+        let mut gate_buffer = context.alloc_buffer(fixture.gate.len() * f32_bytes).unwrap();
+        let mut beta_buffer = context.alloc_buffer(fixture.beta.len() * f32_bytes).unwrap();
+        let mut state_buffer = context
+            .alloc_buffer(fixture.initial_state.len() * f32_bytes)
+            .unwrap();
+        let mut output_buffer = context.alloc_buffer(fixture.v.len() * f32_bytes).unwrap();
+        q_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.q), Some(&mut stream))
+            .unwrap();
+        k_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.k), Some(&mut stream))
+            .unwrap();
+        v_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.v), Some(&mut stream))
+            .unwrap();
+        gate_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.gate), Some(&mut stream))
+            .unwrap();
+        beta_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.beta), Some(&mut stream))
+            .unwrap();
+        state_buffer
+            .copy_from_host(0, &f32s_to_le_bytes(&fixture.initial_state), Some(&mut stream))
+            .unwrap();
+        stream.synchronize().unwrap();
+
+        // Compile/load the HIPRTC kernel and reach steady state before measuring launches.
+        for _ in 0..WARMUP_ITERATIONS {
+            linear_attn_recurrent_f32(
+                &q_buffer,
+                &k_buffer,
+                &v_buffer,
+                &gate_buffer,
+                &beta_buffer,
+                KEY_HEADS,
+                VALUE_HEADS,
+                SEQUENCE_LEN,
+                KEY_DIM,
+                VALUE_DIM,
+                &mut state_buffer,
+                &mut output_buffer,
+                Some(&mut stream),
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..TIMED_ITERATIONS {
+            linear_attn_recurrent_f32(
+                &q_buffer,
+                &k_buffer,
+                &v_buffer,
+                &gate_buffer,
+                &beta_buffer,
+                KEY_HEADS,
+                VALUE_HEADS,
+                SEQUENCE_LEN,
+                KEY_DIM,
+                VALUE_DIM,
+                &mut state_buffer,
+                &mut output_buffer,
+                Some(&mut stream),
+            )
+            .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let elapsed = started.elapsed();
+        let milliseconds = elapsed.as_secs_f64() * 1_000.0 / TIMED_ITERATIONS as f64;
+        assert!(milliseconds.is_finite() && milliseconds > 0.0);
+        eprintln!(
+            "linear-attn recurrent register-resident timing key_heads={KEY_HEADS} value_heads={VALUE_HEADS} M={SEQUENCE_LEN} key_dim={KEY_DIM} value_dim={VALUE_DIM}: {milliseconds:.3} ms/launch ({:.3} launches/s)",
+            1_000.0 / milliseconds
+        );
     }
 
     #[test]
