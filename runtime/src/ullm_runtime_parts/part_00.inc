@@ -1047,6 +1047,19 @@ public:
             error);
     }
 
+    bool compile_segmented_rmsnorm_silu_mul_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_source();
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_segmented_rmsnorm_silu_mul_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
     bool compile_silu_mul_kernel(const std::string &arch, std::vector<char> *code, std::string *error) {
         return compile_kernel(arch, silu_mul_kernel_source(), "ullm_silu_mul_f32.hip", code, error);
     }
@@ -9492,6 +9505,101 @@ HipSegmentedRmsNormSiluMulKernelCache &hip_segmented_rmsnorm_silu_mul_kernel_cac
     return cache;
 }
 
+constexpr size_t kQwen35SegmentedRmsNormSiluMulShufflePrototypeSegments = 32u;
+constexpr size_t kQwen35SegmentedRmsNormSiluMulShufflePrototypeSegmentSize = 128u;
+constexpr unsigned int kQwen35SegmentedRmsNormSiluMulShufflePrototypeThreads = 256u;
+
+bool segmented_rmsnorm_silu_mul_shuffle_prototype_shape_is_supported(
+    const std::string &arch,
+    size_t segments,
+    size_t segment_size) {
+    return arch == "gfx1201" &&
+        segments == kQwen35SegmentedRmsNormSiluMulShufflePrototypeSegments &&
+        segment_size == kQwen35SegmentedRmsNormSiluMulShufflePrototypeSegmentSize;
+}
+
+// This cache is intentionally independent from the served segmented RMSNorm SiLU-mul module.
+// The direct experiment therefore cannot affect production HIPRTC source selection, code
+// objects, or dispatch.
+class HipSegmentedRmsNormSiluMulShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(
+                error,
+                "segmented RMSNorm SiLU-mul shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_segmented_rmsnorm_silu_mul_shuffle_prototype_kernel(
+                "gfx1201",
+                &code,
+                &compile_error)) {
+            append_error(
+                error,
+                compile_error.empty() ?
+                    "failed to build segmented RMSNorm SiLU-mul shuffle prototype HIP kernel" :
+                    compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for segmented RMSNorm SiLU-mul shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_segmented_rmsnorm_silu_mul_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(
+                error,
+                "hipModuleGetFunction failed for segmented RMSNorm SiLU-mul shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+    };
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipSegmentedRmsNormSiluMulShufflePrototypeKernelCache &
+hip_segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_cache() {
+    static HipSegmentedRmsNormSiluMulShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 bool segmented_rmsnorm_silu_mul_f32_hip_kernel(
     const ullm_runtime_buffer *input_buffer,
     const ullm_runtime_buffer *weight_buffer,
@@ -9540,6 +9648,64 @@ bool segmented_rmsnorm_silu_mul_f32_hip_kernel(
             device_id)) {
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for f32 segmented RMSNorm SiLU-mul";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool segmented_rmsnorm_silu_mul_shuffle_prototype_f32_hip_kernel(
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *weight_buffer,
+    const ullm_runtime_buffer *gate_buffer,
+    size_t segments,
+    size_t segment_size,
+    float epsilon,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = input_buffer->hip_device_id;
+    if (!segmented_rmsnorm_silu_mul_shuffle_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(device_id),
+            segments,
+            segment_size)) {
+        if (error != nullptr) {
+            *error =
+                "segmented RMSNorm SiLU-mul shuffle prototype requires gfx1201 and Qwen3.5 segments=32, segment size=128";
+        }
+        return false;
+    }
+    void *function = hip_segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_cache()
+                         .function_for_device(device_id, error);
+    if (function == nullptr) {
+        return false;
+    }
+
+    unsigned long long kernel_segments = static_cast<unsigned long long>(segments);
+    unsigned long long kernel_segment_size = static_cast<unsigned long long>(segment_size);
+    void *input_ptr = input_buffer->ptr;
+    void *weight_ptr = weight_buffer->ptr;
+    void *gate_ptr = gate_buffer->ptr;
+    void *output_ptr = output_buffer->ptr;
+    void *kernel_params[] = {
+        &input_ptr,
+        &weight_ptr,
+        &gate_ptr,
+        &kernel_segments,
+        &kernel_segment_size,
+        &epsilon,
+        &output_ptr,
+    };
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel(
+            function,
+            static_cast<unsigned int>(kQwen35SegmentedRmsNormSiluMulShufflePrototypeSegments),
+            kQwen35SegmentedRmsNormSiluMulShufflePrototypeThreads,
+            kernel_params,
+            hip_stream,
+            device_id)) {
+        if (error != nullptr) {
+            *error = "hipModuleLaunchKernel failed for segmented RMSNorm SiLU-mul shuffle prototype";
         }
         return false;
     }

@@ -5583,6 +5583,76 @@ extern "C" __global__ void ullm_segmented_rmsnorm_silu_mul_f32_kernel(
 )";
     }
 
+    // Direct-only gfx1201 experiment for Qwen3.5's M=1 linear-attention post path. It keeps
+    // the served scalar tree source intact and changes only the per-CTA RMS reduction under an
+    // isolated entry point, so production symbol selection and dispatch cannot change.
+    static std::string segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_source() {
+        std::string prototype = segmented_rmsnorm_silu_mul_kernel_source();
+        const std::string production_name = "ullm_segmented_rmsnorm_silu_mul_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_segmented_rmsnorm_silu_mul_shuffle_prototype_f32_kernel");
+
+        const std::string lds_setup = R"(    const unsigned long long segment = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];
+    float sum_squares = 0.0f;)";
+        const std::string shuffle_setup = R"(    const unsigned long long segment = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid % warpSize;
+    const unsigned int wave = tid / warpSize;
+    // Eight wave32 leaders replace the 256-thread LDS tree for the fixed direct launch.
+    __shared__ float wave_partials[8];
+    float sum_squares = 0.0f;)";
+        const size_t setup_offset = prototype.find(lds_setup);
+        if (setup_offset == std::string::npos) return "";
+        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_reduction = R"(    partial[tid] = sum_squares;
+    __syncthreads();
+    for (unsigned int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            partial[tid] += partial[tid + offset];
+        }
+        __syncthreads();
+    }
+    if (segment >= segments) {
+        return;
+    }
+    const float inv_rms = rsqrtf(partial[0] / static_cast<float>(segment_size) + epsilon);)";
+        const std::string shuffle_reduction = R"(    for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        sum_squares += __shfl_down(sum_squares, offset, warpSize);
+    }
+    if (lane == 0u) {
+        wave_partials[wave] = sum_squares;
+    }
+    __syncthreads();
+
+    if (wave == 0u) {
+        const unsigned int wave_count = (blockDim.x + warpSize - 1u) / warpSize;
+        sum_squares = lane < wave_count ? wave_partials[lane] : 0.0f;
+        for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+            sum_squares += __shfl_down(sum_squares, offset, warpSize);
+        }
+        if (lane == 0u) {
+            wave_partials[0] = sum_squares;
+        }
+    }
+    __syncthreads();
+    if (segment >= segments) {
+        return;
+    }
+    const float inv_rms =
+        rsqrtf(wave_partials[0] / static_cast<float>(segment_size) + epsilon);)";
+        const size_t reduction_offset = prototype.find(lds_reduction);
+        if (reduction_offset == std::string::npos) return "";
+        prototype.replace(reduction_offset, lds_reduction.size(), shuffle_reduction);
+        return prototype;
+    }
+
     static const char *silu_mul_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_silu_mul_f32_kernel(

@@ -783,6 +783,16 @@ unsafe extern "C" {
         output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_segmented_rmsnorm_silu_mul_shuffle_prototype_f32(
+        input_buffer: *const RawRuntimeBuffer,
+        weight_buffer: *const RawRuntimeBuffer,
+        gate_buffer: *const RawRuntimeBuffer,
+        segments: usize,
+        segment_size: usize,
+        epsilon: f32,
+        output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_silu_mul_f32(
         gate_buffer: *const RawRuntimeBuffer,
         up_buffer: *const RawRuntimeBuffer,
@@ -5018,6 +5028,68 @@ pub fn segmented_rmsnorm_silu_mul_f32(
     let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
     status_to_result(unsafe {
         ullm_runtime_segmented_rmsnorm_silu_mul_f32(
+            input_buffer.raw.as_ptr(),
+            weight_buffer.raw.as_ptr(),
+            gate_buffer.raw.as_ptr(),
+            segments,
+            segment_size,
+            epsilon,
+            output_buffer.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Direct-only gfx1201 wave-shuffle segmented RMSNorm SiLU-mul experiment for Qwen3.5's M=1
+/// linear-attention post shape (32 value heads of dimension 128). It is intentionally separate
+/// from production dispatch and has no CPU or staging fallback.
+pub fn segmented_rmsnorm_silu_mul_shuffle_prototype_f32(
+    input_buffer: &RuntimeBuffer,
+    weight_buffer: &RuntimeBuffer,
+    gate_buffer: &RuntimeBuffer,
+    segments: usize,
+    segment_size: usize,
+    epsilon: f32,
+    output_buffer: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    const QWEN35_SEGMENTED_RMSNORM_SILU_MUL_SHUFFLE_PROTOTYPE_SEGMENTS: usize = 32;
+    const QWEN35_SEGMENTED_RMSNORM_SILU_MUL_SHUFFLE_PROTOTYPE_SEGMENT_SIZE: usize = 128;
+    if segments != QWEN35_SEGMENTED_RMSNORM_SILU_MUL_SHUFFLE_PROTOTYPE_SEGMENTS
+        || segment_size != QWEN35_SEGMENTED_RMSNORM_SILU_MUL_SHUFFLE_PROTOTYPE_SEGMENT_SIZE
+    {
+        return Err(
+            "segmented RMSNorm SiLU-mul shuffle prototype requires the Qwen3.5 M=1 value-head shape segments=32, segment size=128"
+                .to_string(),
+        );
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(
+            "segmented RMSNorm SiLU-mul shuffle prototype epsilon must be finite and greater than zero"
+                .to_string(),
+        );
+    }
+    let elements = segments.checked_mul(segment_size).ok_or_else(|| {
+        "segmented RMSNorm SiLU-mul shuffle prototype element count overflows".to_string()
+    })?;
+    let input_output_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "segmented RMSNorm SiLU-mul shuffle prototype input/output byte size overflows"
+                .to_string()
+        })?;
+    let weight_bytes = segment_size
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "segmented RMSNorm SiLU-mul shuffle prototype weight byte size overflows".to_string()
+        })?;
+    check_copy_range(0, input_output_bytes, input_buffer.size()?)?;
+    check_copy_range(0, weight_bytes, weight_buffer.size()?)?;
+    check_copy_range(0, input_output_bytes, gate_buffer.size()?)?;
+    check_copy_range(0, input_output_bytes, output_buffer.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_segmented_rmsnorm_silu_mul_shuffle_prototype_f32(
             input_buffer.raw.as_ptr(),
             weight_buffer.raw.as_ptr(),
             gate_buffer.raw.as_ptr(),

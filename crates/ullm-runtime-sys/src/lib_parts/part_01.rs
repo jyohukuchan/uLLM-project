@@ -11,5 +11,6 @@ mod tests {
     include!("../test_parts/aq4_fused_wide_load_prototype.rs");
     include!("../test_parts/aq4_matvec_triple_shuffle_prototype.rs");
     include!("../test_parts/rmsnorm_shuffle_prototype.rs");
+    include!("../test_parts/segmented_rmsnorm_silu_mul_shuffle_prototype.rs");
     include!("../test_parts/linear_attn_qkv_prepare_shuffle_prototype.rs");
 }
