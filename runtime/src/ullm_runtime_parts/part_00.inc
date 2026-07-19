@@ -908,6 +908,19 @@ public:
             error);
     }
 
+    bool compile_aq4_matvec_silu_mul_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = aq4_matvec_silu_mul_shuffle_prototype_kernel_source_for_arch(arch);
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_aq4_matvec_silu_mul_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
     bool compile_aq4_matvec_gate_beta_kernel(
         const std::string &arch,
         std::vector<char> *code,
@@ -4616,6 +4629,65 @@ HipAq4FusedWideLoadPrototypeKernelCache &hip_aq4_matvec_silu_mul_wide_load_proto
     return cache;
 }
 
+// This stays independent from both production and the wide-load experiment: its source changes
+// only the reduction and must not perturb either comparison code object.
+class HipAq4MatvecSiluMulShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) return found->second->function;
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "AQ4 SiLU-mul shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_aq4_matvec_silu_mul_shuffle_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            append_error(error, compile_error.empty() ?
+                "failed to build AQ4 SiLU-mul shuffle prototype HIP kernel" : compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for AQ4 SiLU-mul shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_aq4_matvec_silu_mul_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for AQ4 SiLU-mul shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        modules_.emplace(device_id, std::move(loaded));
+        return function;
+    }
+
+private:
+    struct LoadedModule { void *module = nullptr; void *function = nullptr; };
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) return;
+        if (!error->empty()) error->append("\n");
+        error->append(message);
+    }
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipAq4MatvecSiluMulShufflePrototypeKernelCache &
+hip_aq4_matvec_silu_mul_shuffle_prototype_kernel_cache() {
+    static HipAq4MatvecSiluMulShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 HipAq4MatvecQkvZGateBetaKernelCache &hip_aq4_matvec_qkv_z_gate_beta_kernel_cache() {
     static HipAq4MatvecQkvZGateBetaKernelCache cache;
     return cache;
@@ -6856,6 +6928,12 @@ HipAq4MatvecSiluMulKernelCache &hip_aq4_matvec_silu_mul_kernel_cache() {
     return cache;
 }
 
+enum class Aq4MatvecSiluMulKernelKind : uint32_t {
+    Production,
+    WideLoadPrototype,
+    ShufflePrototype,
+};
+
 bool aq4_matvec_silu_mul_f32_hip_kernel(
     const ullm_runtime_buffer *gate_index_buffer,
     const ullm_runtime_buffer *gate_scale_buffer,
@@ -6881,17 +6959,19 @@ bool aq4_matvec_silu_mul_f32_hip_kernel(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream,
     std::string *error,
-    bool wide_load_prototype = false) {
+    Aq4MatvecSiluMulKernelKind kind = Aq4MatvecSiluMulKernelKind::Production) {
     const int device_id = gate_index_buffer->hip_device_id;
-    if (wide_load_prototype &&
+    if (kind == Aq4MatvecSiluMulKernelKind::WideLoadPrototype &&
         ((reinterpret_cast<uintptr_t>(gate_index_buffer->ptr) & 15u) != 0u ||
          (reinterpret_cast<uintptr_t>(up_index_buffer->ptr) & 15u) != 0u)) {
         if (error != nullptr) *error = "AQ4 SiLU-mul wide-load prototype requires 16-byte aligned index buffers";
         return false;
     }
-    void *function = wide_load_prototype
+    void *function = kind == Aq4MatvecSiluMulKernelKind::WideLoadPrototype
         ? hip_aq4_matvec_silu_mul_wide_load_prototype_kernel_cache().function_for_device(device_id, error)
-        : hip_aq4_matvec_silu_mul_kernel_cache().function_for_device(device_id, error);
+        : kind == Aq4MatvecSiluMulKernelKind::ShufflePrototype
+            ? hip_aq4_matvec_silu_mul_shuffle_prototype_kernel_cache().function_for_device(device_id, error)
+            : hip_aq4_matvec_silu_mul_kernel_cache().function_for_device(device_id, error);
     if (function == nullptr) {
         return false;
     }

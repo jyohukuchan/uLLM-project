@@ -3719,8 +3719,31 @@ ullm_status ullm_runtime_aq4_matvec_silu_mul_wide_load_prototype_f32(
     const size_t elements = rows * cols;
     if (gate_i->bytes < elements / 2u || up_i->bytes < elements / 2u || gate_s->bytes < elements / gate_g || up_s->bytes < elements / up_g || gate_c->bytes < 16u * sizeof(float) || up_c->bytes < 16u * sizeof(float) || gate_c->bytes % sizeof(float) != 0u || up_c->bytes % sizeof(float) != 0u || gate_v->bytes < gate_sc * sizeof(float) || up_v->bytes < up_sc * sizeof(float) || input->bytes < cols * sizeof(float) || output->bytes < rows * sizeof(float) || (gate_r != nullptr && gate_r->bytes < gate_rc * sizeof(float)) || (up_r != nullptr && up_r->bytes < up_rc * sizeof(float))) { set_error("AQ4 SiLU-mul wide-load prototype buffer is too small or malformed"); return ULLM_STATUS_INVALID_ARGUMENT; }
     std::string error;
-    if (!aq4_matvec_silu_mul_f32_hip_kernel(gate_i,gate_s,gate_c,gate_v,gate_r,gate_sc,gate_g,gate_t,gate_rc,up_i,up_s,up_c,up_v,up_r,up_sc,up_g,up_t,up_rc,input,rows,cols,output,stream,&error,true)) {
+    if (!aq4_matvec_silu_mul_f32_hip_kernel(gate_i,gate_s,gate_c,gate_v,gate_r,gate_sc,gate_g,gate_t,gate_rc,up_i,up_s,up_c,up_v,up_r,up_sc,up_g,up_t,up_rc,input,rows,cols,output,stream,&error,Aq4MatvecSiluMulKernelKind::WideLoadPrototype)) {
         set_error(error.empty() ? "AQ4 SiLU-mul wide-load prototype HIP launch failed" : error.c_str()); return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error(""); return ULLM_STATUS_OK;
+}
+
+ullm_status ullm_runtime_aq4_matvec_silu_mul_shuffle_prototype_f32(
+    const ullm_runtime_buffer *gate_i, const ullm_runtime_buffer *gate_s, const ullm_runtime_buffer *gate_c, const ullm_runtime_buffer *gate_v, const ullm_runtime_buffer *gate_r, size_t gate_sc, size_t gate_g, float gate_t, size_t gate_rc,
+    const ullm_runtime_buffer *up_i, const ullm_runtime_buffer *up_s, const ullm_runtime_buffer *up_c, const ullm_runtime_buffer *up_v, const ullm_runtime_buffer *up_r, size_t up_sc, size_t up_g, float up_t, size_t up_rc,
+    const ullm_runtime_buffer *input, size_t rows, size_t cols, ullm_runtime_buffer *output, ullm_runtime_stream *stream) {
+    const ullm_runtime_buffer *all[] = {gate_i,gate_s,gate_c,gate_v,up_i,up_s,up_c,up_v,input,output};
+    for (const ullm_runtime_buffer *buffer : all) if (buffer == nullptr) { set_error("AQ4 SiLU-mul shuffle prototype received a null pointer"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    if ((gate_rc != 0u && gate_r == nullptr) || (up_rc != 0u && up_r == nullptr)) { set_error("AQ4 SiLU-mul shuffle prototype row-scale count requires its row-scale buffer"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    if (gate_i->backend != BackendKind::Hip || gate_i->hip_device_id < 0 || hip_runtime().device_arch_name(gate_i->hip_device_id) != "gfx1201" ||
+        (gate_g != 8u && gate_g != 16u) || (up_g != 8u && up_g != 16u) || rows == 0u || cols == 0u || cols % 32u != 0u || gate_sc == 0u || up_sc == 0u || !std::isfinite(gate_t) || gate_t <= 0.0f || !std::isfinite(up_t) || up_t <= 0.0f || gate_rc > rows || up_rc > rows ||
+        !buffers_share_backend(gate_i,gate_s) || !buffers_share_backend(gate_i,gate_c) || !buffers_share_backend(gate_i,gate_v) || !buffers_share_backend(gate_i,up_i) || !buffers_share_backend(gate_i,up_s) || !buffers_share_backend(gate_i,up_c) || !buffers_share_backend(gate_i,up_v) || !buffers_share_backend(gate_i,input) || !buffers_share_backend(gate_i,output) || (gate_r != nullptr && !buffers_share_backend(gate_i,gate_r)) || (up_r != nullptr && !buffers_share_backend(gate_i,up_r)) || !stream_matches_buffer(output,stream)) {
+        set_error("AQ4 SiLU-mul shuffle prototype requires valid gfx1201 group8/group16 HIP buffers with cols divisible by 32"); return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (rows > max_size / cols || rows > max_size / sizeof(float) || cols > max_size / sizeof(float) || gate_sc > max_size / sizeof(float) || up_sc > max_size / sizeof(float) || gate_rc > max_size / sizeof(float) || up_rc > max_size / sizeof(float)) { set_error("AQ4 SiLU-mul shuffle prototype matrix element count or byte size overflows"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    const size_t elements = rows * cols;
+    if (gate_i->bytes < elements / 2u || up_i->bytes < elements / 2u || gate_s->bytes < elements / gate_g || up_s->bytes < elements / up_g || gate_c->bytes < 16u * sizeof(float) || up_c->bytes < 16u * sizeof(float) || gate_c->bytes % sizeof(float) != 0u || up_c->bytes % sizeof(float) != 0u || gate_v->bytes < gate_sc * sizeof(float) || up_v->bytes < up_sc * sizeof(float) || input->bytes < cols * sizeof(float) || output->bytes < rows * sizeof(float) || (gate_r != nullptr && gate_r->bytes < gate_rc * sizeof(float)) || (up_r != nullptr && up_r->bytes < up_rc * sizeof(float))) { set_error("AQ4 SiLU-mul shuffle prototype buffer is too small or malformed"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    std::string error;
+    if (!aq4_matvec_silu_mul_f32_hip_kernel(gate_i,gate_s,gate_c,gate_v,gate_r,gate_sc,gate_g,gate_t,gate_rc,up_i,up_s,up_c,up_v,up_r,up_sc,up_g,up_t,up_rc,input,rows,cols,output,stream,&error,Aq4MatvecSiluMulKernelKind::ShufflePrototype)) {
+        set_error(error.empty() ? "AQ4 SiLU-mul shuffle prototype HIP launch failed" : error.c_str()); return ULLM_STATUS_RUNTIME_ERROR;
     }
     set_error(""); return ULLM_STATUS_OK;
 }

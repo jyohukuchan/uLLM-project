@@ -179,7 +179,7 @@ fn aq4_fused_wide_load_run_qkv(
 #[allow(clippy::too_many_arguments)]
 fn aq4_fused_wide_load_run_silu(
     device: u32,
-    wide: bool,
+    variant: u8,
     gate: &Aq4WideLoadMatrixHost,
     up: &Aq4WideLoadMatrixHost,
     input: &[f32],
@@ -193,8 +193,14 @@ fn aq4_fused_wide_load_run_silu(
     let mut output = context.alloc_buffer(gate.rows * 4).unwrap();
     let gate_count = gate.row_scales.as_ref().map_or(0, Vec::len);
     let up_count = up.row_scales.as_ref().map_or(0, Vec::len);
-    if wide {
+    if variant == 1 {
         aq4_matvec_silu_mul_wide_load_prototype_f32(
+            &gate_device.index, &gate_device.scale, &gate_device.codebook, &gate_device.scale_values, gate_device.row_scale.as_ref(), gate.scale_count, gate.group_size, gate.tensor_scale, gate_count,
+            &up_device.index, &up_device.scale, &up_device.codebook, &up_device.scale_values, up_device.row_scale.as_ref(), up.scale_count, up.group_size, up.tensor_scale, up_count,
+            &input_device, gate.rows, gate.cols, &mut output, Some(&mut stream),
+        ).unwrap();
+    } else if variant == 2 {
+        aq4_matvec_silu_mul_shuffle_prototype_f32(
             &gate_device.index, &gate_device.scale, &gate_device.codebook, &gate_device.scale_values, gate_device.row_scale.as_ref(), gate.scale_count, gate.group_size, gate.tensor_scale, gate_count,
             &up_device.index, &up_device.scale, &up_device.codebook, &up_device.scale_values, up_device.row_scale.as_ref(), up.scale_count, up.group_size, up.tensor_scale, up_count,
             &input_device, gate.rows, gate.cols, &mut output, Some(&mut stream),
@@ -234,14 +240,16 @@ fn aq4_fused_wide_load_time_qkv(
 }
 
 fn aq4_fused_wide_load_time_silu(
-    device: u32, wide: bool, gate: &Aq4WideLoadMatrixHost, up: &Aq4WideLoadMatrixHost,
+    device: u32, variant: u8, gate: &Aq4WideLoadMatrixHost, up: &Aq4WideLoadMatrixHost,
     input: &[f32], rounds: usize,
 ) -> f64 {
     let mut context = RuntimeContext::create(device).unwrap(); let mut stream = context.create_stream().unwrap();
     let gate_q = aq4_fused_wide_load_upload(&mut context, &mut stream, gate); let up_q = aq4_fused_wide_load_upload(&mut context, &mut stream, up); let mut input_q = context.alloc_buffer(input.len() * 4).unwrap(); input_q.copy_from_host(0, &f32s_to_le_bytes(input), Some(&mut stream)).unwrap(); let mut output = context.alloc_buffer(gate.rows * 4).unwrap();
     let gate_count = gate.row_scales.as_ref().map_or(0, Vec::len); let up_count = up.row_scales.as_ref().map_or(0, Vec::len);
-    let mut launch = |mut stream: &mut RuntimeStream| if wide {
+    let mut launch = |mut stream: &mut RuntimeStream| if variant == 1 {
         aq4_matvec_silu_mul_wide_load_prototype_f32(&gate_q.index, &gate_q.scale, &gate_q.codebook, &gate_q.scale_values, gate_q.row_scale.as_ref(), gate.scale_count, gate.group_size, gate.tensor_scale, gate_count, &up_q.index, &up_q.scale, &up_q.codebook, &up_q.scale_values, up_q.row_scale.as_ref(), up.scale_count, up.group_size, up.tensor_scale, up_count, &input_q, gate.rows, gate.cols, &mut output, Some(&mut stream)).unwrap();
+    } else if variant == 2 {
+        aq4_matvec_silu_mul_shuffle_prototype_f32(&gate_q.index, &gate_q.scale, &gate_q.codebook, &gate_q.scale_values, gate_q.row_scale.as_ref(), gate.scale_count, gate.group_size, gate.tensor_scale, gate_count, &up_q.index, &up_q.scale, &up_q.codebook, &up_q.scale_values, up_q.row_scale.as_ref(), up.scale_count, up.group_size, up.tensor_scale, up_count, &input_q, gate.rows, gate.cols, &mut output, Some(&mut stream)).unwrap();
     } else {
         aq4_matvec_silu_mul_f32(&gate_q.index, &gate_q.scale, &gate_q.codebook, &gate_q.scale_values, gate_q.row_scale.as_ref(), gate.scale_count, gate.group_size, gate.tensor_scale, gate_count, &up_q.index, &up_q.scale, &up_q.codebook, &up_q.scale_values, up_q.row_scale.as_ref(), up.scale_count, up.group_size, up.tensor_scale, up_count, &input_q, gate.rows, gate.cols, &mut output, Some(&mut stream)).unwrap();
     };
@@ -305,14 +313,14 @@ fn hip_aq4_fused_wide_load_prototypes_match_cpu_and_keep_packed_streams_independ
     // The same production M=1 fusion serves both decode paths: gate/up=[12288,4096].
     let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
     let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
-    let baseline_cpu = aq4_fused_wide_load_run_silu(0, false, &gate, &up, &input);
-    let baseline_gpu = aq4_fused_wide_load_run_silu(gpu, true, &gate, &up, &input);
+    let baseline_cpu = aq4_fused_wide_load_run_silu(0, 0, &gate, &up, &input);
+    let baseline_gpu = aq4_fused_wide_load_run_silu(gpu, 1, &gate, &up, &input);
     aq4_fused_wide_load_assert_matches_cpu(&baseline_gpu, &baseline_cpu, "baseline SiLU-mul");
     for gate_stream in [true, false] {
         let (mut modified_gate, mut modified_up) = (gate.clone(), up.clone());
         if gate_stream { modified_gate.indices[0] ^= 0x11; } else { modified_up.indices[0] ^= 0x11; }
-        let expected = aq4_fused_wide_load_run_silu(0, false, &modified_gate, &modified_up, &input);
-        let actual = aq4_fused_wide_load_run_silu(gpu, true, &modified_gate, &modified_up, &input);
+        let expected = aq4_fused_wide_load_run_silu(0, 0, &modified_gate, &modified_up, &input);
+        let actual = aq4_fused_wide_load_run_silu(gpu, 1, &modified_gate, &modified_up, &input);
         aq4_fused_wide_load_assert_matches_cpu(&actual, &expected, "mutated SiLU-mul");
         aq4_fused_wide_load_assert_changed(&expected, &baseline_cpu, if gate_stream { "SiLU gate" } else { "SiLU up" });
         aq4_fused_wide_load_assert_changed(&actual, &baseline_gpu, if gate_stream { "GPU SiLU gate" } else { "GPU SiLU up" });
@@ -335,9 +343,41 @@ fn hip_aq4_fused_wide_load_prototypes_timing_vs_production() {
     let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
     let qkv_production = aq4_fused_wide_load_time_qkv(gpu, false, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
     let qkv_wide = aq4_fused_wide_load_time_qkv(gpu, true, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
-    let silu_production = aq4_fused_wide_load_time_silu(gpu, false, &gate, &up, &input, 20);
-    let silu_wide = aq4_fused_wide_load_time_silu(gpu, true, &gate, &up, &input, 20);
+    let silu_production = aq4_fused_wide_load_time_silu(gpu, 0, &gate, &up, &input, 20);
+    let silu_wide = aq4_fused_wide_load_time_silu(gpu, 1, &gate, &up, &input, 20);
     assert!(qkv_production > 0.0 && qkv_wide > 0.0 && silu_production > 0.0 && silu_wide > 0.0);
     eprintln!("AQ4 fused qkv/z gate/beta [8192/4096/32,4096]: production={qkv_production:.3} ms, wide={qkv_wide:.3} ms, speedup={:.3}x", qkv_production / qkv_wide);
     eprintln!("AQ4 fused SiLU-mul [12288,4096]: production={silu_production:.3} ms, wide={silu_wide:.3} ms, speedup={:.3}x", silu_production / silu_wide);
+}
+
+#[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_DIFFERENTIAL=1"]
+fn hip_aq4_silu_mul_shuffle_prototype_matches_cpu_for_production_shape() {
+    assert_eq!(std::env::var("ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_DIFFERENTIAL").as_deref(), Ok("1"));
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = aq4_fused_wide_load_gpu_device();
+    let mut state = 0x6a09_e667;
+    // Both gate and up use the served Qwen3.5-9B MLP projection geometry.
+    let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
+    let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
+    let input: Vec<f32> = (0..4_096).map(|_| { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
+    let expected = aq4_fused_wide_load_run_silu(0, 0, &gate, &up, &input);
+    let actual = aq4_fused_wide_load_run_silu(gpu, 2, &gate, &up, &input);
+    aq4_fused_wide_load_assert_matches_cpu(&actual, &expected, "shuffle SiLU-mul");
+}
+
+#[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_TIMING=1"]
+fn hip_aq4_silu_mul_shuffle_prototype_timing_vs_production() {
+    assert_eq!(std::env::var("ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_TIMING").as_deref(), Ok("1"));
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = aq4_fused_wide_load_gpu_device();
+    let mut state = 0xbb67_ae85;
+    let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
+    let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
+    let input = vec![0.125; 4_096];
+    let production = aq4_fused_wide_load_time_silu(gpu, 0, &gate, &up, &input, 20);
+    let shuffle = aq4_fused_wide_load_time_silu(gpu, 2, &gate, &up, &input, 20);
+    assert!(production > 0.0 && shuffle > 0.0);
+    eprintln!("AQ4 SiLU-mul shuffle [12288,4096]: production={production:.3} ms, shuffle={shuffle:.3} ms, speedup={:.3}x", production / shuffle);
 }

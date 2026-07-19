@@ -521,6 +521,17 @@ unsafe extern "C" {
         input_buffer: *const RawRuntimeBuffer, rows: usize, cols: usize, output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_aq4_matvec_silu_mul_shuffle_prototype_f32(
+        gate_index_buffer: *const RawRuntimeBuffer, gate_scale_buffer: *const RawRuntimeBuffer,
+        gate_codebook_buffer: *const RawRuntimeBuffer, gate_scale_values_buffer: *const RawRuntimeBuffer,
+        gate_row_scale_buffer: *const RawRuntimeBuffer, gate_scale_count: usize, gate_group_size: usize,
+        gate_tensor_scale: f32, gate_row_scale_count: usize, up_index_buffer: *const RawRuntimeBuffer,
+        up_scale_buffer: *const RawRuntimeBuffer, up_codebook_buffer: *const RawRuntimeBuffer,
+        up_scale_values_buffer: *const RawRuntimeBuffer, up_row_scale_buffer: *const RawRuntimeBuffer,
+        up_scale_count: usize, up_group_size: usize, up_tensor_scale: f32, up_row_scale_count: usize,
+        input_buffer: *const RawRuntimeBuffer, rows: usize, cols: usize, output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_aq4_matvec_gate_beta_f32(
         a_index_buffer: *const RawRuntimeBuffer,
         a_scale_buffer: *const RawRuntimeBuffer,
@@ -3604,6 +3615,48 @@ pub fn aq4_matvec_silu_mul_wide_load_prototype_f32(
     if let Some(buffer) = up_row_scale { check_copy_range(0, up_row_scale_count * 4, buffer.size()?)?; }
     let stream_raw = stream.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr());
     status_to_result(unsafe { ullm_runtime_aq4_matvec_silu_mul_wide_load_prototype_f32(
+        gate_index.raw.as_ptr(), gate_scale.raw.as_ptr(), gate_codebook.raw.as_ptr(), gate_scale_values.raw.as_ptr(), gate_row_scale.map_or(std::ptr::null_mut(), |v| v.raw.as_ptr()), gate_scale_count, gate_group_size, gate_tensor_scale, gate_row_scale_count,
+        up_index.raw.as_ptr(), up_scale.raw.as_ptr(), up_codebook.raw.as_ptr(), up_scale_values.raw.as_ptr(), up_row_scale.map_or(std::ptr::null_mut(), |v| v.raw.as_ptr()), up_scale_count, up_group_size, up_tensor_scale, up_row_scale_count,
+        input.raw.as_ptr(), rows, cols, output.raw.as_ptr(), stream_raw,
+    ) })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Direct-only gfx1201 fused M=1 SiLU-mul experiment with scalar packed loads and wave32 reductions.
+pub fn aq4_matvec_silu_mul_shuffle_prototype_f32(
+    gate_index: &RuntimeBuffer, gate_scale: &RuntimeBuffer, gate_codebook: &RuntimeBuffer,
+    gate_scale_values: &RuntimeBuffer, gate_row_scale: Option<&RuntimeBuffer>, gate_scale_count: usize,
+    gate_group_size: usize, gate_tensor_scale: f32, gate_row_scale_count: usize,
+    up_index: &RuntimeBuffer, up_scale: &RuntimeBuffer, up_codebook: &RuntimeBuffer,
+    up_scale_values: &RuntimeBuffer, up_row_scale: Option<&RuntimeBuffer>, up_scale_count: usize,
+    up_group_size: usize, up_tensor_scale: f32, up_row_scale_count: usize,
+    input: &RuntimeBuffer, rows: usize, cols: usize, output: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if !matches!(gate_group_size, 8 | 16) || !matches!(up_group_size, 8 | 16)
+        || rows == 0 || cols == 0 || !cols.is_multiple_of(32) || gate_scale_count == 0 || up_scale_count == 0
+        || !gate_tensor_scale.is_finite() || gate_tensor_scale <= 0.0
+        || !up_tensor_scale.is_finite() || up_tensor_scale <= 0.0
+        || gate_row_scale_count > rows || up_row_scale_count > rows {
+        return Err("AQ4 shuffle fused SiLU-mul requires nonzero group8/group16 matrices with cols divisible by 32".into());
+    }
+    if (gate_row_scale_count != 0 && gate_row_scale.is_none())
+        || (up_row_scale_count != 0 && up_row_scale.is_none()) {
+        return Err("AQ4 shuffle fused SiLU-mul row_scale_count requires its row-scale buffer".into());
+    }
+    let elements = rows.checked_mul(cols).ok_or("AQ4 shuffle fused SiLU-mul element count overflows")?;
+    let bytes = elements / 2;
+    let input_bytes = cols.checked_mul(4).ok_or("AQ4 shuffle fused SiLU-mul input bytes overflow")?;
+    let output_bytes = rows.checked_mul(4).ok_or("AQ4 shuffle fused SiLU-mul output bytes overflow")?;
+    for buffer in [gate_index, up_index] { check_copy_range(0, bytes, buffer.size()?)?; }
+    for (buffer, groups) in [(gate_scale, elements / gate_group_size), (up_scale, elements / up_group_size)] { check_copy_range(0, groups, buffer.size()?)?; }
+    for (buffer, count) in [(gate_codebook, 16usize), (up_codebook, 16usize)] { check_copy_range(0, count * 4, buffer.size()?)?; }
+    check_copy_range(0, gate_scale_count * 4, gate_scale_values.size()?)?; check_copy_range(0, up_scale_count * 4, up_scale_values.size()?)?;
+    check_copy_range(0, input_bytes, input.size()?)?; check_copy_range(0, output_bytes, output.size()?)?;
+    if let Some(buffer) = gate_row_scale { check_copy_range(0, gate_row_scale_count * 4, buffer.size()?)?; }
+    if let Some(buffer) = up_row_scale { check_copy_range(0, up_row_scale_count * 4, buffer.size()?)?; }
+    let stream_raw = stream.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr());
+    status_to_result(unsafe { ullm_runtime_aq4_matvec_silu_mul_shuffle_prototype_f32(
         gate_index.raw.as_ptr(), gate_scale.raw.as_ptr(), gate_codebook.raw.as_ptr(), gate_scale_values.raw.as_ptr(), gate_row_scale.map_or(std::ptr::null_mut(), |v| v.raw.as_ptr()), gate_scale_count, gate_group_size, gate_tensor_scale, gate_row_scale_count,
         up_index.raw.as_ptr(), up_scale.raw.as_ptr(), up_codebook.raw.as_ptr(), up_scale_values.raw.as_ptr(), up_row_scale.map_or(std::ptr::null_mut(), |v| v.raw.as_ptr()), up_scale_count, up_group_size, up_tensor_scale, up_row_scale_count,
         input.raw.as_ptr(), rows, cols, output.raw.as_ptr(), stream_raw,

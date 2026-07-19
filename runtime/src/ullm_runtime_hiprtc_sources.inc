@@ -760,6 +760,18 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_silu_mul_wide_load_prototype_kernel_source();
     }
 
+    // Direct-only gfx1201 experiment.  It retains the production scalar packed-byte traversal and
+    // changes only the two independent per-row reductions from LDS trees to wave32 shuffles.
+    static std::string aq4_matvec_silu_mul_shuffle_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   8u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_SILU_MUL_RPB") +
+               aq4_matvec_silu_mul_shuffle_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_gate_beta_kernel_source_for_arch(const std::string &arch) {
         return aq4_rows_per_block_preamble(arch, "ULLM_AQ4_MATVEC_RPB") +
                aq4_matvec_gate_beta_kernel_source();
@@ -4585,6 +4597,7 @@ __device__ float ullm_aq4_matvec_thread_sum(
             sum += raw_sum * scale_values[scale_index] * tensor_scale;
         }
     }
+
     return sum;
 }
 __device__ void ullm_aq4_matvec_silu_mul_thread_sums(
@@ -4629,6 +4642,51 @@ __device__ void ullm_aq4_matvec_silu_mul_thread_sums(
     *gate_sum_output = gate_sum; *up_sum_output = up_sum;
 }
 )" + production;
+    }
+
+    static std::string aq4_matvec_silu_mul_shuffle_prototype_kernel_source() {
+        std::string prototype = aq4_matvec_silu_mul_kernel_source();
+        const std::string production_name = "ullm_aq4_matvec_silu_mul_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(name_offset, production_name.size(),
+            "ullm_aq4_matvec_silu_mul_shuffle_prototype_f32_kernel");
+        const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float gate_partial[256];
+    __shared__ float up_partial[256];
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;)";
+        const std::string shuffle_setup = R"(    // RPB=8 maps each row's contiguous 32 threads to one gfx1201 wave32.
+    // Gate and up keep independent accumulators, but neither needs cross-wave/LDS reduction.
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;)";
+        const size_t setup_offset = prototype.find(lds_setup);
+        if (setup_offset == std::string::npos) return "";
+        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+        const std::string lds_tree = R"(    gate_partial[tid] = gate_sum;
+    up_partial[tid] = up_sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            gate_partial[partial_offset + lane] += gate_partial[partial_offset + lane + offset];
+            up_partial[partial_offset + lane] += up_partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && row < rows) {
+        float gate_value = gate_partial[partial_offset];
+        float up_value = up_partial[partial_offset];)";
+        const std::string shuffle_reduction = R"(    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        gate_sum += __shfl_down(gate_sum, offset, threads_per_row);
+        up_sum += __shfl_down(up_sum, offset, threads_per_row);
+    }
+    if (lane == 0 && row < rows) {
+        float gate_value = gate_sum;
+        float up_value = up_sum;)";
+        const size_t tree_offset = prototype.find(lds_tree);
+        if (tree_offset == std::string::npos) return "";
+        prototype.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+        return prototype;
     }
 
     static const char *aq4_matvec_gate_beta_kernel_source() {
