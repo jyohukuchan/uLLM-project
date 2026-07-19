@@ -34,6 +34,7 @@ pub const QWEN35_AQ4_REQUIRED_HIP_KERNEL_ENV: &[&str] = &[
     "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
+    "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_PAIR_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_TRIPLE_KERNEL",
@@ -436,6 +437,7 @@ mod tests {
             RuntimeFeature::HipAq4RegisterBm8Group8,
             RuntimeFeature::HipAq4GemmWmma,
             RuntimeFeature::HipAq4GemmWmmaGroup8,
+            RuntimeFeature::HipAq4GemmWmmaRaggedM,
         ] {
             assert!(unique.contains(runtime_feature_environment(feature)));
         }

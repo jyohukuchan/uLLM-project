@@ -55,7 +55,7 @@ const MAX_IDENTITY_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const EMBEDDED_BUILD_GIT_COMMIT: Option<&str> = option_env!("ULLM_BUILD_GIT_COMMIT");
 /// Complete fail-closed environment for the fixed Phase 3c full-model M=1 trace.
 ///
-/// The first nine entries guard the layer-0 linear-attention M=1 execution path. The next four
+/// The first nine entries guard the layer-0 linear-attention M=1 execution path. The next five
 /// are normal production *model-load* prerequisites: every AQ4 resident matrix eagerly resolves
 /// its M=2..=128 batch-plan cache, and gfx1201 uses Register-BM8/WMMA descriptors for group16
 /// and group8 matrices at their eligible widths.
@@ -64,7 +64,7 @@ const EMBEDDED_BUILD_GIT_COMMIT: Option<&str> = option_env!("ULLM_BUILD_GIT_COMM
 /// layers. The final two cover the package's BF16 embedding gather and full-logit top-1 selection.
 /// Keep this intentionally narrower than the worker's all-profile environment: enabling unrelated
 /// guards can add probes or change dispatch outside this trace's fixed M=1 path.
-const REQUIRED_PHASE3C_TRACE_ENV: [&str; 20] = [
+const REQUIRED_PHASE3C_TRACE_ENV: [&str; 21] = [
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_BATCH_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL",
@@ -78,6 +78,7 @@ const REQUIRED_PHASE3C_TRACE_ENV: [&str; 20] = [
     "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
+    "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
     "ULLM_REQUIRE_HIP_PAGED_DECODE_ATTN_KERNEL",
     "ULLM_REQUIRE_HIP_QWEN35_QK_NORM_ROPE_PAGED_KV_WRITE_KERNEL",
     "ULLM_REQUIRE_HIP_PAGED_KV_WRITE_CHUNK_KERNEL",
@@ -1825,8 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn phase3c_trace_guard_requires_group16_and_group8_wmma_aq4_paths_for_normal_m1_model_loading()
-    {
+    fn phase3c_trace_guard_requires_all_wmma_aq4_paths_for_normal_m1_model_loading() {
         assert_eq!(
             &REQUIRED_PHASE3C_TRACE_ENV[..QWEN35_AQ4_M1_LINEAR_STAGE_REQUIRED_ENV.len()],
             &QWEN35_AQ4_M1_LINEAR_STAGE_REQUIRED_ENV,
@@ -1847,6 +1847,10 @@ mod tests {
             REQUIRED_PHASE3C_TRACE_ENV[QWEN35_AQ4_M1_LINEAR_STAGE_REQUIRED_ENV.len() + 3],
             "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
         );
+        assert_eq!(
+            REQUIRED_PHASE3C_TRACE_ENV[QWEN35_AQ4_M1_LINEAR_STAGE_REQUIRED_ENV.len() + 4],
+            "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
+        );
         assert!(
             !DISALLOWED_PHASE3C_TRACE_ENV.contains(&"ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_KERNEL"),
             "the normal full-model loader eagerly admits its M=8..=128 AQ4 batch plans"
@@ -1863,6 +1867,11 @@ mod tests {
         assert!(
             !DISALLOWED_PHASE3C_TRACE_ENV.contains(&"ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL"),
             "the normal full-model loader eagerly admits its M=128 group8 AQ4 WMMA batch plans"
+        );
+        assert!(
+            !DISALLOWED_PHASE3C_TRACE_ENV
+                .contains(&"ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL"),
+            "the normal full-model loader eagerly admits its M=65..=127 AQ4 WMMA batch plans"
         );
     }
 
