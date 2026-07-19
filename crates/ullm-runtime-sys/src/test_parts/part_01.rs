@@ -1879,12 +1879,12 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_DIFFERENTIAL=1"]
-    fn hip_aq4_wmma_prototype_v3_m128_group16_model_shapes_match_cpu_when_enabled() {
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_DIFFERENTIAL=1"]
+    fn hip_aq4_wmma_prototype_v4_m128_group16_model_shapes_match_cpu_when_enabled() {
         assert_eq!(
-            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_DIFFERENTIAL").as_deref(),
+            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_DIFFERENTIAL").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_DIFFERENTIAL=1 before running this GPU differential test"
+            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_DIFFERENTIAL=1 before running this GPU differential test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -2070,7 +2070,7 @@
                         .unwrap();
                 }
                 hip_stream.synchronize().unwrap();
-                aq4_matvec_batch_wmma_prototype_v3_f32(
+                aq4_matvec_batch_wmma_prototype_v4_f32(
                     &hip_index,
                     &hip_scale,
                     &hip_codebook,
@@ -2111,12 +2111,12 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_TIMING=1"]
-    fn hip_aq4_wmma_prototype_v3_m128_group16_model_shapes_timing_vs_wmma_prototype_when_enabled() {
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_TIMING=1"]
+    fn hip_aq4_wmma_prototype_v4_m128_group16_model_shapes_timing_vs_wmma_prototype_when_enabled() {
         assert_eq!(
-            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_TIMING").as_deref(),
+            std::env::var("ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_TIMING").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_V3_TIMING=1 before running this GPU timing test"
+            "set ULLM_RUN_AQ4_WMMA_PROTOTYPE_V4_TIMING=1 before running this GPU timing test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -2240,7 +2240,7 @@
             }
             hip_stream.synchronize().unwrap();
             for _ in 0..WARMUP_ITERATIONS {
-                aq4_matvec_batch_wmma_prototype_v3_f32(
+                aq4_matvec_batch_wmma_prototype_v4_f32(
                     &hip_index,
                     &hip_scale,
                     &hip_codebook,
@@ -2287,7 +2287,7 @@
 
             let v3_started = std::time::Instant::now();
             for _ in 0..TIMED_ITERATIONS {
-                aq4_matvec_batch_wmma_prototype_v3_f32(
+                aq4_matvec_batch_wmma_prototype_v4_f32(
                     &hip_index,
                     &hip_scale,
                     &hip_codebook,
