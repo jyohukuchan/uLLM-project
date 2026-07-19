@@ -5789,6 +5789,16 @@ bool aq4_matvec_add_f32_hip_kernel(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream,
     std::string *error) {
+    // The promoted body consumes one aligned uint4 (32 AQ4 elements) at a time. Preserve the
+    // established generic-shape API contract through the caller's staging fallback; production
+    // Qwen3.5 residual projections are all group8/group16 with complete 32-element chunks.
+    if ((group_size != 8u && group_size != 16u) || cols % 32u != 0u) {
+        if (error != nullptr) {
+            *error =
+                "AQ4 matvec add wide-load HIP kernel requires group8/group16 and cols divisible by 32";
+        }
+        return false;
+    }
     const int device_id = index_buffer->hip_device_id;
     void *function = hip_aq4_matvec_add_kernel_cache().function_for_device(device_id, error);
     if (function == nullptr) {

@@ -9,9 +9,8 @@ fn aq4_matvec_add_wide_load_gpu_device() -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn aq4_matvec_add_wide_load_run(
+fn aq4_matvec_add_production_run(
     device: u32,
-    wide_load: bool,
     indices: &[u8],
     scale_indices: &[u8],
     codebook: &[f32],
@@ -54,45 +53,24 @@ fn aq4_matvec_add_wide_load_run(
             .unwrap();
     }
     let row_scale_count = row_scales.map_or(0, <[f32]>::len);
-    if wide_load {
-        aq4_matvec_add_wide_load_prototype_f32(
-            &index,
-            &scale,
-            &codebook_buffer,
-            &scale_values_buffer,
-            &input_buffer,
-            &residual_buffer,
-            row_scale_buffer.as_ref(),
-            scale_values.len(),
-            group_size,
-            tensor_scale,
-            row_scale_count,
-            rows,
-            cols,
-            &mut output,
-            Some(&mut stream),
-        )
-        .unwrap();
-    } else {
-        aq4_matvec_add_f32(
-            &index,
-            &scale,
-            &codebook_buffer,
-            &scale_values_buffer,
-            &input_buffer,
-            &residual_buffer,
-            row_scale_buffer.as_ref(),
-            scale_values.len(),
-            group_size,
-            tensor_scale,
-            row_scale_count,
-            rows,
-            cols,
-            &mut output,
-            Some(&mut stream),
-        )
-        .unwrap();
-    }
+    aq4_matvec_add_f32(
+        &index,
+        &scale,
+        &codebook_buffer,
+        &scale_values_buffer,
+        &input_buffer,
+        &residual_buffer,
+        row_scale_buffer.as_ref(),
+        scale_values.len(),
+        group_size,
+        tensor_scale,
+        row_scale_count,
+        rows,
+        cols,
+        &mut output,
+        Some(&mut stream),
+    )
+    .unwrap();
     stream.synchronize().unwrap();
     let mut output_bytes = vec![0; rows * 4];
     output
@@ -103,17 +81,19 @@ fn aq4_matvec_add_wide_load_run(
 }
 
 #[test]
-#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_ADD_WIDE_LOAD_DIFFERENTIAL=1"]
-fn hip_aq4_matvec_add_wide_load_prototype_matches_cpu_for_production_shapes_when_enabled() {
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_ADD_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_aq4_matvec_add_production_model_shapes_match_cpu_when_enabled() {
     assert_eq!(
-        std::env::var("ULLM_RUN_AQ4_MATVEC_ADD_WIDE_LOAD_DIFFERENTIAL").as_deref(),
+        std::env::var("ULLM_RUN_AQ4_MATVEC_ADD_PRODUCTION_DIFFERENTIAL").as_deref(),
         Ok("1"),
-        "set ULLM_RUN_AQ4_MATVEC_ADD_WIDE_LOAD_DIFFERENTIAL=1 before running this GPU differential test"
+        "set ULLM_RUN_AQ4_MATVEC_ADD_PRODUCTION_DIFFERENTIAL=1 before running this GPU differential test"
     );
     let hip_device = aq4_matvec_add_wide_load_gpu_device();
     let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL", Some("1"));
     let mut state = 0x510e_527f_u32;
     let mut next = || {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -141,9 +121,8 @@ fn hip_aq4_matvec_add_wide_load_prototype_matches_cpu_for_production_shapes_when
                 .map(|_| 0.75 + next() * 0.5)
                 .collect::<Vec<f32>>()
         });
-        let expected = aq4_matvec_add_wide_load_run(
+        let expected = aq4_matvec_add_production_run(
             0,
-            false,
             &indices,
             &scale_indices,
             &codebook,
@@ -156,9 +135,8 @@ fn hip_aq4_matvec_add_wide_load_prototype_matches_cpu_for_production_shapes_when
             rows,
             cols,
         );
-        let actual = aq4_matvec_add_wide_load_run(
+        let actual = aq4_matvec_add_production_run(
             hip_device,
-            true,
             &indices,
             &scale_indices,
             &codebook,
@@ -173,14 +151,14 @@ fn hip_aq4_matvec_add_wide_load_prototype_matches_cpu_for_production_shapes_when
         );
         assert_f32s_close(&actual, &expected, 1e-3);
         eprintln!(
-            "AQ4 matvec-add wide-load differential family={family} rows={rows} cols={cols} group{group_size}: ok"
+            "AQ4 matvec-add production differential family={family} rows={rows} cols={cols} group{group_size}: ok"
         );
     }
 }
 
 #[test]
 #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_ADD_WIDE_LOAD_TIMING=1"]
-fn hip_aq4_matvec_add_wide_load_prototype_timing_vs_scalar_for_production_shapes_when_enabled() {
+fn hip_aq4_matvec_add_wide_load_prototype_timing_vs_production_for_production_shapes_when_enabled() {
     assert_eq!(
         std::env::var("ULLM_RUN_AQ4_MATVEC_ADD_WIDE_LOAD_TIMING").as_deref(),
         Ok("1")
@@ -241,18 +219,18 @@ fn hip_aq4_matvec_add_wide_load_prototype_timing_vs_scalar_for_production_shapes
             aq4_matvec_add_f32(&index, &scale, &codebook, &scale_values, &input, &residual, row_scales.as_ref(), 1, group_size, 0.75, row_scale_count, rows, cols, &mut output, Some(&mut stream)).unwrap();
         }
         stream.synchronize().unwrap();
-        let scalar_ms = started.elapsed().as_secs_f64() * 50.0;
+        let production_ms = started.elapsed().as_secs_f64() * 50.0;
         let started = std::time::Instant::now();
         for _ in 0..20 {
             aq4_matvec_add_wide_load_prototype_f32(&index, &scale, &codebook, &scale_values, &input, &residual, row_scales.as_ref(), 1, group_size, 0.75, row_scale_count, rows, cols, &mut output, Some(&mut stream)).unwrap();
         }
         stream.synchronize().unwrap();
         let wide_ms = started.elapsed().as_secs_f64() * 50.0;
-        assert!(scalar_ms.is_finite() && scalar_ms > 0.0);
+        assert!(production_ms.is_finite() && production_ms > 0.0);
         assert!(wide_ms.is_finite() && wide_ms > 0.0);
         eprintln!(
-            "AQ4 matvec-add wide-load timing family={family} rows={rows} cols={cols} group{group_size}: scalar={scalar_ms:.3} ms, wide={wide_ms:.3} ms, speedup={:.3}x",
-            scalar_ms / wide_ms
+            "AQ4 matvec-add wide-load timing family={family} rows={rows} cols={cols} group{group_size}: production={production_ms:.3} ms, wide={wide_ms:.3} ms, speedup={:.3}x",
+            production_ms / wide_ms
         );
     }
 }

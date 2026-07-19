@@ -2796,7 +2796,10 @@ extern "C" __global__ void ullm_aq4_matvec_top1_f32_kernel(
 )";
     }
 
-    static const char *aq4_matvec_add_kernel_source() {
+    // Superseded scalar AQ4 matvec-add reference. It is deliberately not passed to HIPRTC:
+    // production keeps the same entry-point ABI but uses the validated wide-load body below.
+    // Retain this source for controlled rollback comparisons.
+    [[maybe_unused]] static const char *aq4_matvec_add_scalar_reference_kernel_source() {
         return R"(
 __device__ float ullm_aq4_matvec_add_thread_sum(
     const unsigned char *indices,
@@ -2936,9 +2939,11 @@ extern "C" __global__ void ullm_aq4_matvec_add_f32_kernel(
 )";
     }
 
-    static const char *aq4_matvec_add_wide_load_prototype_kernel_source() {
+    // Production AQ4 matvec-add body. The host ABI and HIPRTC entry-point name remain unchanged,
+    // so package resident decode continues through its existing direct aq4_matvec_add_f32 dispatch.
+    static const char *aq4_matvec_add_kernel_source() {
         return R"(
-extern "C" __global__ void ullm_aq4_matvec_add_wide_load_prototype_f32_kernel(
+extern "C" __global__ void ullm_aq4_matvec_add_f32_kernel(
     const unsigned char *indices,
     const unsigned char *scale_indices,
     const float *codebook,
@@ -2970,8 +2975,9 @@ extern "C" __global__ void ullm_aq4_matvec_add_wide_load_prototype_f32_kernel(
         const unsigned long long row_byte_offset = row_offset >> 1;
         const unsigned long long chunks_per_row = cols / 32ull;
         const unsigned long long groups_per_row = cols / group_size;
-        // This direct-only ABI admits complete, aligned 32-element chunks only. Each scoped
-        // uint4 supplies 16 packed bytes: four group8s or two group16s for this one stream.
+        // Validated Qwen3.5 AQ4 matvec-add geometries have group8/group16 and complete,
+        // aligned 32-element chunks. Each scoped uint4 supplies 16 packed bytes: four group8s
+        // or two group16s for this one stream.
         for (unsigned long long chunk = lane; chunk < chunks_per_row;
              chunk += threads_per_row) {
             const uint4 packed = *reinterpret_cast<const uint4 *>(
@@ -3033,6 +3039,22 @@ extern "C" __global__ void ullm_aq4_matvec_add_wide_load_prototype_f32_kernel(
     }
 }
 )";
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string aq4_matvec_add_wide_load_prototype_kernel_source() {
+        std::string source = aq4_matvec_add_kernel_source();
+        constexpr const char production_name[] = "ullm_aq4_matvec_add_f32_kernel";
+        const size_t name_offset = source.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(
+            name_offset,
+            sizeof(production_name) - 1u,
+            "ullm_aq4_matvec_add_wide_load_prototype_f32_kernel");
+        return source;
     }
 
     static const char *aq4_matvec_pair_kernel_source() {
