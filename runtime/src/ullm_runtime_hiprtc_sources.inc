@@ -720,12 +720,15 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
 
     static std::string aq4_matvec_qkv_z_gate_beta_kernel_source_for_arch(
         const std::string &arch) {
-        return aq4_fused_rows_per_block_preamble(
-                   arch,
-                   4u,
-                   2u,
-                   "ULLM_AQ4_MATVEC_QKV_Z_GATE_BETA_RPB") +
-               aq4_matvec_qkv_z_gate_beta_kernel_source();
+        const unsigned int rows_per_block = aq4_fused_rows_per_block_for_arch(
+            arch,
+            4u,
+            2u,
+            "ULLM_AQ4_MATVEC_QKV_Z_GATE_BETA_RPB");
+        const bool use_gfx1201_shuffle = arch == "gfx1201" && rows_per_block == 4u;
+        return aq4_rows_per_block_preamble_for_rows(rows_per_block) +
+               (use_gfx1201_shuffle ? aq4_matvec_qkv_z_gate_beta_kernel_source()
+                                    : aq4_matvec_qkv_z_gate_beta_scalar_reference_kernel_source());
     }
 
     // Direct-only M=1 experiment. Keep the production fused body intact: this source replaces
@@ -3788,7 +3791,11 @@ extern "C" __global__ void ullm_aq4_matvec_triple_f32_kernel(
 )";
     }
 
-    static const char *aq4_matvec_qkv_z_gate_beta_kernel_source() {
+    // Superseded scalar-reduction AQ4 qkv/z gate/beta reference. It is deliberately not passed
+    // to HIPRTC for the validated gfx1201 RPB=4 geometry: production keeps the same entry-point
+    // ABI but uses the wave32 shuffle reduction below. Retain this source for controlled rollback
+    // comparisons and for generic HIPRTC compilations outside that validated geometry.
+    [[maybe_unused]] static const char *aq4_matvec_qkv_z_gate_beta_scalar_reference_kernel_source() {
         return R"(
 __device__ float ullm_aq4_qkv_z_gate_beta_thread_sum(
     const unsigned char *indices,
@@ -4182,7 +4189,7 @@ extern "C" __global__ void ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel(
     }
 
     static std::string aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_source() {
-        std::string production = aq4_matvec_qkv_z_gate_beta_kernel_source();
+        std::string production = aq4_matvec_qkv_z_gate_beta_scalar_reference_kernel_source();
         const size_t kernel_offset = production.find("extern \"C\" __global__ void");
         if (kernel_offset == std::string::npos) {
             return "";
@@ -4289,13 +4296,10 @@ __device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
 )" + production;
     }
 
-    static std::string aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source() {
-        std::string prototype = aq4_matvec_qkv_z_gate_beta_kernel_source();
-        const std::string production_name = "ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel";
-        const size_t name_offset = prototype.find(production_name);
-        if (name_offset == std::string::npos) return "";
-        prototype.replace(name_offset, production_name.size(),
-            "ullm_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32_kernel");
+    // Production AQ4 qkv/z gate/beta body. The host ABI and HIPRTC entry-point name remain
+    // unchanged, so package resident decode continues through its existing fused dispatch.
+    static std::string aq4_matvec_qkv_z_gate_beta_kernel_source() {
+        std::string production = aq4_matvec_qkv_z_gate_beta_scalar_reference_kernel_source();
 
         const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
     __shared__ float primary_partial[256];
@@ -4312,9 +4316,9 @@ __device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
     __shared__ float secondary_wave_partial[8];
     float primary_sum = 0.0f;
     float secondary_sum = 0.0f;)";
-        const size_t setup_offset = prototype.find(lds_setup);
+        const size_t setup_offset = production.find(lds_setup);
         if (setup_offset == std::string::npos) return "";
-        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+        production.replace(setup_offset, lds_setup.size(), shuffle_setup);
 
         const std::string lds_tree = R"(    primary_partial[tid] = primary_sum;
     secondary_partial[tid] = secondary_sum;
@@ -4343,25 +4347,37 @@ __device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
     if (lane == 0 && logical_row < total_rows) {
         float value = primary_wave_partial[row_in_block * 2u] +
             primary_wave_partial[row_in_block * 2u + 1u];)";
-        const size_t tree_offset = prototype.find(lds_tree);
+        const size_t tree_offset = production.find(lds_tree);
         if (tree_offset == std::string::npos) return "";
-        prototype.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+        production.replace(tree_offset, lds_tree.size(), shuffle_reduction);
 
         const std::string secondary_value = "float z_value = secondary_partial[partial_offset];";
         const std::string secondary_wave_value =
             "float z_value = secondary_wave_partial[row_in_block * 2u] + "
             "secondary_wave_partial[row_in_block * 2u + 1u];";
-        const size_t z_value_offset = prototype.find(secondary_value);
+        const size_t z_value_offset = production.find(secondary_value);
         if (z_value_offset == std::string::npos) return "";
-        prototype.replace(z_value_offset, secondary_value.size(), secondary_wave_value);
+        production.replace(z_value_offset, secondary_value.size(), secondary_wave_value);
 
         const std::string b_value = "float b_value = secondary_partial[partial_offset];";
         const std::string secondary_b_value =
             "float b_value = secondary_wave_partial[row_in_block * 2u] + "
             "secondary_wave_partial[row_in_block * 2u + 1u];";
-        const size_t b_value_offset = prototype.find(b_value);
+        const size_t b_value_offset = production.find(b_value);
         if (b_value_offset == std::string::npos) return "";
-        prototype.replace(b_value_offset, b_value.size(), secondary_b_value);
+        production.replace(b_value_offset, b_value.size(), secondary_b_value);
+        return production;
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source() {
+        std::string prototype = aq4_matvec_qkv_z_gate_beta_kernel_source();
+        const std::string production_name = "ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(name_offset, production_name.size(),
+            "ullm_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32_kernel");
         return prototype;
     }
 

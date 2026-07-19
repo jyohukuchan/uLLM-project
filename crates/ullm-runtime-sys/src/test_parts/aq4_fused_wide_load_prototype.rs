@@ -362,10 +362,17 @@ fn hip_aq4_fused_wide_load_prototypes_timing_vs_production() {
 }
 
 #[test]
-#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_DIFFERENTIAL=1"]
-fn hip_aq4_qkv_z_gate_beta_shuffle_prototype_matches_cpu_for_production_shapes() {
-    assert_eq!(std::env::var("ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_DIFFERENTIAL").as_deref(), Ok("1"));
-    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_QKV_Z_GATE_BETA_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_aq4_qkv_z_gate_beta_production_matches_cpu_for_production_shapes() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_AQ4_QKV_Z_GATE_BETA_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1")
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_AQ4_MATVEC_QKV_Z_GATE_BETA_KERNEL", Some("1"));
     let gpu = aq4_fused_wide_load_gpu_device();
     let mut state = 0x3c6e_f372;
     // Qwen3.5-9B linear-attention decode: QKV=[8192,4096], Z=[4096,4096], A/B=[32,4096].
@@ -374,8 +381,16 @@ fn hip_aq4_qkv_z_gate_beta_shuffle_prototype_matches_cpu_for_production_shapes()
     let input: Vec<f32> = (0..4_096).map(|_| { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
     let a_log = vec![0.25; 32]; let dt_bias = vec![-0.125; 32];
     let expected = aq4_fused_wide_load_run_qkv(0, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
-    let actual = aq4_fused_wide_load_run_qkv(gpu, 2, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
-    for (label, actual, expected) in [("shuffle qkv", &actual.0, &expected.0), ("shuffle z", &actual.1, &expected.1), ("shuffle gate", &actual.2, &expected.2), ("shuffle beta", &actual.3, &expected.3)] { aq4_fused_wide_load_assert_matches_cpu(actual, expected, label); }
+    let actual =
+        aq4_fused_wide_load_run_qkv(gpu, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
+    for (label, actual, expected) in [
+        ("production qkv", &actual.0, &expected.0),
+        ("production z", &actual.1, &expected.1),
+        ("production gate", &actual.2, &expected.2),
+        ("production beta", &actual.3, &expected.3),
+    ] {
+        aq4_fused_wide_load_assert_matches_cpu(actual, expected, label);
+    }
 }
 
 #[test]
