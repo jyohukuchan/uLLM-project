@@ -786,11 +786,20 @@ struct ActiveCalibrationReplay {
     observed_nonce: Option<u64>,
 }
 
+const PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128: &str =
+    "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128";
+const PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127: &str =
+    "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m127";
+const PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128: &str =
+    "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128";
+
 /// Compares one runtime implementation with the canonical load-time contract entry.
 ///
 /// Split paged-decode readers are typed alternates of their matching single-reader family. No
-/// writer, chunk reader, linear-attention operation, unknown id, or plain/gated cross-family
-/// substitution is accepted.
+/// writer, unrelated reader, linear-attention operation, unknown id, or plain/gated cross-family
+/// substitution is accepted. The gated M=2..=128 chunk reader additionally admits its exact
+/// gfx1201 M=127 scalar and M=128 WMMA alternatives. The load-time contract intentionally keeps
+/// the generic M=2..=128 id; the exact prefill width is known only at dispatch time.
 fn operation_implementation_matches_contract(expected: &str, actual: &str) -> bool {
     if expected == actual {
         return EXECUTION_IMPLEMENTATIONS
@@ -808,11 +817,15 @@ fn operation_implementation_matches_contract(expected: &str, actual: &str) -> bo
             "hip.paged-decode-attention-split-sigmoid-gate-f32.tile128"
                 | "hip.paged-decode-attention-split-sigmoid-gate-f32.tile256"
         ),
+        PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128 => {
+            actual == PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127
+                || actual == PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128
+        }
         _ => false,
     }
 }
 
-const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 14] = [
+const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 16] = [
     (
         "linear_attention_qkv_prepare",
         "hip.linear-attention-qkv-prepare-f32.m1",
@@ -845,7 +858,7 @@ const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 14] = [
     ("paged_kv_write", "hip.paged-kv-write-chunk-f32.m2-m128"),
     (
         "paged_causal_gqa_read",
-        "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128",
+        PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128,
     ),
     (
         "paged_causal_gqa_read",
@@ -862,6 +875,14 @@ const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 14] = [
     (
         "paged_causal_gqa_read",
         "hip.paged-decode-attention-split-sigmoid-gate-f32.tile256",
+    ),
+    (
+        "paged_causal_gqa_read",
+        PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127,
+    ),
+    (
+        "paged_causal_gqa_read",
+        PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128,
     ),
 ];
 
@@ -885,7 +906,7 @@ struct OperationAuditAccumulator {
     prefill_tokens_executed: u64,
     prefill_tokens_committed: u64,
     prefill_width_histogram: Vec<u64>,
-    implementation_counts: [u64; 14],
+    implementation_counts: [u64; 16],
     digest: Sha256,
 }
 
@@ -902,7 +923,7 @@ impl OperationAuditAccumulator {
             prefill_tokens_executed: 0,
             prefill_tokens_committed: 0,
             prefill_width_histogram: vec![0; QWEN35_AQ4_MAX_PREFILL_CHUNK + 1],
-            implementation_counts: [0; 14],
+            implementation_counts: [0; 16],
             digest: Sha256::new(),
         }
     }
@@ -3010,6 +3031,74 @@ mod tests {
         assert!(!operation_implementation_matches_contract(
             "unknown", "unknown"
         ));
+    }
+
+    #[test]
+    fn prefill_audit_accepts_every_promoted_gated_chunk_reader_alternate() {
+        // The M=1 load-time contract remaps self-attention prefill to the generic chunk-reader
+        // id. At runtime, gfx1201's WMMA-enabled registry narrows the scalar fallback to M=127
+        // and resolves M=128 to WMMA. Exercise both full 32-layer traces here so either omitted
+        // audit entry fails without requiring a GPU or a model package.
+        for (execution_width, reader_implementation) in [
+            (127, PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127),
+            (128, PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128),
+        ] {
+            assert!(
+                EXECUTION_IMPLEMENTATIONS
+                    .iter()
+                    .any(|(_, implementation_id)| *implementation_id == reader_implementation)
+            );
+            assert!(operation_implementation_matches_contract(
+                PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128,
+                reader_implementation
+            ));
+
+            let contract = audited_contract();
+            let native_contract = native_hybrid_contract(execution_width);
+            let invocations = audited_records(&native_contract, ExecutionPhase::ColdPrefill)
+                .into_iter()
+                .enumerate()
+                .map(|(layer_index, mut records)| {
+                    if layer_index % 4 == 3 {
+                        records[1].implementation_id = reader_implementation;
+                    }
+                    Qwen35PrefillExecutionStep {
+                        layer_index,
+                        execution_width,
+                        phase: ExecutionPhase::ColdPrefill,
+                        records,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut audit = OperationAuditAccumulator::new();
+            let observation = audit
+                .observe_prefill_chunk(
+                    ExecutionPhase::ColdPrefill,
+                    execution_width,
+                    &contract,
+                    &invocations,
+                )
+                .unwrap();
+            assert_eq!(observation.actual_token_batch_width, execution_width);
+            assert_eq!(audit.total_records, 64);
+            let reader_slot = EXECUTION_IMPLEMENTATIONS
+                .iter()
+                .position(|(_, implementation_id)| *implementation_id == reader_implementation)
+                .unwrap();
+            assert_eq!(audit.implementation_counts[reader_slot], 8);
+        }
+
+        for rejected in [
+            "hip.paged-causal-gqa-chunk-f32.m2-m128",
+            "hip.paged-decode-attention-split-sigmoid-gate-f32.tile128",
+            "hip.aq4-gemm-wmma-f32.gfx1201.group16.m128",
+        ] {
+            assert!(!operation_implementation_matches_contract(
+                PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128,
+                rejected
+            ));
+        }
     }
 
     #[test]
