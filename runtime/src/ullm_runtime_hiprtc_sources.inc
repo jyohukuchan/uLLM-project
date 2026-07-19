@@ -1703,6 +1703,112 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
         return source;
     }
 
+    // Experimental ragged-M variant of the group16 WMMA kernel.  This deliberately starts from
+    // the v2 source rather than the production direct-output v4 transformation: rocWMMA's direct
+    // store_matrix_sync cannot be guarded per batch row.  Keeping v2's 8 KiB output LDS tile lets
+    // the final scalar store skip invalid rows, while preserving the proven two-stage Wide-K
+    // input/weight pipeline unchanged.  It is a separate source/module from production.
+    static std::string aq4_matvec_wmma_ragged_m_prototype_kernel_source() {
+        std::string source(aq4_matvec_wmma_prototype_v2_reference_kernel_source());
+        const auto replace_once = [&source](const char *from, const char *to) {
+            const size_t position = source.find(from);
+            if (position == std::string::npos) {
+                return false;
+            }
+            source.replace(position, std::strlen(from), to);
+            return true;
+        };
+        const bool replaced =
+            replace_once(
+                "ullm_aq4_gemm_wmma_prototype_f32_kernel",
+                "ullm_aq4_gemm_wmma_ragged_m_prototype_f32_kernel") &&
+            replace_once(
+                "unsigned long long batch_count,\n"
+                "    float *output)",
+                "unsigned long long m_actual,\n"
+                "    float *output)") &&
+            replace_once(
+                "if (group_size != 16ull || batch_count != kBatchTile || rows == 0ull || cols == 0ull ||\n"
+                "        (rows % kTileRows) != 0ull || (cols % kWideK) != 0ull) {",
+                "if (group_size != 16ull || m_actual == 0ull || m_actual > kBatchTile ||\n"
+                "        rows == 0ull || cols == 0ull || (rows % kTileRows) != 0ull ||\n"
+                "        (cols % kWideK) != 0ull) {") &&
+            replace_once(
+                "        const unsigned long long input_offset =\n"
+                "            (batch_base + batch_in_tile) * cols + k_in_tile;\n"
+                "        const ullm_aq4_wmma_float4 values =\n"
+                "            *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);\n"
+                "        const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "        input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "        input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "        input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "        input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(values[3]);",
+                "        const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "        // Do not form an input address for an invalid physical row.\n"
+                "        if (batch_base + batch_in_tile < m_actual) {\n"
+                "            const unsigned long long input_offset =\n"
+                "                (batch_base + batch_in_tile) * cols + k_in_tile;\n"
+                "            const ullm_aq4_wmma_float4 values =\n"
+                "                *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);\n"
+                "            input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "            input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "            input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "            input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(values[3]);\n"
+                "        } else {\n"
+                "            input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(0.0f);\n"
+                "        }") &&
+            replace_once(
+                "                const unsigned long long input_offset =\n"
+                "                    (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;\n"
+                "                prefetched_input[prefetch_index] =\n"
+                "                    *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);",
+                "                // The steady-state prefetch follows the same rule as stage 0:\n"
+                "                // no invalid-row pointer arithmetic and no invalid global load.\n"
+                "                if (batch_base + batch_in_tile < m_actual) {\n"
+                "                    const unsigned long long input_offset =\n"
+                "                        (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;\n"
+                "                    prefetched_input[prefetch_index] =\n"
+                "                        *reinterpret_cast<const ullm_aq4_wmma_float4 *>(input + input_offset);\n"
+                "                }") &&
+            replace_once(
+                "                const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "                const ullm_aq4_wmma_float4 values = prefetched_input[prefetch_index];\n"
+                "                input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "                input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "                input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "                input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(values[3]);",
+                "                const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "                if (batch_base + batch_in_tile < m_actual) {\n"
+                "                    const ullm_aq4_wmma_float4 values = prefetched_input[prefetch_index];\n"
+                "                    input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "                    input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "                    input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "                    input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(values[3]);\n"
+                "                } else {\n"
+                "                    input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(0.0f);\n"
+                "                }") &&
+            replace_once(
+                "        const float row_scale =\n"
+                "            row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;\n"
+                "        output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;",
+                "        if (batch < m_actual) {\n"
+                "            const float row_scale =\n"
+                "                row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;\n"
+                "            output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;\n"
+                "        }") &&
+            replace_once("    (void)batch_count;", "    (void)m_actual;");
+        if (!replaced) {
+            return "";
+        }
+        return source;
+    }
+
     // Experimental v3 of the gfx1201 AQ4 WMMA path. It keeps v2's two-stage asynchronous
     // prefetch discipline, but each stage owns two physically independent Wide-K microtiles.
     // That permits four WMMA operations between producer/consumer barriers without changing

@@ -310,6 +310,28 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_f32(
     ullm_runtime_stream *stream);
 
 /*
+ * Direct-only gfx1201/group16 ragged-M WMMA experiment. The kernel always computes one physical
+ * M=128 CTA, while m_actual (1..128) controls its guarded activation loads and output stores.
+ * It is isolated from production dispatch and accepts the same complete 16-row/Wide-K geometry.
+ */
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_ragged_m_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t m_actual,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
  * Isolated v3 experiment for the gfx1201/group16/M=128 WMMA GEMM. It uses two 32-K Wide-K
  * microtiles per LDS stage and therefore additionally requires cols divisible by 64. It has its
  * own HIPRTC module/cache, has no fallback, and does not affect production dispatch.
