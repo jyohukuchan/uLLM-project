@@ -37,6 +37,7 @@ enum ProbeFaultStage {
     PagedCausalGqaChunkWmma = 19,
     Aq4GemmWmmaGroup8 = 20,
     Aq4GemmWmmaRaggedM = 21,
+    Aq4GemmWmmaGroup8RaggedM = 22,
 }
 
 type ProbeCacheKey = (u8, Option<String>, i32, u32, u64);
@@ -59,8 +60,8 @@ fn probe_cache_key(capabilities: &DeviceCapabilities) -> ProbeCacheKey {
 }
 
 #[cfg(test)]
-static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 22] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 22];
+static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 23] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 23];
 
 #[cfg(test)]
 std::thread_local! {
