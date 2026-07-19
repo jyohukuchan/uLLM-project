@@ -414,6 +414,44 @@ unsafe extern "C" {
         third_output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_aq4_matvec_triple_shuffle_prototype_f32(
+        first_index_buffer: *const RawRuntimeBuffer,
+        first_scale_buffer: *const RawRuntimeBuffer,
+        first_codebook_buffer: *const RawRuntimeBuffer,
+        first_scale_values_buffer: *const RawRuntimeBuffer,
+        first_row_scale_buffer: *const RawRuntimeBuffer,
+        first_scale_count: usize,
+        first_group_size: usize,
+        first_tensor_scale: f32,
+        first_row_scale_count: usize,
+        second_index_buffer: *const RawRuntimeBuffer,
+        second_scale_buffer: *const RawRuntimeBuffer,
+        second_codebook_buffer: *const RawRuntimeBuffer,
+        second_scale_values_buffer: *const RawRuntimeBuffer,
+        second_row_scale_buffer: *const RawRuntimeBuffer,
+        second_scale_count: usize,
+        second_group_size: usize,
+        second_tensor_scale: f32,
+        second_row_scale_count: usize,
+        third_index_buffer: *const RawRuntimeBuffer,
+        third_scale_buffer: *const RawRuntimeBuffer,
+        third_codebook_buffer: *const RawRuntimeBuffer,
+        third_scale_values_buffer: *const RawRuntimeBuffer,
+        third_row_scale_buffer: *const RawRuntimeBuffer,
+        third_scale_count: usize,
+        third_group_size: usize,
+        third_tensor_scale: f32,
+        third_row_scale_count: usize,
+        input_buffer: *const RawRuntimeBuffer,
+        first_rows: usize,
+        second_rows: usize,
+        third_rows: usize,
+        cols: usize,
+        first_output_buffer: *mut RawRuntimeBuffer,
+        second_output_buffer: *mut RawRuntimeBuffer,
+        third_output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_aq4_matvec_qkv_z_gate_beta_f32(
         qkv_index_buffer: *const RawRuntimeBuffer,
         qkv_scale_buffer: *const RawRuntimeBuffer,
@@ -711,6 +749,14 @@ unsafe extern "C" {
         stream: *mut RawRuntimeStream,
     ) -> c_int;
     fn ullm_runtime_rmsnorm_f32(
+        input_buffer: *const RawRuntimeBuffer,
+        weight_buffer: *const RawRuntimeBuffer,
+        elements: usize,
+        epsilon: f32,
+        output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
+    fn ullm_runtime_rmsnorm_shuffle_prototype_f32(
         input_buffer: *const RawRuntimeBuffer,
         weight_buffer: *const RawRuntimeBuffer,
         elements: usize,
@@ -1167,6 +1213,23 @@ unsafe extern "C" {
         stream: *mut RawRuntimeStream,
     ) -> c_int;
     fn ullm_runtime_linear_attn_qkv_prepare_f32(
+        qkv_buffer: *const RawRuntimeBuffer,
+        conv_weight_buffer: *const RawRuntimeBuffer,
+        conv_history_buffer: *mut RawRuntimeBuffer,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        kernel_size: usize,
+        q_scale: f32,
+        qk_l2_norm: c_int,
+        conv_output_buffer: *mut RawRuntimeBuffer,
+        q_output_buffer: *mut RawRuntimeBuffer,
+        k_output_buffer: *mut RawRuntimeBuffer,
+        v_output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
+    fn ullm_runtime_linear_attn_qkv_prepare_shuffle_prototype_f32(
         qkv_buffer: *const RawRuntimeBuffer,
         conv_weight_buffer: *const RawRuntimeBuffer,
         conv_history_buffer: *mut RawRuntimeBuffer,
@@ -3277,6 +3340,90 @@ pub fn aq4_matvec_triple_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Direct-only gfx1201 triple-stream experiment. The C++ ABI validates its exact shape and
+/// buffer contract before it builds or launches the isolated shuffle module.
+pub fn aq4_matvec_triple_shuffle_prototype_f32(
+    first_index_buffer: &RuntimeBuffer,
+    first_scale_buffer: &RuntimeBuffer,
+    first_codebook_buffer: &RuntimeBuffer,
+    first_scale_values_buffer: &RuntimeBuffer,
+    first_row_scale_buffer: Option<&RuntimeBuffer>,
+    first_scale_count: usize,
+    first_group_size: usize,
+    first_tensor_scale: f32,
+    first_row_scale_count: usize,
+    second_index_buffer: &RuntimeBuffer,
+    second_scale_buffer: &RuntimeBuffer,
+    second_codebook_buffer: &RuntimeBuffer,
+    second_scale_values_buffer: &RuntimeBuffer,
+    second_row_scale_buffer: Option<&RuntimeBuffer>,
+    second_scale_count: usize,
+    second_group_size: usize,
+    second_tensor_scale: f32,
+    second_row_scale_count: usize,
+    third_index_buffer: &RuntimeBuffer,
+    third_scale_buffer: &RuntimeBuffer,
+    third_codebook_buffer: &RuntimeBuffer,
+    third_scale_values_buffer: &RuntimeBuffer,
+    third_row_scale_buffer: Option<&RuntimeBuffer>,
+    third_scale_count: usize,
+    third_group_size: usize,
+    third_tensor_scale: f32,
+    third_row_scale_count: usize,
+    input_buffer: &RuntimeBuffer,
+    first_rows: usize,
+    second_rows: usize,
+    third_rows: usize,
+    cols: usize,
+    first_output_buffer: &mut RuntimeBuffer,
+    second_output_buffer: &mut RuntimeBuffer,
+    third_output_buffer: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    let stream_raw = stream.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_aq4_matvec_triple_shuffle_prototype_f32(
+            first_index_buffer.raw.as_ptr(),
+            first_scale_buffer.raw.as_ptr(),
+            first_codebook_buffer.raw.as_ptr(),
+            first_scale_values_buffer.raw.as_ptr(),
+            first_row_scale_buffer.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr()),
+            first_scale_count,
+            first_group_size,
+            first_tensor_scale,
+            first_row_scale_count,
+            second_index_buffer.raw.as_ptr(),
+            second_scale_buffer.raw.as_ptr(),
+            second_codebook_buffer.raw.as_ptr(),
+            second_scale_values_buffer.raw.as_ptr(),
+            second_row_scale_buffer.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr()),
+            second_scale_count,
+            second_group_size,
+            second_tensor_scale,
+            second_row_scale_count,
+            third_index_buffer.raw.as_ptr(),
+            third_scale_buffer.raw.as_ptr(),
+            third_codebook_buffer.raw.as_ptr(),
+            third_scale_values_buffer.raw.as_ptr(),
+            third_row_scale_buffer.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr()),
+            third_scale_count,
+            third_group_size,
+            third_tensor_scale,
+            third_row_scale_count,
+            input_buffer.raw.as_ptr(),
+            first_rows,
+            second_rows,
+            third_rows,
+            cols,
+            first_output_buffer.raw.as_ptr(),
+            second_output_buffer.raw.as_ptr(),
+            third_output_buffer.raw.as_ptr(),
+            stream_raw,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn aq4_matvec_qkv_z_gate_beta_f32(
     qkv_index_buffer: &RuntimeBuffer,
     qkv_scale_buffer: &RuntimeBuffer,
@@ -4736,6 +4883,46 @@ pub fn rmsnorm_f32(
     let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
     status_to_result(unsafe {
         ullm_runtime_rmsnorm_f32(
+            input_buffer.raw.as_ptr(),
+            weight_buffer.raw.as_ptr(),
+            elements,
+            epsilon,
+            output_buffer.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Direct-only gfx1201 wave-shuffle RMSNorm experiment for Qwen3.5's M=1 hidden=4096 shape.
+/// It is intentionally separate from production dispatch and has no CPU or staging fallback.
+pub fn rmsnorm_shuffle_prototype_f32(
+    input_buffer: &RuntimeBuffer,
+    weight_buffer: &RuntimeBuffer,
+    elements: usize,
+    epsilon: f32,
+    output_buffer: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    const QWEN35_RMSNORM_SHUFFLE_PROTOTYPE_ELEMENTS: usize = 4_096;
+    if elements != QWEN35_RMSNORM_SHUFFLE_PROTOTYPE_ELEMENTS {
+        return Err(
+            "RMSNorm shuffle prototype requires the Qwen3.5 M=1 hidden=4096 shape".to_string(),
+        );
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(
+            "RMSNorm shuffle prototype epsilon must be finite and greater than zero".to_string(),
+        );
+    }
+    let required_bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "RMSNorm shuffle prototype byte size overflows".to_string())?;
+    check_copy_range(0, required_bytes, input_buffer.size()?)?;
+    check_copy_range(0, required_bytes, weight_buffer.size()?)?;
+    check_copy_range(0, required_bytes, output_buffer.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_rmsnorm_shuffle_prototype_f32(
             input_buffer.raw.as_ptr(),
             weight_buffer.raw.as_ptr(),
             elements,
@@ -7493,6 +7680,107 @@ pub fn linear_attn_qkv_prepare_f32(
     let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
     status_to_result(unsafe {
         ullm_runtime_linear_attn_qkv_prepare_f32(
+            qkv.raw.as_ptr(),
+            conv_weight.raw.as_ptr(),
+            conv_history.raw.as_ptr(),
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            kernel_size,
+            q_scale,
+            if qk_l2_norm { 1 } else { 0 },
+            conv_output.raw.as_ptr(),
+            q_output.raw.as_ptr(),
+            k_output.raw.as_ptr(),
+            v_output.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Directly invokes the isolated gfx1201 wave-shuffle qkv-prepare experiment for Qwen3.5's
+/// M=1 linear-attention geometry. It never changes production dispatch or falls back to CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attn_qkv_prepare_shuffle_prototype_f32(
+    qkv: &RuntimeBuffer,
+    conv_weight: &RuntimeBuffer,
+    conv_history: &mut RuntimeBuffer,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    kernel_size: usize,
+    q_scale: f32,
+    qk_l2_norm: bool,
+    conv_output: &mut RuntimeBuffer,
+    q_output: &mut RuntimeBuffer,
+    k_output: &mut RuntimeBuffer,
+    v_output: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if key_heads != 16
+        || value_heads != 32
+        || key_dim != 128
+        || value_dim != 128
+        || kernel_size != 4
+    {
+        return Err(
+            "linear attention qkv prepare shuffle prototype requires Qwen3.5 key/value heads=16/32, key/value dim=128, and kernel_size=4"
+                .to_string(),
+        );
+    }
+    if !q_scale.is_finite() {
+        return Err(
+            "linear attention qkv prepare shuffle prototype q_scale must be finite".to_string(),
+        );
+    }
+
+    let q_elements = key_heads.checked_mul(key_dim).ok_or_else(|| {
+        "linear attention qkv prepare shuffle prototype q element count overflows".to_string()
+    })?;
+    let v_elements = value_heads.checked_mul(value_dim).ok_or_else(|| {
+        "linear attention qkv prepare shuffle prototype v element count overflows".to_string()
+    })?;
+    let channels = q_elements
+        .checked_add(q_elements)
+        .and_then(|value| value.checked_add(v_elements))
+        .ok_or_else(|| {
+            "linear attention qkv prepare shuffle prototype channel count overflows".to_string()
+        })?;
+    let qkv_bytes = channels
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "linear attention qkv prepare shuffle prototype qkv byte size overflows".to_string()
+        })?;
+    let history_bytes = channels
+        .checked_mul(kernel_size)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| {
+            "linear attention qkv prepare shuffle prototype history byte size overflows".to_string()
+        })?;
+    let q_bytes = q_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "linear attention qkv prepare shuffle prototype q byte size overflows".to_string()
+        })?;
+    let v_bytes = v_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            "linear attention qkv prepare shuffle prototype v byte size overflows".to_string()
+        })?;
+
+    check_copy_range(0, qkv_bytes, qkv.size()?)?;
+    check_copy_range(0, history_bytes, conv_weight.size()?)?;
+    check_copy_range(0, history_bytes, conv_history.size()?)?;
+    check_copy_range(0, qkv_bytes, conv_output.size()?)?;
+    check_copy_range(0, q_bytes, q_output.size()?)?;
+    check_copy_range(0, q_bytes, k_output.size()?)?;
+    check_copy_range(0, v_bytes, v_output.size()?)?;
+
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_linear_attn_qkv_prepare_shuffle_prototype_f32(
             qkv.raw.as_ptr(),
             conv_weight.raw.as_ptr(),
             conv_history.raw.as_ptr(),

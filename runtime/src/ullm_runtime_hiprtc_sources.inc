@@ -718,6 +718,19 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_triple_kernel_source();
     }
 
+    // Direct-only gfx1201 experiment. It retains triple's scalar packed-byte traversal and
+    // three independent accumulators, but replaces the RPB=8 per-row LDS trees with wave32
+    // shuffles. The direct ABI rejects any RPB override other than 8 before compiling it.
+    static std::string aq4_matvec_triple_shuffle_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   8u,
+                   4u,
+                   "ULLM_AQ4_MATVEC_TRIPLE_RPB") +
+               aq4_matvec_triple_shuffle_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_qkv_z_gate_beta_kernel_source_for_arch(
         const std::string &arch) {
         const unsigned int rows_per_block = aq4_fused_rows_per_block_for_arch(
@@ -3791,6 +3804,76 @@ extern "C" __global__ void ullm_aq4_matvec_triple_f32_kernel(
 )";
     }
 
+    // Keep the direct-only prototype ABI isolated from production. It preserves the scalar
+    // packed-load work and all three stream paths, replacing only the RPB=8 reduction.
+    static std::string aq4_matvec_triple_shuffle_prototype_kernel_source() {
+        std::string prototype = aq4_matvec_triple_kernel_source();
+        const std::string production_name = "ullm_aq4_matvec_triple_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_aq4_matvec_triple_shuffle_prototype_f32_kernel");
+
+        const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float first_partial[256];
+    __shared__ float second_partial[256];
+    __shared__ float third_partial[256];
+    float first_sum = 0.0f;
+    float second_sum = 0.0f;
+    float third_sum = 0.0f;)";
+        const std::string shuffle_setup = R"(    // RPB=8 maps each row's contiguous 32 threads to one gfx1201 wave32.
+    // Retain the three independent stream accumulators, but no cross-wave/LDS combine is needed.
+    float first_sum = 0.0f;
+    float second_sum = 0.0f;
+    float third_sum = 0.0f;)";
+        const size_t setup_offset = prototype.find(lds_setup);
+        if (setup_offset == std::string::npos) return "";
+        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_tree = R"(    first_partial[tid] = first_sum;
+    second_partial[tid] = second_sum;
+    third_partial[tid] = third_sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            first_partial[partial_offset + lane] +=
+                first_partial[partial_offset + lane + offset];
+            second_partial[partial_offset + lane] +=
+                second_partial[partial_offset + lane + offset];
+            third_partial[partial_offset + lane] +=
+                third_partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        if (row < first_rows) {
+            float first_value = first_partial[partial_offset];)";
+        const std::string shuffle_reduction = R"(    for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        first_sum += __shfl_down(first_sum, offset, warpSize);
+        second_sum += __shfl_down(second_sum, offset, warpSize);
+        third_sum += __shfl_down(third_sum, offset, warpSize);
+    }
+    if (lane == 0) {
+        if (row < first_rows) {
+            float first_value = first_sum;)";
+        const size_t tree_offset = prototype.find(lds_tree);
+        if (tree_offset == std::string::npos) return "";
+        prototype.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+
+        const std::string second_value = "float second_value = second_partial[partial_offset];";
+        const size_t second_value_offset = prototype.find(second_value);
+        if (second_value_offset == std::string::npos) return "";
+        prototype.replace(second_value_offset, second_value.size(), "float second_value = second_sum;");
+
+        const std::string third_value = "float third_value = third_partial[partial_offset];";
+        const size_t third_value_offset = prototype.find(third_value);
+        if (third_value_offset == std::string::npos) return "";
+        prototype.replace(third_value_offset, third_value.size(), "float third_value = third_sum;");
+        return prototype;
+    }
+
     // Superseded scalar-reduction AQ4 qkv/z gate/beta reference. It is deliberately not passed
     // to HIPRTC for the validated gfx1201 RPB=4 geometry: production keeps the same entry-point
     // ABI but uses the wave32 shuffle reduction below. Retain this source for controlled rollback
@@ -5227,6 +5310,52 @@ extern "C" __global__ void ullm_rmsnorm_f32_kernel(
         __syncthreads();
     }
     const float inv_rms = rsqrtf(partial[0] / static_cast<float>(elements) + epsilon);
+    for (unsigned long long index = tid; index < elements; index += blockDim.x) {
+        output[index] = input[index] * inv_rms * weight[index];
+    }
+}
+)";
+    }
+
+    // Direct-only gfx1201 experiment for the Qwen3.5 M=1 RMSNorm shape. It preserves the
+    // production ABI and arithmetic while reducing eight wave32 partials with two barriers.
+    static const char *rmsnorm_shuffle_prototype_kernel_source() {
+        return R"(
+extern "C" __global__ void ullm_rmsnorm_shuffle_prototype_f32_kernel(
+    const float *input,
+    const float *weight,
+    unsigned long long elements,
+    float epsilon,
+    float *output) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid % warpSize;
+    const unsigned int wave = tid / warpSize;
+    __shared__ float wave_partials[8];
+    float sum = 0.0f;
+    for (unsigned long long index = tid; index < elements; index += blockDim.x) {
+        const float value = input[index];
+        sum += value * value;
+    }
+    for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset, warpSize);
+    }
+    if (lane == 0u) {
+        wave_partials[wave] = sum;
+    }
+    __syncthreads();
+
+    if (wave == 0u) {
+        const unsigned int wave_count = (blockDim.x + warpSize - 1u) / warpSize;
+        sum = lane < wave_count ? wave_partials[lane] : 0.0f;
+        for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+            sum += __shfl_down(sum, offset, warpSize);
+        }
+        if (lane == 0u) {
+            wave_partials[0] = sum;
+        }
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(wave_partials[0] / static_cast<float>(elements) + epsilon);
     for (unsigned long long index = tid; index < elements; index += blockDim.x) {
         output[index] = input[index] * inv_rms * weight[index];
     }
@@ -8284,6 +8413,98 @@ extern "C" __global__ void ullm_linear_attn_qkv_split_l2norm_f32_kernel(
     }
 }
 )";
+    }
+
+    // Direct-only gfx1201 experiment for Qwen3.5's M=1 linear-attention prepare launch. It
+    // keeps the served source intact and gives the candidate a distinct entry point. Only Q/K
+    // CTAs use the helper below; V CTAs retain their reduction-free path unchanged.
+    static std::string linear_attn_qkv_prepare_shuffle_prototype_kernel_source() {
+        std::string prototype = linear_attn_qkv_prepare_kernel_source();
+        const std::string next_kernel =
+            "\nextern \"C\" __global__ void ullm_linear_attn_qkv_conv_step_silu_f32_kernel";
+        const size_t next_kernel_offset = prototype.find(next_kernel);
+        if (next_kernel_offset == std::string::npos) {
+            return "";
+        }
+        prototype.erase(next_kernel_offset);
+
+        const std::string production_name = "ullm_linear_attn_qkv_prepare_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        prototype.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_linear_attn_qkv_prepare_shuffle_prototype_f32_kernel");
+
+        const std::string lds_setup = R"(    const unsigned int tid = threadIdx.x;
+    __shared__ float partial[256];)";
+        const std::string shuffle_setup = R"(    const unsigned int tid = threadIdx.x;
+    // Eight wave32 leaders are enough for the fixed 256-thread direct launch. V blocks never
+    // access this scratch because their path has no Q/K normalization reduction.
+    __shared__ float wave_partials[8];)";
+        const size_t setup_offset = prototype.find(lds_setup);
+        if (setup_offset == std::string::npos) {
+            return "";
+        }
+        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_reduction = R"(        partial[tid] = sum_squares;
+        __syncthreads();
+        for (unsigned int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+            if (tid < offset) {
+                partial[tid] += partial[tid + offset];
+            }
+            __syncthreads();
+        }
+        const float norm = sqrtf(partial[0] + 1.0e-6f);)";
+        const std::string shuffle_reduction = R"(        const float norm = sqrtf(
+            ullm_linear_attn_qkv_prepare_shuffle_reduce_to_all(
+                sum_squares,
+                wave_partials) + 1.0e-6f);)";
+        size_t first_reduction = prototype.find(lds_reduction);
+        if (first_reduction == std::string::npos) {
+            return "";
+        }
+        prototype.replace(first_reduction, lds_reduction.size(), shuffle_reduction);
+        const size_t second_reduction = prototype.find(lds_reduction);
+        if (second_reduction == std::string::npos) {
+            return "";
+        }
+        prototype.replace(second_reduction, lds_reduction.size(), shuffle_reduction);
+        if (prototype.find(lds_reduction) != std::string::npos) {
+            return "";
+        }
+
+        return R"(
+__device__ __forceinline__ float ullm_linear_attn_qkv_prepare_shuffle_reduce_to_all(
+    float sum,
+    float *wave_partials) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid % warpSize;
+    const unsigned int wave = tid / warpSize;
+    for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset, warpSize);
+    }
+    if (lane == 0u) {
+        wave_partials[wave] = sum;
+    }
+    __syncthreads();
+
+    if (wave == 0u) {
+        sum = lane < 8u ? wave_partials[lane] : 0.0f;
+        for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+            sum += __shfl_down(sum, offset, warpSize);
+        }
+        if (lane == 0u) {
+            wave_partials[0] = sum;
+        }
+    }
+    __syncthreads();
+    return wave_partials[0];
+}
+)" + prototype;
     }
 
     static const char *linear_attn_qkv_prepare_batch_kernel_source() {

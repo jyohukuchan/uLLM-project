@@ -551,6 +551,14 @@ ullm_status ullm_runtime_aq4_matvec_triple_f32(
     ullm_runtime_buffer *third_output_buffer,
     ullm_runtime_stream *stream);
 
+/* Direct-only gfx1201 experiment: scalar packed loads and wave32 reductions for three streams. */
+ullm_status ullm_runtime_aq4_matvec_triple_shuffle_prototype_f32(
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, size_t, size_t, size_t, size_t,
+    ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_stream *);
+
 ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_f32(
     const ullm_runtime_buffer *qkv_index_buffer,
     const ullm_runtime_buffer *qkv_scale_buffer,
@@ -814,6 +822,18 @@ ullm_status ullm_runtime_top1_pairs_f32(
     ullm_runtime_stream *stream);
 
 ullm_status ullm_runtime_rmsnorm_f32(
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *weight_buffer,
+    size_t elements,
+    float epsilon,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
+ * Direct-only gfx1201 experiment for Qwen3.5's M=1 hidden=4096 RMSNorm. This never changes
+ * production RMSNorm dispatch and never falls back; it is for differential and timing checks.
+ */
+ullm_status ullm_runtime_rmsnorm_shuffle_prototype_f32(
     const ullm_runtime_buffer *input_buffer,
     const ullm_runtime_buffer *weight_buffer,
     size_t elements,
@@ -1341,6 +1361,25 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32(
     ullm_runtime_stream *stream);
 
 ullm_status ullm_runtime_linear_attn_qkv_prepare_f32(
+    const ullm_runtime_buffer *qkv_buffer,
+    const ullm_runtime_buffer *conv_weight_buffer,
+    ullm_runtime_buffer *conv_history_buffer,
+    size_t key_heads,
+    size_t value_heads,
+    size_t key_dim,
+    size_t value_dim,
+    size_t kernel_size,
+    float q_scale,
+    int qk_l2_norm,
+    ullm_runtime_buffer *conv_output_buffer,
+    ullm_runtime_buffer *q_output_buffer,
+    ullm_runtime_buffer *k_output_buffer,
+    ullm_runtime_buffer *v_output_buffer,
+    ullm_runtime_stream *stream);
+
+/* Direct-only gfx1201 Qwen3.5 M=1 experiment. This never changes production prepare dispatch
+ * or stages through CPU; it is solely for isolated differential and timing comparisons. */
+ullm_status ullm_runtime_linear_attn_qkv_prepare_shuffle_prototype_f32(
     const ullm_runtime_buffer *qkv_buffer,
     const ullm_runtime_buffer *conv_weight_buffer,
     ullm_runtime_buffer *conv_history_buffer,

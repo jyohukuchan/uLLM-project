@@ -3057,6 +3057,114 @@ ullm_status ullm_runtime_aq4_matvec_triple_f32(
     return ULLM_STATUS_RUNTIME_ERROR;
 }
 
+ullm_status ullm_runtime_aq4_matvec_triple_shuffle_prototype_f32(
+    const ullm_runtime_buffer *first_i, const ullm_runtime_buffer *first_s,
+    const ullm_runtime_buffer *first_c, const ullm_runtime_buffer *first_v,
+    const ullm_runtime_buffer *first_r, size_t first_sc, size_t first_g, float first_t,
+    size_t first_rc, const ullm_runtime_buffer *second_i, const ullm_runtime_buffer *second_s,
+    const ullm_runtime_buffer *second_c, const ullm_runtime_buffer *second_v,
+    const ullm_runtime_buffer *second_r, size_t second_sc, size_t second_g, float second_t,
+    size_t second_rc, const ullm_runtime_buffer *third_i, const ullm_runtime_buffer *third_s,
+    const ullm_runtime_buffer *third_c, const ullm_runtime_buffer *third_v,
+    const ullm_runtime_buffer *third_r, size_t third_sc, size_t third_g, float third_t,
+    size_t third_rc, const ullm_runtime_buffer *input, size_t first_rows, size_t second_rows,
+    size_t third_rows, size_t cols, ullm_runtime_buffer *first_out,
+    ullm_runtime_buffer *second_out, ullm_runtime_buffer *third_out,
+    ullm_runtime_stream *stream) {
+    const ullm_runtime_buffer *all[] = {
+        first_i, first_s, first_c, first_v, second_i, second_s, second_c, second_v,
+        third_i, third_s, third_c, third_v, input, first_out, second_out, third_out,
+    };
+    for (const ullm_runtime_buffer *buffer : all) {
+        if (buffer == nullptr) {
+            set_error("AQ4 matvec triple shuffle prototype received a null pointer");
+            return ULLM_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if ((first_rc != 0u && first_r == nullptr) ||
+        (second_rc != 0u && second_r == nullptr) ||
+        (third_rc != 0u && third_r == nullptr)) {
+        set_error("AQ4 matvec triple shuffle prototype row-scale count requires its row-scale buffer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (first_i->backend != BackendKind::Hip || first_i->hip_device_id < 0 ||
+        hip_runtime().device_arch_name(first_i->hip_device_id) != "gfx1201" ||
+        (first_g != 8u && first_g != 16u) ||
+        (second_g != 8u && second_g != 16u) ||
+        (third_g != 8u && third_g != 16u) ||
+        first_rows == 0u || second_rows == 0u || third_rows == 0u || cols == 0u ||
+        cols % 32u != 0u || first_sc == 0u || second_sc == 0u || third_sc == 0u ||
+        !std::isfinite(first_t) || first_t <= 0.0f || !std::isfinite(second_t) ||
+        second_t <= 0.0f || !std::isfinite(third_t) || third_t <= 0.0f ||
+        !buffers_share_backend(first_i, first_s) || !buffers_share_backend(first_i, first_c) ||
+        !buffers_share_backend(first_i, first_v) || !buffers_share_backend(first_i, second_i) ||
+        !buffers_share_backend(first_i, second_s) || !buffers_share_backend(first_i, second_c) ||
+        !buffers_share_backend(first_i, second_v) || !buffers_share_backend(first_i, third_i) ||
+        !buffers_share_backend(first_i, third_s) || !buffers_share_backend(first_i, third_c) ||
+        !buffers_share_backend(first_i, third_v) || !buffers_share_backend(first_i, input) ||
+        !buffers_share_backend(first_i, first_out) || !buffers_share_backend(first_i, second_out) ||
+        !buffers_share_backend(first_i, third_out) ||
+        (first_r != nullptr && !buffers_share_backend(first_i, first_r)) ||
+        (second_r != nullptr && !buffers_share_backend(first_i, second_r)) ||
+        (third_r != nullptr && !buffers_share_backend(first_i, third_r)) ||
+        !stream_matches_buffer(first_out, stream) || !stream_matches_buffer(second_out, stream) ||
+        !stream_matches_buffer(third_out, stream)) {
+        set_error("AQ4 matvec triple shuffle prototype requires valid gfx1201 group8/group16 HIP buffers with cols divisible by 32");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const auto matrix_valid = [cols](
+                                  const ullm_runtime_buffer *index,
+                                  const ullm_runtime_buffer *scale,
+                                  const ullm_runtime_buffer *codebook,
+                                  const ullm_runtime_buffer *scale_values,
+                                  const ullm_runtime_buffer *row_scale,
+                                  size_t scale_count,
+                                  size_t group_size,
+                                  size_t row_scale_count,
+                                  size_t rows) {
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        if (row_scale_count > rows || rows > max_size / cols ||
+            rows > max_size / sizeof(float) || scale_count > max_size / sizeof(float) ||
+            row_scale_count > max_size / sizeof(float)) {
+            return false;
+        }
+        const size_t elements = rows * cols;
+        return index->bytes >= elements / 2u && scale->bytes >= elements / group_size &&
+               codebook->bytes >= 16u * sizeof(float) &&
+               codebook->bytes % sizeof(float) == 0u &&
+               scale_values->bytes >= scale_count * sizeof(float) &&
+               (row_scale == nullptr || row_scale->bytes >= row_scale_count * sizeof(float));
+    };
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / sizeof(float) ||
+        !matrix_valid(first_i, first_s, first_c, first_v, first_r, first_sc, first_g,
+                      first_rc, first_rows) ||
+        !matrix_valid(second_i, second_s, second_c, second_v, second_r, second_sc, second_g,
+                      second_rc, second_rows) ||
+        !matrix_valid(third_i, third_s, third_c, third_v, third_r, third_sc, third_g,
+                      third_rc, third_rows) ||
+        input->bytes < cols * sizeof(float) ||
+        first_out->bytes < first_rows * sizeof(float) ||
+        second_out->bytes < second_rows * sizeof(float) ||
+        third_out->bytes < third_rows * sizeof(float)) {
+        set_error("AQ4 matvec triple shuffle prototype buffer is too small or malformed");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    std::string error;
+    if (!aq4_matvec_triple_f32_hip_kernel(
+            first_i, first_s, first_c, first_v, first_r, first_sc, first_g, first_t, first_rc,
+            second_i, second_s, second_c, second_v, second_r, second_sc, second_g, second_t,
+            second_rc, third_i, third_s, third_c, third_v, third_r, third_sc, third_g, third_t,
+            third_rc, input, first_rows, second_rows, third_rows, cols, first_out, second_out,
+            third_out, stream, &error, Aq4MatvecTripleKernelKind::ShufflePrototype)) {
+        set_error(error.empty() ? "AQ4 matvec triple shuffle prototype HIP launch failed" :
+                                  error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_f32(
     const ullm_runtime_buffer *qkv_index_buffer,
     const ullm_runtime_buffer *qkv_scale_buffer,

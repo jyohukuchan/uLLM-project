@@ -165,6 +165,121 @@ ullm_status ullm_runtime_linear_attn_qkv_prepare_f32(
         stream);
 }
 
+ullm_status ullm_runtime_linear_attn_qkv_prepare_shuffle_prototype_f32(
+    const ullm_runtime_buffer *qkv_buffer,
+    const ullm_runtime_buffer *conv_weight_buffer,
+    ullm_runtime_buffer *conv_history_buffer,
+    size_t key_heads,
+    size_t value_heads,
+    size_t key_dim,
+    size_t value_dim,
+    size_t kernel_size,
+    float q_scale,
+    int qk_l2_norm,
+    ullm_runtime_buffer *conv_output_buffer,
+    ullm_runtime_buffer *q_output_buffer,
+    ullm_runtime_buffer *k_output_buffer,
+    ullm_runtime_buffer *v_output_buffer,
+    ullm_runtime_stream *stream) {
+    if (qkv_buffer == nullptr || conv_weight_buffer == nullptr ||
+        conv_history_buffer == nullptr || conv_output_buffer == nullptr ||
+        q_output_buffer == nullptr || k_output_buffer == nullptr || v_output_buffer == nullptr) {
+        set_error("linear attention qkv prepare shuffle prototype received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(q_scale)) {
+        set_error("linear attention qkv prepare shuffle prototype q_scale must be finite");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!buffers_share_backend(qkv_buffer, conv_weight_buffer) ||
+        !buffers_share_backend(qkv_buffer, conv_history_buffer) ||
+        !buffers_share_backend(qkv_buffer, conv_output_buffer) ||
+        !buffers_share_backend(qkv_buffer, q_output_buffer) ||
+        !buffers_share_backend(qkv_buffer, k_output_buffer) ||
+        !buffers_share_backend(qkv_buffer, v_output_buffer)) {
+        set_error("linear attention qkv prepare shuffle prototype buffers belong to different backends or devices");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!stream_matches_buffer(conv_output_buffer, stream) ||
+        !stream_matches_buffer(q_output_buffer, stream) ||
+        !stream_matches_buffer(k_output_buffer, stream) ||
+        !stream_matches_buffer(v_output_buffer, stream)) {
+        set_error("linear attention qkv prepare shuffle prototype stream belongs to a different backend or device");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (qkv_buffer->backend != BackendKind::Hip) {
+        set_error("linear attention qkv prepare shuffle prototype requires a HIP gfx1201 backend");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!linear_attn_qkv_prepare_shuffle_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(qkv_buffer->hip_device_id),
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            kernel_size)) {
+        set_error(
+            "linear attention qkv prepare shuffle prototype requires exact gfx1201 Qwen3.5 key/value heads=16/32, key/value dim=128, kernel size=4");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const size_t q_elements = key_heads * key_dim;
+    const size_t v_elements = value_heads * value_dim;
+    const size_t channels = q_elements * 2u + v_elements;
+    const size_t qkv_bytes = channels * sizeof(float);
+    const size_t conv_history_bytes = channels * kernel_size * sizeof(float);
+    const size_t q_bytes = q_elements * sizeof(float);
+    const size_t v_bytes = v_elements * sizeof(float);
+    if (qkv_buffer->bytes < qkv_bytes) {
+        set_error("linear attention qkv prepare shuffle prototype qkv buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (conv_weight_buffer->bytes < conv_history_bytes) {
+        set_error("linear attention qkv prepare shuffle prototype conv weight buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (conv_history_buffer->bytes < conv_history_bytes) {
+        set_error("linear attention qkv prepare shuffle prototype conv history buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (conv_output_buffer->bytes < qkv_bytes) {
+        set_error("linear attention qkv prepare shuffle prototype conv output buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (q_output_buffer->bytes < q_bytes || k_output_buffer->bytes < q_bytes ||
+        v_output_buffer->bytes < v_bytes) {
+        set_error("linear attention qkv prepare shuffle prototype output buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::string hip_kernel_error;
+    if (!linear_attn_qkv_prepare_shuffle_prototype_f32_hip_kernel(
+            qkv_buffer,
+            conv_weight_buffer,
+            conv_history_buffer,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            kernel_size,
+            q_scale,
+            qk_l2_norm != 0,
+            conv_output_buffer,
+            q_output_buffer,
+            k_output_buffer,
+            v_output_buffer,
+            stream,
+            &hip_kernel_error)) {
+        set_error(
+            hip_kernel_error.empty() ?
+                "linear attention qkv prepare shuffle prototype HIP kernel launch failed" :
+                hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_linear_attn_qkv_prepare_batch_f32(
     const ullm_runtime_buffer *qkv_buffer,
     const ullm_runtime_buffer *conv_weight_buffer,

@@ -5192,6 +5192,208 @@ HipLinearAttnQkvPrepareKernelCache &hip_linear_attn_qkv_prepare_kernel_cache() {
     return cache;
 }
 
+constexpr size_t kLinearAttnQkvPrepareShufflePrototypeKeyHeads = 16u;
+constexpr size_t kLinearAttnQkvPrepareShufflePrototypeValueHeads = 32u;
+constexpr size_t kLinearAttnQkvPrepareShufflePrototypeKeyDim = 128u;
+constexpr size_t kLinearAttnQkvPrepareShufflePrototypeValueDim = 128u;
+constexpr size_t kLinearAttnQkvPrepareShufflePrototypeKernelSize = 4u;
+constexpr unsigned int kLinearAttnQkvPrepareShufflePrototypeThreads = 256u;
+constexpr unsigned int kLinearAttnQkvPrepareShufflePrototypeGrid = 48u;
+
+bool linear_attn_qkv_prepare_shuffle_prototype_shape_is_supported(
+    const std::string &arch,
+    size_t key_heads,
+    size_t value_heads,
+    size_t key_dim,
+    size_t value_dim,
+    size_t kernel_size) {
+    return arch == "gfx1201" &&
+        key_heads == kLinearAttnQkvPrepareShufflePrototypeKeyHeads &&
+        value_heads == kLinearAttnQkvPrepareShufflePrototypeValueHeads &&
+        key_dim == kLinearAttnQkvPrepareShufflePrototypeKeyDim &&
+        value_dim == kLinearAttnQkvPrepareShufflePrototypeValueDim &&
+        kernel_size == kLinearAttnQkvPrepareShufflePrototypeKernelSize;
+}
+
+// This cache is intentionally independent from the served qkv-prepare module so the direct
+// experiment cannot affect production HIPRTC source selection, code objects, or dispatch.
+class HipLinearAttnQkvPrepareShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        auto failed = failures_.find(device_id);
+        if (failed != failures_.end()) {
+            append_error(error, failed->second);
+            return nullptr;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(
+                error,
+                "linear attention qkv prepare shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_linear_attn_qkv_prepare_shuffle_prototype_kernel(
+                "gfx1201",
+                &code,
+                &compile_error)) {
+            return fail(
+                device_id,
+                compile_error.empty() ?
+                    "failed to build linear attention qkv prepare shuffle prototype HIP kernel" :
+                    compile_error,
+                error);
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            return fail(
+                device_id,
+                "hipModuleLoadData failed for linear attention qkv prepare shuffle prototype",
+                error);
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_linear_attn_qkv_prepare_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            return fail(
+                device_id,
+                "hipModuleGetFunction failed for linear attention qkv prepare shuffle prototype",
+                error);
+        }
+
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+    };
+
+    void *fail(int device_id, const std::string &message, std::string *error) {
+        failures_.emplace(device_id, message);
+        append_error(error, message);
+        return nullptr;
+    }
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+    std::unordered_map<int, std::string> failures_;
+};
+
+HipLinearAttnQkvPrepareShufflePrototypeKernelCache &
+hip_linear_attn_qkv_prepare_shuffle_prototype_kernel_cache() {
+    static HipLinearAttnQkvPrepareShufflePrototypeKernelCache cache;
+    return cache;
+}
+
+bool linear_attn_qkv_prepare_shuffle_prototype_f32_hip_kernel(
+    const ullm_runtime_buffer *qkv_buffer,
+    const ullm_runtime_buffer *conv_weight_buffer,
+    ullm_runtime_buffer *conv_history_buffer,
+    size_t key_heads,
+    size_t value_heads,
+    size_t key_dim,
+    size_t value_dim,
+    size_t kernel_size,
+    float q_scale,
+    bool qk_l2_norm,
+    ullm_runtime_buffer *conv_output_buffer,
+    ullm_runtime_buffer *q_output_buffer,
+    ullm_runtime_buffer *k_output_buffer,
+    ullm_runtime_buffer *v_output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = qkv_buffer->hip_device_id;
+    if (!linear_attn_qkv_prepare_shuffle_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(device_id),
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            kernel_size)) {
+        if (error != nullptr) {
+            *error =
+                "linear attention qkv prepare shuffle prototype requires gfx1201 and Qwen3.5 16/32 heads, 128/128 dims, kernel size 4";
+        }
+        return false;
+    }
+    void *function = hip_linear_attn_qkv_prepare_shuffle_prototype_kernel_cache()
+                         .function_for_device(device_id, error);
+    if (function == nullptr) {
+        return false;
+    }
+
+    void *qkv_ptr = qkv_buffer->ptr;
+    void *conv_weight_ptr = conv_weight_buffer->ptr;
+    void *conv_history_ptr = conv_history_buffer->ptr;
+    unsigned long long kernel_key_heads = static_cast<unsigned long long>(key_heads);
+    unsigned long long kernel_value_heads = static_cast<unsigned long long>(value_heads);
+    unsigned long long kernel_key_dim = static_cast<unsigned long long>(key_dim);
+    unsigned long long kernel_value_dim = static_cast<unsigned long long>(value_dim);
+    unsigned long long kernel_size_arg = static_cast<unsigned long long>(kernel_size);
+    int kernel_qk_l2_norm = qk_l2_norm ? 1 : 0;
+    void *conv_output_ptr = conv_output_buffer->ptr;
+    void *q_output_ptr = q_output_buffer->ptr;
+    void *k_output_ptr = k_output_buffer->ptr;
+    void *v_output_ptr = v_output_buffer->ptr;
+    void *kernel_params[] = {
+        &qkv_ptr,
+        &conv_weight_ptr,
+        &conv_history_ptr,
+        &kernel_key_heads,
+        &kernel_value_heads,
+        &kernel_key_dim,
+        &kernel_value_dim,
+        &kernel_size_arg,
+        &q_scale,
+        &kernel_qk_l2_norm,
+        &conv_output_ptr,
+        &q_output_ptr,
+        &k_output_ptr,
+        &v_output_ptr,
+    };
+    // 32 Q/K-normalizing CTAs plus ceil(32 * 128 / 256) == 16 reduction-free V CTAs.
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel(
+            function,
+            kLinearAttnQkvPrepareShufflePrototypeGrid,
+            kLinearAttnQkvPrepareShufflePrototypeThreads,
+            kernel_params,
+            hip_stream,
+            device_id)) {
+        if (error != nullptr) {
+            *error = "hipModuleLaunchKernel failed for linear attention qkv prepare shuffle prototype";
+        }
+        return false;
+    }
+    return true;
+}
+
 class HipLinearAttnQkvPrepareBatchKernelCache {
 public:
     bool functions_for_device(

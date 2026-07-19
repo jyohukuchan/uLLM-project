@@ -855,6 +855,19 @@ public:
             error);
     }
 
+    bool compile_aq4_matvec_triple_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = aq4_matvec_triple_shuffle_prototype_kernel_source_for_arch(arch);
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_aq4_matvec_triple_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
     bool compile_aq4_matvec_qkv_z_gate_beta_kernel(
         const std::string &arch,
         std::vector<char> *code,
@@ -994,6 +1007,18 @@ public:
 
     bool compile_rmsnorm_kernel(const std::string &arch, std::vector<char> *code, std::string *error) {
         return compile_kernel(arch, rmsnorm_kernel_source(), "ullm_rmsnorm_f32.hip", code, error);
+    }
+
+    bool compile_rmsnorm_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        return compile_kernel(
+            arch,
+            rmsnorm_shuffle_prototype_kernel_source(),
+            "ullm_rmsnorm_shuffle_prototype_f32.hip",
+            code,
+            error);
     }
 
     bool compile_segmented_rmsnorm_kernel(
@@ -1302,6 +1327,19 @@ public:
             arch,
             linear_attn_qkv_prepare_kernel_source(),
             "ullm_linear_attn_qkv_prepare_f32.hip",
+            code,
+            error);
+    }
+
+    bool compile_linear_attn_qkv_prepare_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = linear_attn_qkv_prepare_shuffle_prototype_kernel_source();
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_linear_attn_qkv_prepare_shuffle_prototype_f32.hip",
             code,
             error);
     }
@@ -4492,6 +4530,65 @@ HipAq4MatvecTripleKernelCache &hip_aq4_matvec_triple_kernel_cache() {
     return cache;
 }
 
+// This stays independent from the production triple cache: it changes only the RPB=8
+// reduction and remains directly callable until a device differential/timing window validates it.
+class HipAq4MatvecTripleShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) return found->second->function;
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "AQ4 matvec triple shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_aq4_matvec_triple_shuffle_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            append_error(error, compile_error.empty() ?
+                "failed to build AQ4 matvec triple shuffle prototype HIP kernel" : compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for AQ4 matvec triple shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_aq4_matvec_triple_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for AQ4 matvec triple shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        modules_.emplace(device_id, std::move(loaded));
+        return function;
+    }
+
+private:
+    struct LoadedModule { void *module = nullptr; void *function = nullptr; };
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) return;
+        if (!error->empty()) error->append("\n");
+        error->append(message);
+    }
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipAq4MatvecTripleShufflePrototypeKernelCache &
+hip_aq4_matvec_triple_shuffle_prototype_kernel_cache() {
+    static HipAq4MatvecTripleShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 class HipAq4MatvecQkvZGateBetaKernelCache {
 public:
     void *function_for_device(int device_id, std::string *error) {
@@ -6211,6 +6308,11 @@ bool aq4_matvec_pair_f32_hip_kernel(
     return true;
 }
 
+enum class Aq4MatvecTripleKernelKind : uint32_t {
+    Production,
+    ShufflePrototype,
+};
+
 bool aq4_matvec_triple_f32_hip_kernel(
     const ullm_runtime_buffer *first_index_buffer,
     const ullm_runtime_buffer *first_scale_buffer,
@@ -6248,19 +6350,28 @@ bool aq4_matvec_triple_f32_hip_kernel(
     ullm_runtime_buffer *second_output_buffer,
     ullm_runtime_buffer *third_output_buffer,
     ullm_runtime_stream *stream,
-    std::string *error) {
+    std::string *error,
+    Aq4MatvecTripleKernelKind kind = Aq4MatvecTripleKernelKind::Production) {
     const int device_id = first_index_buffer->hip_device_id;
-    void *function = hip_aq4_matvec_triple_kernel_cache().function_for_device(device_id, error);
-    if (function == nullptr) {
-        return false;
-    }
-
     const Aq4MatvecLaunchConfig launch_config =
         aq4_matvec_launch_config_for_fused_kernel(
             device_id,
             8u,
             4u,
             "ULLM_AQ4_MATVEC_TRIPLE_RPB");
+    if (kind == Aq4MatvecTripleKernelKind::ShufflePrototype &&
+        launch_config.rows_per_block != 8u) {
+        if (error != nullptr) {
+            *error = "AQ4 matvec triple shuffle prototype requires ULLM_AQ4_MATVEC_TRIPLE_RPB=8";
+        }
+        return false;
+    }
+    void *function = kind == Aq4MatvecTripleKernelKind::ShufflePrototype
+        ? hip_aq4_matvec_triple_shuffle_prototype_kernel_cache().function_for_device(device_id, error)
+        : hip_aq4_matvec_triple_kernel_cache().function_for_device(device_id, error);
+    if (function == nullptr) {
+        return false;
+    }
     const size_t work_rows = std::max(first_rows, std::max(second_rows, third_rows));
     const size_t grid_size =
         (work_rows + launch_config.rows_per_block - 1) / launch_config.rows_per_block;
@@ -8843,6 +8954,79 @@ HipRmsNormKernelCache &hip_rmsnorm_kernel_cache() {
     return cache;
 }
 
+// This cache is deliberately separate from production: it compiles only the fixed gfx1201
+// wave32-reduction module and is reachable only through the direct prototype ABI.
+class HipRmsNormShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "RMSNorm shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_rmsnorm_shuffle_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            append_error(
+                error,
+                compile_error.empty() ?
+                    "failed to build RMSNorm shuffle prototype HIP kernel" :
+                    compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for RMSNorm shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_rmsnorm_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for RMSNorm shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        modules_.emplace(device_id, std::move(loaded));
+        return function;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+    };
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipRmsNormShufflePrototypeKernelCache &hip_rmsnorm_shuffle_prototype_kernel_cache() {
+    static HipRmsNormShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 bool rmsnorm_f32_hip_kernel(
     const ullm_runtime_buffer *input_buffer,
     const ullm_runtime_buffer *weight_buffer,
@@ -8879,6 +9063,49 @@ bool rmsnorm_f32_hip_kernel(
             device_id)) {
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for f32 RMSNorm";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool rmsnorm_shuffle_prototype_f32_hip_kernel(
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *weight_buffer,
+    size_t elements,
+    float epsilon,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = input_buffer->hip_device_id;
+    void *function = hip_rmsnorm_shuffle_prototype_kernel_cache().function_for_device(
+        device_id, error);
+    if (function == nullptr) {
+        return false;
+    }
+
+    constexpr unsigned int block_size = 256;
+    unsigned long long kernel_elements = static_cast<unsigned long long>(elements);
+    void *input_ptr = input_buffer->ptr;
+    void *weight_ptr = weight_buffer->ptr;
+    void *output_ptr = output_buffer->ptr;
+    void *kernel_params[] = {
+        &input_ptr,
+        &weight_ptr,
+        &kernel_elements,
+        &epsilon,
+        &output_ptr,
+    };
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel(
+            function,
+            1,
+            block_size,
+            kernel_params,
+            hip_stream,
+            device_id)) {
+        if (error != nullptr) {
+            *error = "hipModuleLaunchKernel failed for RMSNorm shuffle prototype";
         }
         return false;
     }

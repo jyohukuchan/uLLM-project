@@ -599,6 +599,68 @@ ullm_status ullm_runtime_rmsnorm_f32(
         stream);
 }
 
+ullm_status ullm_runtime_rmsnorm_shuffle_prototype_f32(
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *weight_buffer,
+    size_t elements,
+    float epsilon,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    constexpr size_t kQwen35RmsNormShufflePrototypeElements = 4096u;
+    if (input_buffer == nullptr || weight_buffer == nullptr || output_buffer == nullptr) {
+        set_error("RMSNorm shuffle prototype received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (elements != kQwen35RmsNormShufflePrototypeElements) {
+        set_error("RMSNorm shuffle prototype requires the Qwen3.5 M=1 hidden=4096 shape");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(epsilon) || epsilon <= 0.0f) {
+        set_error("RMSNorm shuffle prototype epsilon must be finite and greater than zero");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!buffers_share_backend(input_buffer, weight_buffer) ||
+        !buffers_share_backend(input_buffer, output_buffer)) {
+        set_error("RMSNorm shuffle prototype buffers belong to different backends or devices");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!stream_matches_buffer(output_buffer, stream)) {
+        set_error("RMSNorm shuffle prototype stream belongs to a different backend or device");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (input_buffer->backend != BackendKind::Hip || input_buffer->hip_device_id < 0 ||
+        hip_runtime().device_arch_name(input_buffer->hip_device_id) != "gfx1201") {
+        set_error("RMSNorm shuffle prototype requires a HIP gfx1201 backend");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const size_t required_bytes =
+        kQwen35RmsNormShufflePrototypeElements * sizeof(float);
+    if (input_buffer->bytes < required_bytes || weight_buffer->bytes < required_bytes ||
+        output_buffer->bytes < required_bytes) {
+        set_error("RMSNorm shuffle prototype buffer is too small for hidden=4096");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::string hip_kernel_error;
+    if (!rmsnorm_shuffle_prototype_f32_hip_kernel(
+            input_buffer,
+            weight_buffer,
+            elements,
+            epsilon,
+            output_buffer,
+            stream,
+            &hip_kernel_error)) {
+        set_error(
+            hip_kernel_error.empty() ?
+                "RMSNorm shuffle prototype HIP kernel launch failed" :
+                hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_segmented_rmsnorm_f32(
     const ullm_runtime_buffer *input_buffer,
     const ullm_runtime_buffer *weight_buffer,
