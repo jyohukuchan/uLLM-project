@@ -351,19 +351,31 @@ fn hip_aq4_fused_wide_load_prototypes_timing_vs_production() {
 }
 
 #[test]
-#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_DIFFERENTIAL=1"]
-fn hip_aq4_silu_mul_shuffle_prototype_matches_cpu_for_production_shape() {
-    assert_eq!(std::env::var("ULLM_RUN_AQ4_SILU_MUL_SHUFFLE_DIFFERENTIAL").as_deref(), Ok("1"));
-    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_SILU_MUL_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_aq4_silu_mul_production_matches_cpu_for_production_shape() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_AQ4_SILU_MUL_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1")
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_AQ4_MATVEC_KERNEL", Some("1"));
     let gpu = aq4_fused_wide_load_gpu_device();
     let mut state = 0x6a09_e667;
     // Both gate and up use the served Qwen3.5-9B MLP projection geometry.
     let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
     let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
-    let input: Vec<f32> = (0..4_096).map(|_| { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
+    let input: Vec<f32> = (0..4_096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state as f32 / u32::MAX as f32 * 2.0 - 1.0
+        })
+        .collect();
     let expected = aq4_fused_wide_load_run_silu(0, 0, &gate, &up, &input);
-    let actual = aq4_fused_wide_load_run_silu(gpu, 2, &gate, &up, &input);
-    aq4_fused_wide_load_assert_matches_cpu(&actual, &expected, "shuffle SiLU-mul");
+    let actual = aq4_fused_wide_load_run_silu(gpu, 0, &gate, &up, &input);
+    aq4_fused_wide_load_assert_matches_cpu(&actual, &expected, "production SiLU-mul");
 }
 
 #[test]

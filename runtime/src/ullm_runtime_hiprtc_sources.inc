@@ -741,12 +741,15 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
     }
 
     static std::string aq4_matvec_silu_mul_kernel_source_for_arch(const std::string &arch) {
-        return aq4_fused_rows_per_block_preamble(
-                   arch,
-                   8u,
-                   2u,
-                   "ULLM_AQ4_MATVEC_SILU_MUL_RPB") +
-               aq4_matvec_silu_mul_kernel_source();
+        const unsigned int rows_per_block = aq4_fused_rows_per_block_for_arch(
+            arch,
+            8u,
+            2u,
+            "ULLM_AQ4_MATVEC_SILU_MUL_RPB");
+        const bool use_gfx1201_shuffle = arch == "gfx1201" && rows_per_block == 8u;
+        return aq4_rows_per_block_preamble_for_rows(rows_per_block) +
+               (use_gfx1201_shuffle ? aq4_matvec_silu_mul_kernel_source()
+                                    : aq4_matvec_silu_mul_scalar_reference_kernel_source());
     }
 
     // Direct-only M=1 experiment; see the qkv/z/gate/beta counterpart above.
@@ -4273,7 +4276,10 @@ __device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
 )" + production;
     }
 
-    static const char *aq4_matvec_silu_mul_kernel_source() {
+    // Superseded scalar-reduction AQ4 matvec SiLU-mul reference. It is deliberately not passed
+    // to HIPRTC: production keeps the same entry-point ABI but uses the validated wave32
+    // shuffle reduction below. Retain this source for controlled rollback comparisons.
+    [[maybe_unused]] static const char *aq4_matvec_silu_mul_scalar_reference_kernel_source() {
         return R"(
 __device__ float ullm_aq4_matvec_thread_sum(
     const unsigned char *indices,
@@ -4545,7 +4551,7 @@ extern "C" __global__ void ullm_aq4_matvec_silu_mul_f32_kernel(
     }
 
     static std::string aq4_matvec_silu_mul_wide_load_prototype_kernel_source() {
-        std::string production = aq4_matvec_silu_mul_kernel_source();
+        std::string production = aq4_matvec_silu_mul_scalar_reference_kernel_source();
         const size_t kernel_offset = production.find("extern \"C\" __global__ void");
         if (kernel_offset == std::string::npos) return "";
         production.erase(0u, kernel_offset);
@@ -4644,13 +4650,11 @@ __device__ void ullm_aq4_matvec_silu_mul_thread_sums(
 )" + production;
     }
 
-    static std::string aq4_matvec_silu_mul_shuffle_prototype_kernel_source() {
-        std::string prototype = aq4_matvec_silu_mul_kernel_source();
-        const std::string production_name = "ullm_aq4_matvec_silu_mul_f32_kernel";
-        const size_t name_offset = prototype.find(production_name);
-        if (name_offset == std::string::npos) return "";
-        prototype.replace(name_offset, production_name.size(),
-            "ullm_aq4_matvec_silu_mul_shuffle_prototype_f32_kernel");
+    // Production AQ4 matvec SiLU-mul body. The host ABI and HIPRTC entry-point name remain
+    // unchanged, so package resident decode continues through its existing direct
+    // aq4_matvec_silu_mul_f32 dispatch.
+    static std::string aq4_matvec_silu_mul_kernel_source() {
+        std::string production = aq4_matvec_silu_mul_scalar_reference_kernel_source();
         const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
     __shared__ float gate_partial[256];
     __shared__ float up_partial[256];
@@ -4660,9 +4664,9 @@ __device__ void ullm_aq4_matvec_silu_mul_thread_sums(
     // Gate and up keep independent accumulators, but neither needs cross-wave/LDS reduction.
     float gate_sum = 0.0f;
     float up_sum = 0.0f;)";
-        const size_t setup_offset = prototype.find(lds_setup);
+        const size_t setup_offset = production.find(lds_setup);
         if (setup_offset == std::string::npos) return "";
-        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+        production.replace(setup_offset, lds_setup.size(), shuffle_setup);
         const std::string lds_tree = R"(    gate_partial[tid] = gate_sum;
     up_partial[tid] = up_sum;
     __syncthreads();
@@ -4683,9 +4687,21 @@ __device__ void ullm_aq4_matvec_silu_mul_thread_sums(
     if (lane == 0 && row < rows) {
         float gate_value = gate_sum;
         float up_value = up_sum;)";
-        const size_t tree_offset = prototype.find(lds_tree);
+        const size_t tree_offset = production.find(lds_tree);
         if (tree_offset == std::string::npos) return "";
-        prototype.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+        production.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+        return production;
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string aq4_matvec_silu_mul_shuffle_prototype_kernel_source() {
+        std::string prototype = aq4_matvec_silu_mul_kernel_source();
+        const std::string production_name = "ullm_aq4_matvec_silu_mul_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(name_offset, production_name.size(),
+            "ullm_aq4_matvec_silu_mul_shuffle_prototype_f32_kernel");
         return prototype;
     }
 
