@@ -7,5 +7,6 @@ mod tests {
     include!("../test_parts/part_02.rs");
     include!("../test_parts/part_03.rs");
     include!("../test_parts/aq4_wide_load_prototype.rs");
+    include!("../test_parts/aq4_matvec_add_wide_load_prototype.rs");
     include!("../test_parts/aq4_fused_wide_load_prototype.rs");
 }

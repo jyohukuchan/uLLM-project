@@ -688,6 +688,18 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_add_kernel_source();
     }
 
+    // Direct-only experiment. Keep add's RPB=8 geometry; unlike the multi-stream fused
+    // experiments, this body owns exactly one packed AQ4 stream and one accumulator.
+    static std::string aq4_matvec_add_wide_load_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   8u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_ADD_RPB") +
+               aq4_matvec_add_wide_load_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_pair_kernel_source_for_arch(const std::string &arch) {
         return aq4_fused_rows_per_block_preamble(
                    arch,
@@ -2913,6 +2925,105 @@ extern "C" __global__ void ullm_aq4_matvec_add_f32_kernel(
         }
         __syncthreads();
     }
+    if (lane == 0 && row < rows) {
+        float value = partial[partial_offset];
+        if (row_scales != nullptr && row < row_scale_count) {
+            value *= row_scales[row];
+        }
+        output[row] = residual[row] + value;
+    }
+}
+)";
+    }
+
+    static const char *aq4_matvec_add_wide_load_prototype_kernel_source() {
+        return R"(
+extern "C" __global__ void ullm_aq4_matvec_add_wide_load_prototype_f32_kernel(
+    const unsigned char *indices,
+    const unsigned char *scale_indices,
+    const float *codebook,
+    const float *scale_values,
+    const float *input,
+    const float *residual,
+    const float *row_scales,
+    unsigned long long scale_count,
+    unsigned long long group_size,
+    float tensor_scale,
+    unsigned long long row_scale_count,
+    unsigned long long rows,
+    unsigned long long cols,
+    float *output) {
+    static_assert(sizeof(uint4) == 16u, "AQ4 add wide load must remain 128 bits");
+    static_assert(alignof(uint4) == 16u, "AQ4 add wide load must remain 16-byte aligned");
+    const unsigned int tid = threadIdx.x;
+    constexpr unsigned int rows_per_block = ULLM_AQ4_ROWS_PER_BLOCK;
+    constexpr unsigned int threads_per_row = 256u / rows_per_block;
+    const unsigned int row_in_block = tid / threads_per_row;
+    const unsigned int lane = tid - row_in_block * threads_per_row;
+    const unsigned long long row =
+        static_cast<unsigned long long>(blockIdx.x) * rows_per_block + row_in_block;
+    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    if (row < rows) {
+        const unsigned long long row_offset = row * cols;
+        const unsigned long long row_byte_offset = row_offset >> 1;
+        const unsigned long long chunks_per_row = cols / 32ull;
+        const unsigned long long groups_per_row = cols / group_size;
+        // This direct-only ABI admits complete, aligned 32-element chunks only. Each scoped
+        // uint4 supplies 16 packed bytes: four group8s or two group16s for this one stream.
+        for (unsigned long long chunk = lane; chunk < chunks_per_row;
+             chunk += threads_per_row) {
+            const uint4 packed = *reinterpret_cast<const uint4 *>(
+                indices + row_byte_offset + chunk * 16ull);
+            const unsigned long long col_base = chunk * 32ull;
+            const unsigned long long group_base =
+                row * groups_per_row + col_base / group_size;
+            const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
+#pragma unroll
+            for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+                if (group_in_chunk >= groups_per_chunk) {
+                    continue;
+                }
+                const unsigned long long group = group_base + group_in_chunk;
+                const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group]);
+                if (scale_index >= scale_count) {
+                    continue;
+                }
+                const unsigned int byte_start =
+                    group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+                const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+                float raw_sum = 0.0f;
+#pragma unroll
+                for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                    if (byte_offset >= byte_count) {
+                        continue;
+                    }
+                    const unsigned int packed_byte_index = byte_start + byte_offset;
+                    const unsigned int word_index = packed_byte_index >> 2;
+                    const unsigned int word = word_index == 0u ? packed.x :
+                        (word_index == 1u ? packed.y :
+                            (word_index == 2u ? packed.z : packed.w));
+                    const unsigned int packed_byte =
+                        (word >> (8u * (packed_byte_index & 3u))) & 0xffu;
+                    const unsigned long long col =
+                        col_base + static_cast<unsigned long long>(packed_byte_index * 2u);
+                    raw_sum += codebook[packed_byte & 0x0fu] * input[col];
+                    raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
+                }
+                sum += raw_sum * scale_values[scale_index] * tensor_scale;
+            }
+        }
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[partial_offset + lane] += partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    // Preserve the production residual-add epilogue: it is not another AQ4 stream.
     if (lane == 0 && row < rows) {
         float value = partial[partial_offset];
         if (row_scales != nullptr && row < row_scale_count) {
