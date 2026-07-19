@@ -1,10 +1,10 @@
 #[test]
-#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WIDE_LOAD_DIFFERENTIAL=1"]
-fn hip_aq4_wide_load_prototype_m1_model_shapes_match_cpu_when_enabled() {
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_aq4_matvec_production_m1_model_shapes_match_cpu_when_enabled() {
     assert_eq!(
-        std::env::var("ULLM_RUN_AQ4_WIDE_LOAD_DIFFERENTIAL").as_deref(),
+        std::env::var("ULLM_RUN_AQ4_MATVEC_PRODUCTION_DIFFERENTIAL").as_deref(),
         Ok("1"),
-        "set ULLM_RUN_AQ4_WIDE_LOAD_DIFFERENTIAL=1 before running this GPU differential test"
+        "set ULLM_RUN_AQ4_MATVEC_PRODUCTION_DIFFERENTIAL=1 before running this GPU differential test"
     );
     let hip_device = (1..device_count().unwrap())
         .find(|&device| {
@@ -44,7 +44,7 @@ fn hip_aq4_wide_load_prototype_m1_model_shapes_match_cpu_when_enabled() {
         let input: Vec<f32> = (0..cols).map(|_| next() * 2.0 - 1.0).collect();
         let row_scales: Vec<f32> = (0..rows).map(|_| 0.75 + next() * 0.5).collect();
         let row_scale_count = if use_row_scale { rows } else { 0 };
-        let run = |device: u32, wide: bool| {
+        let run_production = |device: u32| {
             let mut context = RuntimeContext::create(device).unwrap();
             let mut stream = context.create_stream().unwrap();
             let mut index = context.alloc_buffer(index_bytes).unwrap();
@@ -75,43 +75,23 @@ fn hip_aq4_wide_load_prototype_m1_model_shapes_match_cpu_when_enabled() {
                     .copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut stream))
                     .unwrap();
             }
-            if wide {
-                aq4_matvec_wide_load_prototype_f32(
-                    &index,
-                    &scale,
-                    &codebook_buffer,
-                    &scale_values_buffer,
-                    &input_buffer,
-                    row_scale_buffer.as_ref(),
-                    scale_count,
-                    group_size,
-                    0.75,
-                    row_scale_count,
-                    rows,
-                    cols,
-                    &mut output,
-                    Some(&mut stream),
-                )
-                .unwrap();
-            } else {
-                aq4_matvec_f32(
-                    &index,
-                    &scale,
-                    &codebook_buffer,
-                    &scale_values_buffer,
-                    &input_buffer,
-                    row_scale_buffer.as_ref(),
-                    scale_count,
-                    group_size,
-                    0.75,
-                    row_scale_count,
-                    rows,
-                    cols,
-                    &mut output,
-                    Some(&mut stream),
-                )
-                .unwrap();
-            }
+            aq4_matvec_f32(
+                &index,
+                &scale,
+                &codebook_buffer,
+                &scale_values_buffer,
+                &input_buffer,
+                row_scale_buffer.as_ref(),
+                scale_count,
+                group_size,
+                0.75,
+                row_scale_count,
+                rows,
+                cols,
+                &mut output,
+                Some(&mut stream),
+            )
+            .unwrap();
             stream.synchronize().unwrap();
             let mut bytes = vec![0; rows * 4];
             output
@@ -120,10 +100,10 @@ fn hip_aq4_wide_load_prototype_m1_model_shapes_match_cpu_when_enabled() {
             stream.synchronize().unwrap();
             le_bytes_to_f32s(&bytes)
         };
-        let expected = run(0, false);
-        let actual = run(hip_device, true);
+        let expected = run_production(0);
+        let actual = run_production(hip_device);
         assert_f32s_close(&actual, &expected, 1e-3);
-        eprintln!("AQ4 M=1 wide-load differential family={family} rows={rows} cols={cols} group{group_size}: ok");
+        eprintln!("AQ4 production M=1 differential family={family} rows={rows} cols={cols} group{group_size}: ok");
     }
 }
 

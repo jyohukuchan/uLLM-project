@@ -5391,6 +5391,19 @@ bool aq4_matvec_f32_hip_kernel(
     ullm_runtime_stream *stream,
     std::string *error) {
     const int device_id = index_buffer->hip_device_id;
+    // The promoted body is validated for the Qwen3.5 decode contract only. Preserve the
+    // established public ABI for unrelated AQ4 geometries by letting the caller use its existing
+    // host-staging fallback rather than launching a wide kernel with incomplete chunks.
+    if (hip_runtime().device_arch_name(device_id) != "gfx1201" ||
+        (group_size != 8u && group_size != 16u) || cols % 32u != 0u ||
+        cols % group_size != 0u ||
+        (reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u) {
+        if (error != nullptr) {
+            *error = "AQ4 production wide-load matvec requires gfx1201, group8/group16, "
+                "cols divisible by 32, and a 16-byte-aligned index buffer";
+        }
+        return false;
+    }
     void *function = hip_aq4_matvec_kernel_cache().function_for_device(device_id, error);
     if (function == nullptr) {
         return false;

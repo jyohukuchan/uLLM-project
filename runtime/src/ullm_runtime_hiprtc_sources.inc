@@ -753,7 +753,10 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_gate_beta_kernel_source();
     }
 
-    static const char *aq4_matvec_kernel_source() {
+    // Superseded scalar M=1 AQ4 matvec reference. It is deliberately not passed to HIPRTC:
+    // production keeps the same entry-point ABI but uses the validated wide-load body below.
+    // Retain this source for controlled rollback comparisons.
+    [[maybe_unused]] static const char *aq4_matvec_scalar_reference_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
     const unsigned char *indices,
@@ -863,11 +866,13 @@ extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
 )";
     }
 
-    static const char *aq4_matvec_wide_load_prototype_kernel_source() {
+    // Production M=1 AQ4 matvec body. The host ABI and HIPRTC entry-point name remain unchanged,
+    // so resident decode continues through its existing direct aq4_matvec_f32 dispatch.
+    static const char *aq4_matvec_kernel_source() {
         return R"(
-// This direct-only M=1 prototype deliberately accepts only complete 32-element chunks.
+// Validated Qwen3.5 AQ4 M=1 geometries have group8/group16 and complete 32-element chunks.
 // `uint4` is the same explicit 128-bit packed-AQ4 load type used by the Wide-K WMMA kernels.
-extern "C" __global__ void ullm_aq4_matvec_wide_load_prototype_f32_kernel(
+extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
     const unsigned char *indices,
     const unsigned char *scale_indices,
     const float *codebook,
@@ -961,6 +966,22 @@ extern "C" __global__ void ullm_aq4_matvec_wide_load_prototype_f32_kernel(
     }
 }
 )";
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string aq4_matvec_wide_load_prototype_kernel_source() {
+        std::string source = aq4_matvec_kernel_source();
+        constexpr const char production_name[] = "ullm_aq4_matvec_f32_kernel";
+        const size_t name_offset = source.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(
+            name_offset,
+            sizeof(production_name) - 1u,
+            "ullm_aq4_matvec_wide_load_prototype_f32_kernel");
+        return source;
     }
 
     static const char *aq4_matvec_batch_kernel_source() {
