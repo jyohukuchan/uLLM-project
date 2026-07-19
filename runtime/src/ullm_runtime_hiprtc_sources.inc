@@ -700,6 +700,18 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_add_wide_load_prototype_kernel_source();
     }
 
+    // Direct-only gfx1201 experiment. It retains the promoted uint4 weight traversal and
+    // residual-add epilogue, changing only the RPB=8 per-row LDS tree to a wave32 shuffle.
+    static std::string aq4_matvec_add_shuffle_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   8u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_ADD_RPB") +
+               aq4_matvec_add_shuffle_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_pair_kernel_source_for_arch(const std::string &arch) {
         return aq4_fused_rows_per_block_preamble(
                    arch,
@@ -3101,6 +3113,57 @@ extern "C" __global__ void ullm_aq4_matvec_add_f32_kernel(
             name_offset,
             sizeof(production_name) - 1u,
             "ullm_aq4_matvec_add_wide_load_prototype_f32_kernel");
+        return source;
+    }
+
+    // Keep the shuffle experiment isolated from both production and the historical wide-load
+    // comparison. RPB=8 gives each row exactly one gfx1201 wave32, so no cross-wave LDS combine
+    // is needed: lane 0 receives the shuffle result directly.
+    static std::string aq4_matvec_add_shuffle_prototype_kernel_source() {
+        std::string source = aq4_matvec_add_kernel_source();
+        constexpr const char production_name[] = "ullm_aq4_matvec_add_f32_kernel";
+        const size_t name_offset = source.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(
+            name_offset,
+            sizeof(production_name) - 1u,
+            "ullm_aq4_matvec_add_shuffle_prototype_f32_kernel");
+
+        const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float partial[256];
+    float sum = 0.0f;)";
+        const std::string shuffle_setup = R"(    // RPB=8 maps each row's contiguous 32 threads to one gfx1201 wave32.
+    float sum = 0.0f;)";
+        const size_t setup_offset = source.find(lds_setup);
+        if (setup_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_tree = R"(    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[partial_offset + lane] += partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    // Preserve the production residual-add epilogue: it is not another AQ4 stream.
+    if (lane == 0 && row < rows) {
+        float value = partial[partial_offset];)";
+        const std::string shuffle_reduction = R"(    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset, threads_per_row);
+    }
+    // Preserve the production residual-add epilogue: it is not another AQ4 stream.
+    if (lane == 0 && row < rows) {
+        float value = sum;)";
+        const size_t tree_offset = source.find(lds_tree);
+        if (tree_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(tree_offset, lds_tree.size(), shuffle_reduction);
         return source;
     }
 

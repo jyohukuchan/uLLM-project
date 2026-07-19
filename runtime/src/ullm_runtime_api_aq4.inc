@@ -2552,6 +2552,106 @@ ullm_status ullm_runtime_aq4_matvec_add_wide_load_prototype_f32(
     return ULLM_STATUS_OK;
 }
 
+ullm_status ullm_runtime_aq4_matvec_add_shuffle_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *residual_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    if (index_buffer == nullptr || scale_buffer == nullptr || codebook_buffer == nullptr ||
+        scale_values_buffer == nullptr || input_buffer == nullptr || residual_buffer == nullptr ||
+        output_buffer == nullptr) {
+        set_error("AQ4 matvec add shuffle prototype received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if ((group_size != 8u && group_size != 16u) || scale_count == 0u || rows == 0u ||
+        cols == 0u || cols % 32u != 0u || cols % group_size != 0u) {
+        set_error("AQ4 matvec add shuffle prototype requires nonzero group8/group16 rows/cols with cols divisible by 32");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (row_scale_count != 0u && row_scale_count != rows) {
+        set_error("AQ4 matvec add shuffle prototype row_scale_count must be zero or rows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (row_scale_count != 0u && row_scale_buffer == nullptr) {
+        set_error("AQ4 matvec add shuffle prototype row_scale_count requires a row-scale buffer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(tensor_scale) || tensor_scale <= 0.0f) {
+        set_error("AQ4 matvec add shuffle prototype tensor scale must be finite and greater than zero");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (index_buffer->backend != BackendKind::Hip ||
+        !buffers_share_backend(index_buffer, scale_buffer) ||
+        !buffers_share_backend(index_buffer, codebook_buffer) ||
+        !buffers_share_backend(index_buffer, scale_values_buffer) ||
+        !buffers_share_backend(index_buffer, input_buffer) ||
+        !buffers_share_backend(index_buffer, residual_buffer) ||
+        !buffers_share_backend(index_buffer, output_buffer) ||
+        (row_scale_buffer != nullptr && !buffers_share_backend(index_buffer, row_scale_buffer))) {
+        set_error("AQ4 matvec add shuffle prototype requires HIP buffers on one device");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!stream_matches_buffer(output_buffer, stream)) {
+        set_error("AQ4 matvec add shuffle prototype stream belongs to a different backend or device");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (hip_runtime().device_arch_name(index_buffer->hip_device_id) != "gfx1201") {
+        set_error("AQ4 matvec add shuffle prototype requires exact gfx1201 architecture");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u) {
+        set_error("AQ4 matvec add shuffle prototype requires a 16-byte-aligned index buffer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / rows || cols > max_size / sizeof(float) ||
+        rows > max_size / sizeof(float) || scale_count > max_size / sizeof(float) ||
+        row_scale_count > max_size / sizeof(float)) {
+        set_error("AQ4 matvec add shuffle prototype byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t elements = rows * cols;
+    const size_t required_index_bytes = elements / 2u;
+    const size_t groups = elements / group_size;
+    const size_t required_input_bytes = cols * sizeof(float);
+    const size_t required_output_bytes = rows * sizeof(float);
+    const size_t required_scale_value_bytes = scale_count * sizeof(float);
+    const size_t required_row_scale_bytes = row_scale_count * sizeof(float);
+    if (index_buffer->bytes < required_index_bytes || scale_buffer->bytes < groups ||
+        scale_values_buffer->bytes < required_scale_value_bytes ||
+        input_buffer->bytes < required_input_bytes || residual_buffer->bytes < required_output_bytes ||
+        output_buffer->bytes < required_output_bytes ||
+        (row_scale_buffer != nullptr && row_scale_buffer->bytes < required_row_scale_bytes) ||
+        codebook_buffer->bytes < 16u * sizeof(float) ||
+        codebook_buffer->bytes % sizeof(float) != 0u) {
+        set_error("AQ4 matvec add shuffle prototype buffer is too small or malformed");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    std::string hip_kernel_error;
+    if (!aq4_matvec_add_shuffle_prototype_f32_hip_kernel(
+            index_buffer, scale_buffer, codebook_buffer, scale_values_buffer, input_buffer,
+            residual_buffer, row_scale_buffer, scale_count, group_size, tensor_scale,
+            row_scale_count, rows, cols, output_buffer, stream, &hip_kernel_error)) {
+        set_error(hip_kernel_error.empty() ?
+            "AQ4 matvec add shuffle prototype HIP kernel launch failed" :
+            hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_aq4_matvec_pair_f32(
     const ullm_runtime_buffer *left_index_buffer,
     const ullm_runtime_buffer *left_scale_buffer,

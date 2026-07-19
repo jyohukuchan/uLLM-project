@@ -829,6 +829,19 @@ public:
             error);
     }
 
+    bool compile_aq4_matvec_add_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = aq4_matvec_add_shuffle_prototype_kernel_source_for_arch(arch);
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_aq4_matvec_add_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
     bool compile_aq4_matvec_pair_kernel(
         const std::string &arch,
         std::vector<char> *code,
@@ -4382,6 +4395,79 @@ HipAq4MatvecAddWideLoadPrototypeKernelCache &hip_aq4_matvec_add_wide_load_protot
     return cache;
 }
 
+// This remains independent from production and the wide-load comparison module: it changes only
+// matvec-add's reduction, which keeps differential and timing results attributable to shuffles.
+class HipAq4MatvecAddShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "AQ4 matvec add shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_aq4_matvec_add_shuffle_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            append_error(
+                error,
+                compile_error.empty() ?
+                    "failed to build AQ4 matvec add shuffle prototype HIP kernel" :
+                    compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for AQ4 matvec add shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_aq4_matvec_add_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for AQ4 matvec add shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule {
+        void *module = nullptr;
+        void *function = nullptr;
+    };
+
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) {
+            return;
+        }
+        if (!error->empty()) {
+            error->append("\n");
+        }
+        error->append(message);
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipAq4MatvecAddShufflePrototypeKernelCache &hip_aq4_matvec_add_shuffle_prototype_kernel_cache() {
+    static HipAq4MatvecAddShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 class HipAq4MatvecPairKernelCache {
 public:
     void *function_for_device(int device_id, std::string *error) {
@@ -6199,6 +6285,94 @@ bool aq4_matvec_add_wide_load_prototype_f32_hip_kernel(
             device_id)) {
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for AQ4 matvec add wide-load prototype";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool aq4_matvec_add_shuffle_prototype_f32_hip_kernel(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *residual_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = index_buffer->hip_device_id;
+    const Aq4MatvecLaunchConfig launch_config =
+        aq4_matvec_launch_config_for_fused_kernel(
+            device_id,
+            8u,
+            2u,
+            "ULLM_AQ4_MATVEC_ADD_RPB");
+    if (launch_config.rows_per_block != 8u) {
+        if (error != nullptr) {
+            *error = "AQ4 matvec add shuffle prototype requires ULLM_AQ4_MATVEC_ADD_RPB=8";
+        }
+        return false;
+    }
+    void *function = hip_aq4_matvec_add_shuffle_prototype_kernel_cache().function_for_device(
+        device_id, error);
+    if (function == nullptr) {
+        return false;
+    }
+    const size_t grid_size =
+        (rows + launch_config.rows_per_block - 1) / launch_config.rows_per_block;
+    if (grid_size > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+        if (error != nullptr) {
+            *error = "AQ4 matvec add shuffle prototype row count exceeds HIP grid limit";
+        }
+        return false;
+    }
+    unsigned long long kernel_scale_count = static_cast<unsigned long long>(scale_count);
+    unsigned long long kernel_group_size = static_cast<unsigned long long>(group_size);
+    unsigned long long kernel_rows = static_cast<unsigned long long>(rows);
+    unsigned long long kernel_cols = static_cast<unsigned long long>(cols);
+    unsigned long long kernel_row_scale_count = static_cast<unsigned long long>(row_scale_count);
+    void *index_ptr = index_buffer->ptr;
+    void *scale_ptr = scale_buffer->ptr;
+    void *codebook_ptr = codebook_buffer->ptr;
+    void *scale_values_ptr = scale_values_buffer->ptr;
+    void *input_ptr = input_buffer->ptr;
+    void *residual_ptr = residual_buffer->ptr;
+    void *row_scale_ptr = row_scale_buffer == nullptr ? nullptr : row_scale_buffer->ptr;
+    void *output_ptr = output_buffer->ptr;
+    void *kernel_params[] = {
+        &index_ptr,
+        &scale_ptr,
+        &codebook_ptr,
+        &scale_values_ptr,
+        &input_ptr,
+        &residual_ptr,
+        &row_scale_ptr,
+        &kernel_scale_count,
+        &kernel_group_size,
+        &tensor_scale,
+        &kernel_row_scale_count,
+        &kernel_rows,
+        &kernel_cols,
+        &output_ptr,
+    };
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel(
+            function,
+            static_cast<unsigned int>(grid_size),
+            launch_config.block_size,
+            kernel_params,
+            hip_stream,
+            device_id)) {
+        if (error != nullptr) {
+            *error = "hipModuleLaunchKernel failed for AQ4 matvec add shuffle prototype";
         }
         return false;
     }

@@ -349,6 +349,23 @@ unsafe extern "C" {
         output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_aq4_matvec_add_shuffle_prototype_f32(
+        index_buffer: *const RawRuntimeBuffer,
+        scale_buffer: *const RawRuntimeBuffer,
+        codebook_buffer: *const RawRuntimeBuffer,
+        scale_values_buffer: *const RawRuntimeBuffer,
+        input_buffer: *const RawRuntimeBuffer,
+        residual_buffer: *const RawRuntimeBuffer,
+        row_scale_buffer: *const RawRuntimeBuffer,
+        scale_count: usize,
+        group_size: usize,
+        tensor_scale: f32,
+        row_scale_count: usize,
+        rows: usize,
+        cols: usize,
+        output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_aq4_matvec_pair_f32(
         left_index_buffer: *const RawRuntimeBuffer,
         left_scale_buffer: *const RawRuntimeBuffer,
@@ -2955,6 +2972,105 @@ pub fn aq4_matvec_add_wide_load_prototype_f32(
     let row_scale_raw = row_scale_buffer.map_or(std::ptr::null(), |buffer| buffer.raw.as_ptr());
     status_to_result(unsafe {
         ullm_runtime_aq4_matvec_add_wide_load_prototype_f32(
+            index_buffer.raw.as_ptr(),
+            scale_buffer.raw.as_ptr(),
+            codebook_buffer.raw.as_ptr(),
+            scale_values_buffer.raw.as_ptr(),
+            input_buffer.raw.as_ptr(),
+            residual_buffer.raw.as_ptr(),
+            row_scale_raw,
+            scale_count,
+            group_size,
+            tensor_scale,
+            row_scale_count,
+            rows,
+            cols,
+            output_buffer.raw.as_ptr(),
+            stream,
+        )
+    })
+}
+
+/// Direct-only gfx1201 AQ4 matvec-add shuffle prototype. It preserves the promoted uint4 weight
+/// traversal and residual-add epilogue while requiring the exact RPB=8 wave32 geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn aq4_matvec_add_shuffle_prototype_f32(
+    index_buffer: &RuntimeBuffer,
+    scale_buffer: &RuntimeBuffer,
+    codebook_buffer: &RuntimeBuffer,
+    scale_values_buffer: &RuntimeBuffer,
+    input_buffer: &RuntimeBuffer,
+    residual_buffer: &RuntimeBuffer,
+    row_scale_buffer: Option<&RuntimeBuffer>,
+    scale_count: usize,
+    group_size: usize,
+    tensor_scale: f32,
+    row_scale_count: usize,
+    rows: usize,
+    cols: usize,
+    output_buffer: &mut RuntimeBuffer,
+    stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    if scale_count == 0 || rows == 0 || cols == 0 {
+        return Err(
+            "AQ4 matvec add shuffle prototype requires nonzero scale_count, rows, and cols".into(),
+        );
+    }
+    if !matches!(group_size, 8 | 16)
+        || !cols.is_multiple_of(32)
+        || !cols.is_multiple_of(group_size)
+    {
+        return Err(
+            "AQ4 matvec add shuffle prototype requires group8/group16 and cols divisible by 32"
+                .into(),
+        );
+    }
+    if row_scale_count != 0 && row_scale_count != rows {
+        return Err("AQ4 matvec add shuffle prototype row_scale_count must be zero or rows".into());
+    }
+    if row_scale_count != 0 && row_scale_buffer.is_none() {
+        return Err(
+            "AQ4 matvec add shuffle prototype row_scale_count requires a row-scale buffer".into(),
+        );
+    }
+    if !tensor_scale.is_finite() || tensor_scale <= 0.0 {
+        return Err("AQ4 matvec add shuffle prototype tensor_scale must be finite and positive".into());
+    }
+    let elements = rows.checked_mul(cols).ok_or_else(|| {
+        "AQ4 matvec add shuffle prototype matrix element count overflows".to_string()
+    })?;
+    let index_bytes = elements / 2;
+    let groups = elements / group_size;
+    let scale_value_bytes = scale_count.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        "AQ4 matvec add shuffle prototype scale value byte size overflows".to_string()
+    })?;
+    let input_bytes = cols.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        "AQ4 matvec add shuffle prototype input byte size overflows".to_string()
+    })?;
+    let output_bytes = rows.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        "AQ4 matvec add shuffle prototype output byte size overflows".to_string()
+    })?;
+    let row_scale_bytes = row_scale_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "AQ4 matvec add shuffle prototype row scale byte size overflows".to_string())?;
+    check_copy_range(0, index_bytes, index_buffer.size()?)?;
+    check_copy_range(0, groups, scale_buffer.size()?)?;
+    check_copy_range(
+        0,
+        16 * std::mem::size_of::<f32>(),
+        codebook_buffer.size()?,
+    )?;
+    check_copy_range(0, scale_value_bytes, scale_values_buffer.size()?)?;
+    check_copy_range(0, input_bytes, input_buffer.size()?)?;
+    check_copy_range(0, output_bytes, residual_buffer.size()?)?;
+    if let Some(row_scale_buffer) = row_scale_buffer {
+        check_copy_range(0, row_scale_bytes, row_scale_buffer.size()?)?;
+    }
+    check_copy_range(0, output_bytes, output_buffer.size()?)?;
+    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
+    let row_scale_raw = row_scale_buffer.map_or(std::ptr::null(), |buffer| buffer.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_aq4_matvec_add_shuffle_prototype_f32(
             index_buffer.raw.as_ptr(),
             scale_buffer.raw.as_ptr(),
             codebook_buffer.raw.as_ptr(),
