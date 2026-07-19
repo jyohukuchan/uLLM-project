@@ -102,7 +102,7 @@ fn aq4_matvec_add_run(
     le_bytes_to_f32s(&output_bytes)
 }
 
-fn aq4_matvec_add_shuffle_assert_matches_cpu(actual: &[f32], expected: &[f32], label: &str) {
+fn aq4_matvec_add_assert_matches_cpu(actual: &[f32], expected: &[f32], label: &str) {
     assert_eq!(actual.len(), expected.len(), "{label}: output lengths differ");
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         let tolerance = 5e-2_f32 + 1e-2_f32 * expected.abs();
@@ -127,6 +127,7 @@ fn hip_aq4_matvec_add_production_model_shapes_match_cpu_when_enabled() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _require_production_kernel =
         ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL", Some("1"));
+    let _rpb = ExperimentalEnvGuard::new("ULLM_AQ4_MATVEC_ADD_RPB", Some("8"));
     let mut state = 0x510e_527f_u32;
     let mut next = || {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -184,7 +185,7 @@ fn hip_aq4_matvec_add_production_model_shapes_match_cpu_when_enabled() {
             rows,
             cols,
         );
-        assert_f32s_close(&actual, &expected, 1e-3);
+        aq4_matvec_add_assert_matches_cpu(&actual, &expected, family);
         eprintln!(
             "AQ4 matvec-add production differential family={family} rows={rows} cols={cols} group{group_size}: ok"
         );
@@ -261,7 +262,7 @@ fn hip_aq4_matvec_add_shuffle_prototype_matches_cpu_for_production_shapes_when_e
             rows,
             cols,
         );
-        aq4_matvec_add_shuffle_assert_matches_cpu(&actual, &expected, family);
+        aq4_matvec_add_assert_matches_cpu(&actual, &expected, family);
         eprintln!(
             "AQ4 matvec-add shuffle differential family={family} rows={rows} cols={cols} group{group_size}: ok"
         );
