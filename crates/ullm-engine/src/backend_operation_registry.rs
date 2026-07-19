@@ -36,6 +36,7 @@ enum ProbeFaultStage {
     Aq4GemmWmma = 18,
     PagedCausalGqaChunkWmma = 19,
     Aq4GemmWmmaGroup8 = 20,
+    Aq4GemmWmmaRaggedM = 21,
 }
 
 type ProbeCacheKey = (u8, Option<String>, i32, u32, u64);
@@ -58,8 +59,8 @@ fn probe_cache_key(capabilities: &DeviceCapabilities) -> ProbeCacheKey {
 }
 
 #[cfg(test)]
-static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 21] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 21];
+static M1_PROBE_CHECKPOINT_COUNTS: [std::sync::atomic::AtomicUsize; 22] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 22];
 
 #[cfg(test)]
 std::thread_local! {
@@ -375,6 +376,8 @@ pub enum RuntimeFeature {
     HipPagedCausalGqaChunkWmma = 15,
     /// Direct gfx1201/group8 rocWMMA AQ4 GEMM ABI capability for M=128.
     HipAq4GemmWmmaGroup8 = 16,
+    /// Direct gfx1201/group16 rocWMMA AQ4 GEMM ABI capability for ragged M=65..=127.
+    HipAq4GemmWmmaRaggedM = 17,
 }
 
 /// Canonical production guard for a probed runtime feature.
@@ -411,6 +414,7 @@ pub const fn runtime_feature_environment(feature: RuntimeFeature) -> &'static st
             "ULLM_REQUIRE_HIP_PAGED_CAUSAL_GQA_WMMA_KERNEL"
         }
         RuntimeFeature::HipAq4GemmWmmaGroup8 => "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
+        RuntimeFeature::HipAq4GemmWmmaRaggedM => "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
     }
 }
 
@@ -452,6 +456,7 @@ impl DeviceCapabilities {
                 RuntimeFeature::HipAq4GemmWmma,
                 RuntimeFeature::HipPagedCausalGqaChunkWmma,
                 RuntimeFeature::HipAq4GemmWmmaGroup8,
+                RuntimeFeature::HipAq4GemmWmmaRaggedM,
             ] {
                 if std::env::var_os(runtime_feature_environment(feature)).as_deref()
                     == Some(std::ffi::OsStr::new("1"))
@@ -1071,6 +1076,44 @@ impl DeviceCapabilities {
             probe_fault_checkpoint(20, "aq4-gemm-wmma-group8")?;
             proven = proven.with(RuntimeFeature::HipAq4GemmWmmaGroup8);
         }
+        if policy.contains(RuntimeFeature::HipAq4GemmWmmaRaggedM) {
+            // Probe the largest validated ragged width on a real group16 projection. The
+            // independently guarded feature admits only M=65..=127 registry descriptors.
+            let binding = aq4_wmma_probe_binding(127);
+            let packed_indices = aq4_probe_packed_indices(binding)?;
+            let scale_indices = aq4_probe_scale_indices(binding)?;
+            let codebook_bytes = aq4_probe_codebook_bytes();
+            let scale_value_bytes = aq4_probe_scale_value_bytes();
+            let mut index = context.alloc_buffer(packed_indices.len())?;
+            index.copy_from_host(0, &packed_indices, Some(stream))?;
+            let mut scale = context.alloc_buffer(scale_indices.len())?;
+            scale.copy_from_host(0, &scale_indices, Some(stream))?;
+            let mut codebook = context.alloc_buffer(codebook_bytes.len())?;
+            codebook.copy_from_host(0, &codebook_bytes, Some(stream))?;
+            let mut scale_values = context.alloc_buffer(scale_value_bytes.len())?;
+            scale_values.copy_from_host(0, &scale_value_bytes, Some(stream))?;
+            let input = zeros(context, stream, binding.input_elements()?)?;
+            let mut output = zeros(context, stream, binding.output_elements()?)?;
+            ullm_runtime_sys::aq4_matvec_batch_wmma_ragged_m_prototype_f32(
+                &index,
+                &scale,
+                &codebook,
+                &scale_values,
+                &input,
+                None,
+                binding.scale_count,
+                binding.group_size,
+                f32::from_bits(binding.tensor_scale_bits),
+                binding.row_scale_count,
+                binding.rows,
+                binding.cols,
+                binding.batch_count,
+                &mut output,
+                Some(stream),
+            )?;
+            probe_fault_checkpoint(21, "aq4-gemm-wmma-ragged-m")?;
+            proven = proven.with(RuntimeFeature::HipAq4GemmWmmaRaggedM);
+        }
         if policy.contains(RuntimeFeature::HipLinearAttentionQkvPrepareBatch) {
             const SEQUENCE_LEN: usize = 128;
             let qkv = zeros(context, stream, SEQUENCE_LEN * 8_192)?;
@@ -1365,6 +1408,7 @@ pub enum ExecutableOperation {
     HipAq4GemmRegisterBm8Group8F32,
     HipAq4GemmWmmaF32,
     HipAq4GemmWmmaGroup8F32,
+    HipAq4GemmWmmaRaggedMF32,
     HipPagedDecodeAttentionF32,
     HipPagedDecodeAttentionSigmoidGateF32,
     HipPagedDecodeAttentionSplitF32(PagedDecodeSourceTile),
@@ -2529,6 +2573,90 @@ impl StartedOperationPlan<'_> {
         .map_err(|error| error.to_string())
     }
 
+    /// Executes the production gfx1201/group16 ragged-M rocWMMA AQ4 GEMM ABI selected at load
+    /// time.
+    ///
+    /// This method intentionally has no fallback path: a plan can select this ABI only after its
+    /// independent ragged-M probe succeeds, and ABI failures must remain visible to the caller.
+    pub fn execute_aq4_gemm_wmma_ragged_m_f32(
+        self,
+        index: &ullm_runtime_sys::RuntimeBuffer,
+        scale: &ullm_runtime_sys::RuntimeBuffer,
+        codebook: &ullm_runtime_sys::RuntimeBuffer,
+        scale_values: &ullm_runtime_sys::RuntimeBuffer,
+        input: &ullm_runtime_sys::RuntimeBuffer,
+        row_scale: Option<&ullm_runtime_sys::RuntimeBuffer>,
+        output: &mut ullm_runtime_sys::RuntimeBuffer,
+        stream: &mut ullm_runtime_sys::RuntimeStream,
+    ) -> Result<(), String> {
+        let plan = self.plan();
+        let OperationGeometry::Aq4MatvecBatch {
+            rows,
+            cols,
+            group_size,
+            scale_count,
+            row_scale_count,
+            tensor_scale_bits,
+        } = plan.geometry
+        else {
+            return Err(
+                "resolved AQ4 ragged-M WMMA GEMM operation has incompatible geometry".into(),
+            );
+        };
+        if plan.kind != OperationKind::Aq4MatvecBatch
+            || plan.executable != ExecutableOperation::HipAq4GemmWmmaRaggedMF32
+            || plan.device.backend != OperationBackend::Hip
+            || plan.device.architecture.as_deref() != Some("gfx1201")
+            || !(65..=127).contains(&plan.batch_width)
+            || plan.chunk_width != 1
+            || group_size != 16
+            || rows == 0
+            || !rows.is_multiple_of(16)
+            || cols == 0
+            || !cols.is_multiple_of(32)
+        {
+            return Err(format!(
+                "resolved backend operation {} is not a gfx1201/group16/M=65..=127 AQ4 ragged-M WMMA GEMM operation",
+                plan.implementation_id
+            ));
+        }
+        if scale_count == 0 {
+            return Err("resolved AQ4 ragged-M WMMA GEMM operation has zero scale count".into());
+        }
+        let tensor_scale = f32::from_bits(tensor_scale_bits);
+        if !tensor_scale.is_finite() || tensor_scale <= 0.0 {
+            return Err("resolved AQ4 ragged-M WMMA GEMM tensor scale is invalid".into());
+        }
+        if row_scale_count == 0 && row_scale.is_some() {
+            return Err(
+                "resolved AQ4 ragged-M WMMA GEMM has an unexpected row scale buffer".into(),
+            );
+        }
+        if row_scale_count != 0 && row_scale.is_none() {
+            return Err("resolved AQ4 ragged-M WMMA GEMM is missing its row scale buffer".into());
+        }
+        let batch_count = usize::try_from(plan.batch_width)
+            .map_err(|_| "resolved AQ4 ragged-M WMMA GEMM width exceeds usize".to_string())?;
+        ullm_runtime_sys::aq4_matvec_batch_wmma_ragged_m_prototype_f32(
+            index,
+            scale,
+            codebook,
+            scale_values,
+            input,
+            row_scale,
+            scale_count,
+            group_size,
+            tensor_scale,
+            row_scale_count,
+            rows,
+            cols,
+            batch_count,
+            output,
+            Some(stream),
+        )
+        .map_err(|error| error.to_string())
+    }
+
     /// Executes the production gfx1201/group8 rocWMMA AQ4 GEMM ABI selected at load time.
     ///
     /// This method intentionally has no fallback path: M=128 plans that resolve to group8 WMMA
@@ -3321,6 +3449,11 @@ fn validate_descriptor(descriptor: &ImplementationDescriptor) -> Result<(), Stri
             OperationKind::Aq4MatvecBatch,
             OperationGeometry::Aq4MatvecBatch { .. },
             ExecutableOperation::HipAq4GemmWmmaGroup8F32,
+        ) => true,
+        (
+            OperationKind::Aq4MatvecBatch,
+            OperationGeometry::Aq4MatvecBatch { .. },
+            ExecutableOperation::HipAq4GemmWmmaRaggedMF32,
         ) => true,
         (
             OperationKind::PagedCausalGqaRead,
@@ -5059,7 +5192,9 @@ fn aq4_matvec_batch_descriptors(
         && cols.is_multiple_of(32);
     let eligible_register_bm8 = eligible_register_bm8_group16 || eligible_register_bm8_group8;
     let eligible_wmma_any = eligible_wmma || eligible_wmma_group8;
-    let descriptor_count = if eligible_wmma_any && eligible_register_bm8 {
+    let descriptor_count = if eligible_wmma && eligible_register_bm8_group16 {
+        4
+    } else if eligible_wmma_any && eligible_register_bm8 {
         3
     } else if eligible_wmma_any || eligible_register_bm8 {
         2
@@ -5074,7 +5209,8 @@ fn aq4_matvec_batch_descriptors(
                            required_features,
                            executable,
                            architecture,
-                           workspace| {
+                           workspace,
+                           priority| {
         descriptors.push(ImplementationDescriptor {
             id,
             semantic_version: "1.0.0",
@@ -5108,7 +5244,7 @@ fn aq4_matvec_batch_descriptors(
                 externally_visible_before_commit: false,
             },
             promotion: PromotionStatus::Production,
-            priority: 100,
+            priority,
             fallback_id: None,
             deterministic: true,
             executable,
@@ -5124,8 +5260,8 @@ fn aq4_matvec_batch_descriptors(
         .filter(|_| eligible_register_bm8 || eligible_wmma_any);
     if eligible_wmma {
         // The group16 register gate (rows % 32 == 0 && cols % 128 == 0) is a strict subset of
-        // the WMMA gate below. Keep M=128 exclusive to WMMA: overlapping equal-priority
-        // descriptors would make resolution ambiguous and could silently retain the old kernel.
+        // the WMMA gate below. Keep M=128 exclusive to exact WMMA, and give the independently
+        // guarded ragged M=65..=127 WMMA descriptor a higher priority than register BM8.
         let legacy_maximum_batch_width = if eligible_register_bm8_group16 {
             7
         } else {
@@ -5151,6 +5287,7 @@ fn aq4_matvec_batch_descriptors(
                 temporary_bytes_per_chunk_token: 0,
                 maximum_total_bytes,
             },
+            100,
         );
         if eligible_register_bm8_group16 {
             push_descriptor(
@@ -5162,6 +5299,20 @@ fn aq4_matvec_batch_descriptors(
                 ExecutableOperation::HipAq4GemmRegisterBm8F32,
                 Some("gfx1201"),
                 WorkspaceFormula::ZERO,
+                100,
+            );
+            // Keep the full M=8..=127 register descriptor as a lower-priority fallback. The
+            // independently guarded ragged WMMA ABI wins only for the timing-validated range.
+            push_descriptor(
+                &mut descriptors,
+                65,
+                127,
+                "hip.aq4-gemm-wmma-ragged-m-f32.gfx1201.group16.m65-m127",
+                RuntimeFeatureSet::from_feature(RuntimeFeature::HipAq4GemmWmmaRaggedM),
+                ExecutableOperation::HipAq4GemmWmmaRaggedMF32,
+                Some("gfx1201"),
+                WorkspaceFormula::ZERO,
+                101,
             );
         }
         push_descriptor(
@@ -5173,6 +5324,7 @@ fn aq4_matvec_batch_descriptors(
             ExecutableOperation::HipAq4GemmWmmaF32,
             Some("gfx1201"),
             WorkspaceFormula::ZERO,
+            100,
         );
     } else if eligible_wmma_group8 {
         // The group8 register gate (rows % 32 == 0 && cols % 128 == 0) is a strict subset of
@@ -5200,6 +5352,7 @@ fn aq4_matvec_batch_descriptors(
                 temporary_bytes_per_chunk_token: 0,
                 maximum_total_bytes,
             },
+            100,
         );
         if eligible_register_bm8_group8 {
             push_descriptor(
@@ -5211,6 +5364,7 @@ fn aq4_matvec_batch_descriptors(
                 ExecutableOperation::HipAq4GemmRegisterBm8Group8F32,
                 Some("gfx1201"),
                 WorkspaceFormula::ZERO,
+                100,
             );
         }
         push_descriptor(
@@ -5222,6 +5376,7 @@ fn aq4_matvec_batch_descriptors(
             ExecutableOperation::HipAq4GemmWmmaGroup8F32,
             Some("gfx1201"),
             WorkspaceFormula::ZERO,
+            100,
         );
     } else if eligible_register_bm8 {
         push_descriptor(
@@ -5239,6 +5394,7 @@ fn aq4_matvec_batch_descriptors(
                 temporary_bytes_per_chunk_token: 0,
                 maximum_total_bytes,
             },
+            100,
         );
         if eligible_register_bm8_group16 {
             push_descriptor(
@@ -5250,6 +5406,7 @@ fn aq4_matvec_batch_descriptors(
                 ExecutableOperation::HipAq4GemmRegisterBm8F32,
                 Some("gfx1201"),
                 WorkspaceFormula::ZERO,
+                100,
             );
         } else {
             push_descriptor(
@@ -5261,6 +5418,7 @@ fn aq4_matvec_batch_descriptors(
                 ExecutableOperation::HipAq4GemmRegisterBm8Group8F32,
                 Some("gfx1201"),
                 WorkspaceFormula::ZERO,
+                100,
             );
         }
     } else {
@@ -5283,6 +5441,7 @@ fn aq4_matvec_batch_descriptors(
                 temporary_bytes_per_chunk_token: 0,
                 maximum_total_bytes,
             },
+            100,
         );
     }
     Ok(descriptors)
@@ -5582,7 +5741,8 @@ mod tests {
                 .with(RuntimeFeature::HipAq4RegisterBm8Group8)
                 .with(RuntimeFeature::HipAq4GemmWmma)
                 .with(RuntimeFeature::HipPagedCausalGqaChunkWmma)
-                .with(RuntimeFeature::HipAq4GemmWmmaGroup8),
+                .with(RuntimeFeature::HipAq4GemmWmmaGroup8)
+                .with(RuntimeFeature::HipAq4GemmWmmaRaggedM),
             workspace_capacity_bytes: u64::MAX,
         }
     }
@@ -6794,7 +6954,7 @@ mod tests {
     }
 
     #[test]
-    fn wmma_eligible_aq4_batch_registry_splits_register_and_wmma_at_m128() {
+    fn wmma_eligible_aq4_batch_registry_prefers_ragged_wmma_m65_through_m127() {
         let device = test_hip_capabilities();
         // These are the five distinct group16 dimensions used by the model. The shared
         // dimensions cover the paired projection families as noted in each label.
@@ -6807,7 +6967,7 @@ mod tests {
         ] {
             let geometry = wmma_eligible_aq4_geometry(rows, cols);
             let registry = aq4_matvec_batch_production_registry(geometry, &device).unwrap();
-            assert_eq!(registry.implementations().len(), 3, "{family}");
+            assert_eq!(registry.implementations().len(), 4, "{family}");
             let legacy = registry
                 .implementations()
                 .iter()
@@ -6837,6 +6997,35 @@ mod tests {
             );
             assert_eq!(bm8.workspace.estimate(127, 1).unwrap().temporary_bytes, 0);
             assert_eq!(bm8.workspace.maximum_total_bytes, 0);
+            let ragged_wmma = registry
+                .implementations()
+                .iter()
+                .find(|descriptor| {
+                    descriptor.executable == ExecutableOperation::HipAq4GemmWmmaRaggedMF32
+                })
+                .unwrap();
+            assert_eq!(ragged_wmma.minimum_batch_width, 65, "{family}");
+            assert_eq!(ragged_wmma.maximum_batch_width, 127, "{family}");
+            assert_eq!(
+                ragged_wmma.id, "hip.aq4-gemm-wmma-ragged-m-f32.gfx1201.group16.m65-m127",
+                "{family}"
+            );
+            assert_eq!(
+                ragged_wmma.required_features,
+                RuntimeFeatureSet::from_feature(RuntimeFeature::HipAq4GemmWmmaRaggedM),
+                "{family}"
+            );
+            assert_eq!(ragged_wmma.priority, bm8.priority + 1, "{family}");
+            assert_eq!(
+                ragged_wmma
+                    .workspace
+                    .estimate(127, 1)
+                    .unwrap()
+                    .temporary_bytes,
+                0,
+                "{family}"
+            );
+            assert_eq!(ragged_wmma.workspace.maximum_total_bytes, 0, "{family}");
             let wmma = registry
                 .implementations()
                 .iter()
@@ -6856,7 +7045,9 @@ mod tests {
                 (7, ExecutableOperation::HipAq4MatvecBatchF32),
                 (8, ExecutableOperation::HipAq4GemmRegisterBm8F32),
                 (64, ExecutableOperation::HipAq4GemmRegisterBm8F32),
-                (127, ExecutableOperation::HipAq4GemmRegisterBm8F32),
+                (65, ExecutableOperation::HipAq4GemmWmmaRaggedMF32),
+                (113, ExecutableOperation::HipAq4GemmWmmaRaggedMF32),
+                (127, ExecutableOperation::HipAq4GemmWmmaRaggedMF32),
                 (128, ExecutableOperation::HipAq4GemmWmmaF32),
             ] {
                 let request = aq4_matvec_batch_operation_request(
@@ -6877,6 +7068,25 @@ mod tests {
             missing_wmma.runtime_features = RuntimeFeatureSet::EMPTY
                 .with(RuntimeFeature::HipAq4MatvecBatch)
                 .with(RuntimeFeature::HipAq4RegisterBm8);
+            let mut missing_ragged_wmma = missing_wmma.clone();
+            missing_ragged_wmma.runtime_features = missing_ragged_wmma
+                .runtime_features
+                .with(RuntimeFeature::HipAq4GemmWmma);
+            for width in [65, 113, 127] {
+                let request = aq4_matvec_batch_operation_request(
+                    ExecutionPhase::Decode,
+                    geometry,
+                    width,
+                    missing_ragged_wmma.clone(),
+                    u64::MAX,
+                )
+                .unwrap();
+                assert_eq!(
+                    registry.resolve(&request).unwrap().trace().executable,
+                    ExecutableOperation::HipAq4GemmRegisterBm8F32,
+                    "{family} M={width} falls back without ragged WMMA"
+                );
+            }
             let request = aq4_matvec_batch_operation_request(
                 ExecutionPhase::Decode,
                 geometry,
@@ -7750,6 +7960,11 @@ mod tests {
                 20,
                 "aq4-gemm-wmma-group8",
             ),
+            (
+                ProbeFaultStage::Aq4GemmWmmaRaggedM,
+                21,
+                "aq4-gemm-wmma-ragged-m",
+            ),
             (ProbeFaultStage::QkvPrepareBatch, 10, "qkv-prepare-batch"),
             (ProbeFaultStage::RecurrentSequence, 11, "recurrent-sequence"),
             (ProbeFaultStage::QkNormRopeBatch, 12, "qk-norm-rope-batch"),
@@ -7843,6 +8058,22 @@ mod tests {
     }
 
     #[test]
+    fn aq4_ragged_m_wmma_feature_environment_and_fault_checkpoint_are_exact() {
+        assert_eq!(
+            runtime_feature_environment(RuntimeFeature::HipAq4GemmWmmaRaggedM),
+            "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL"
+        );
+        let before = M1_PROBE_CHECKPOINT_COUNTS[21].load(std::sync::atomic::Ordering::Acquire);
+        force_probe_failure(ProbeFaultStage::Aq4GemmWmmaRaggedM);
+        assert!(probe_fault_checkpoint(21, "aq4-gemm-wmma-ragged-m").is_err());
+        assert_eq!(
+            M1_PROBE_CHECKPOINT_COUNTS[21].load(std::sync::atomic::Ordering::Acquire),
+            before + 1
+        );
+        probe_fault_checkpoint(21, "aq4-gemm-wmma-ragged-m").unwrap();
+    }
+
+    #[test]
     fn paged_causal_gqa_wmma_feature_environment_and_fault_checkpoint_are_exact() {
         assert_eq!(
             runtime_feature_environment(RuntimeFeature::HipPagedCausalGqaChunkWmma),
@@ -7899,6 +8130,53 @@ mod tests {
         assert_eq!(
             plan.trace().executable,
             ExecutableOperation::HipAq4GemmWmmaF32
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL=1"]
+    fn isolated_hip_aq4_ragged_m_wmma_probe_enables_production_m127_dispatch_when_guarded() {
+        assert_eq!(
+            std::env::var(runtime_feature_environment(
+                RuntimeFeature::HipAq4GemmWmmaRaggedM
+            ))
+            .as_deref(),
+            Ok("1")
+        );
+        let hip_index = (1..ullm_runtime_sys::device_count().unwrap())
+            .find(|index| {
+                ullm_runtime_sys::device_info(*index)
+                    .is_ok_and(|info| info.backend == "hip" && info.gcn_arch_name == "gfx1201")
+            })
+            .expect("isolated gfx1201 HIP device");
+        let mut context = ullm_runtime_sys::RuntimeContext::create(hip_index).unwrap();
+        let mut stream = context.create_stream().unwrap();
+        let device =
+            DeviceCapabilities::probe_m1_runtime_context(&mut context, &mut stream).unwrap();
+        assert!(
+            device
+                .runtime_features
+                .contains(RuntimeFeature::HipAq4GemmWmmaRaggedM)
+        );
+
+        let geometry = wmma_eligible_aq4_geometry(32, 4_096);
+        let registry = aq4_matvec_batch_production_registry(geometry, &device).unwrap();
+        let request = aq4_matvec_batch_operation_request(
+            ExecutionPhase::ColdPrefill,
+            geometry,
+            127,
+            device,
+            u64::MAX,
+        )
+        .unwrap();
+        let plan = registry.resolve(&request).unwrap();
+        assert_eq!(
+            plan.trace().implementation_id,
+            "hip.aq4-gemm-wmma-ragged-m-f32.gfx1201.group16.m65-m127"
+        );
+        assert_eq!(
+            plan.trace().executable,
+            ExecutableOperation::HipAq4GemmWmmaRaggedMF32
         );
     }
 
@@ -8110,6 +8388,37 @@ mod tests {
     }
 
     #[test]
+    fn aq4_ragged_m_wmma_m127_probe_binding_matches_small_row_geometry_and_packed_layout() {
+        let binding = aq4_wmma_probe_binding(127);
+        assert_eq!(binding.scale_count, 2);
+        assert_eq!(binding.group_size, 16);
+        assert_eq!(binding.tensor_scale_bits, 1.0_f32.to_bits());
+        assert_eq!(binding.row_scale_count, 0);
+        assert_eq!(binding.rows, 32);
+        assert_eq!(binding.cols, 4_096);
+        assert_eq!(binding.batch_count, 127);
+        assert_eq!(binding.rows / 16, 2, "WMMA grid.x");
+        assert_eq!(binding.matrix_elements().unwrap(), 131_072);
+        assert_eq!(binding.packed_index_bytes().unwrap(), 65_536);
+        assert_eq!(binding.scale_index_bytes().unwrap(), 8_192);
+        assert_eq!(binding.input_elements().unwrap(), 520_192);
+        assert_eq!(binding.output_elements().unwrap(), 4_064);
+        assert_eq!(binding.packed_index_bytes().unwrap() % 16, 0);
+        assert_eq!(binding.cols * std::mem::size_of::<f32>() % 16, 0);
+        let scale_indices = aq4_probe_scale_indices(binding).unwrap();
+        assert_eq!(scale_indices.len(), 8_192);
+        assert!(
+            scale_indices
+                .iter()
+                .all(|&index| usize::from(index) < binding.scale_count)
+        );
+        force_probe_failure(ProbeFaultStage::Aq4GemmWmmaRaggedM);
+        let error = probe_fault_checkpoint(21, "aq4-gemm-wmma-ragged-m").unwrap_err();
+        assert!(error.contains("aq4-gemm-wmma-ragged-m"));
+        probe_fault_checkpoint(21, "aq4-gemm-wmma-ragged-m").unwrap();
+    }
+
+    #[test]
     fn aq4_group8_wmma_m128_probe_binding_matches_target_geometry_and_packed_layout() {
         let binding = aq4_wmma_group8_probe_binding(128);
         assert_eq!(binding.scale_count, 2);
@@ -8229,6 +8538,7 @@ mod tests {
             "ULLM_REQUIRE_HIP_AQ4_REGISTER_BM8_GROUP8_KERNEL",
             "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL",
             "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
+            "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
             "ULLM_REQUIRE_HIP_PAGED_DECODE_SPLIT_KERNEL",
         ] {
             assert_eq!(std::env::var(environment).as_deref(), Ok("1"));
@@ -8247,6 +8557,7 @@ mod tests {
             ProbeFaultStage::Aq4RegisterBm8Group8,
             ProbeFaultStage::Aq4GemmWmma,
             ProbeFaultStage::Aq4GemmWmmaGroup8,
+            ProbeFaultStage::Aq4GemmWmmaRaggedM,
             ProbeFaultStage::PagedCausalGqaChunkWmma,
             ProbeFaultStage::QkvPrepareBatch,
             ProbeFaultStage::RecurrentSequence,
