@@ -372,6 +372,42 @@ fn hip_aq4_matvec_triple_shuffle_prototype_matches_cpu_for_production_and_single
 }
 
 #[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_TRIPLE_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_aq4_matvec_triple_production_matches_cpu_for_production_shape() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_AQ4_MATVEC_TRIPLE_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1")
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _rpb = ExperimentalEnvGuard::new("ULLM_AQ4_MATVEC_TRIPLE_RPB", Some("8"));
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_AQ4_MATVEC_TRIPLE_KERNEL", Some("1"));
+    let gpu = aq4_fused_wide_load_gpu_device();
+    let mut state = 0x510e_527f;
+    // Qwen3.5-9B self-attention Q/K/V: Q=[8192,4096], K/V=[1024,4096].
+    let first = aq4_fused_wide_load_host_matrix(8_192, 4_096, 16, true, &mut state);
+    let second = aq4_fused_wide_load_host_matrix(1_024, 4_096, 16, false, &mut state);
+    let third = aq4_fused_wide_load_host_matrix(1_024, 4_096, 16, true, &mut state);
+    let input: Vec<f32> = (0..4_096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state as f32 / u32::MAX as f32 * 2.0 - 1.0
+        })
+        .collect();
+    let expected = aq4_matvec_triple_shuffle_run(0, false, &first, &second, &third, &input);
+    let actual = aq4_matvec_triple_shuffle_run(gpu, false, &first, &second, &third, &input);
+    for (label, actual, expected) in [
+        ("production Q", &actual.0, &expected.0),
+        ("production K", &actual.1, &expected.1),
+        ("production V", &actual.2, &expected.2),
+    ] {
+        aq4_fused_wide_load_assert_matches_cpu(actual, expected, label);
+    }
+}
+
+#[test]
 #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_MATVEC_TRIPLE_SHUFFLE_TIMING=1"]
 fn hip_aq4_matvec_triple_shuffle_prototype_timing_vs_production() {
     assert_eq!(

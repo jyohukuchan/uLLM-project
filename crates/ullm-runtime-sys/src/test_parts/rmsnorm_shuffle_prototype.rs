@@ -232,6 +232,39 @@ fn hip_rmsnorm_shuffle_prototype_m1_qwen35_shape_matches_cpu_when_enabled() {
 }
 
 #[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_RMSNORM_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_rmsnorm_production_m1_qwen35_shape_matches_cpu_when_enabled() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_RMSNORM_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1"),
+        "set ULLM_RUN_RMSNORM_PRODUCTION_DIFFERENTIAL=1 before running this GPU differential test"
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_RMSNORM_KERNEL", Some("1"));
+    let gpu = rmsnorm_shuffle_prototype_gpu_device();
+    let (input, weight) = rmsnorm_shuffle_prototype_fixture();
+
+    // Both Qwen3.5 self-attention and linear-attention decode paths call this M=1 shape;
+    // input and post norms differ only in epsilon.
+    for &(label, epsilon) in &[("input norm", 1e-6_f32), ("post norm", 1e-5_f32)] {
+        let expected = rmsnorm_shuffle_prototype_run(0, false, &input, &weight, epsilon);
+        let actual = rmsnorm_shuffle_prototype_run(gpu, false, &input, &weight, epsilon);
+        assert_rmsnorm_shuffle_prototype_matches_cpu(&actual, &expected, label);
+        let max_abs_diff = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        eprintln!(
+            "RMSNorm production differential passed case={label} M=1 hidden=4096 epsilon={epsilon:.9} max_abs_diff={max_abs_diff:.9}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_RMSNORM_SHUFFLE_PROTOTYPE_TIMING=1"]
 fn hip_rmsnorm_shuffle_prototype_m1_qwen35_shape_timing_vs_production_when_enabled() {
     assert_eq!(

@@ -1006,16 +1006,18 @@ public:
     }
 
     bool compile_rmsnorm_kernel(const std::string &arch, std::vector<char> *code, std::string *error) {
-        return compile_kernel(arch, rmsnorm_kernel_source(), "ullm_rmsnorm_f32.hip", code, error);
+        const std::string source = rmsnorm_kernel_source_for_arch(arch);
+        return compile_kernel(arch, source.c_str(), "ullm_rmsnorm_f32.hip", code, error);
     }
 
     bool compile_rmsnorm_shuffle_prototype_kernel(
         const std::string &arch,
         std::vector<char> *code,
         std::string *error) {
+        const std::string source = rmsnorm_shuffle_prototype_kernel_source();
         return compile_kernel(
             arch,
-            rmsnorm_shuffle_prototype_kernel_source(),
+            source.c_str(),
             "ullm_rmsnorm_shuffle_prototype_f32.hip",
             code,
             error);
@@ -1323,9 +1325,10 @@ public:
         const std::string &arch,
         std::vector<char> *code,
         std::string *error) {
+        const std::string source = linear_attn_qkv_prepare_kernel_source_for_arch(arch);
         return compile_kernel(
             arch,
-            linear_attn_qkv_prepare_kernel_source(),
+            source.c_str(),
             "ullm_linear_attn_qkv_prepare_f32.hip",
             code,
             error);

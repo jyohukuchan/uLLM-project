@@ -413,6 +413,41 @@ fn hip_linear_attn_qkv_prepare_shuffle_prototype_qwen35_m1_matches_cpu_when_enab
 }
 
 #[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_LINEAR_ATTN_QKV_PREPARE_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_linear_attn_qkv_prepare_production_qwen35_m1_matches_cpu_when_enabled() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_LINEAR_ATTN_QKV_PREPARE_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1"),
+        "set ULLM_RUN_LINEAR_ATTN_QKV_PREPARE_PRODUCTION_DIFFERENTIAL=1 before running this GPU differential test"
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel =
+        ExperimentalEnvGuard::new("ULLM_REQUIRE_HIP_LINEAR_ATTN_KERNEL", Some("1"));
+    let fixture = linear_attn_qkv_prepare_shuffle_prototype_fixture();
+    let expected = linear_attn_qkv_prepare_shuffle_prototype_run(0, false, &fixture);
+    let actual = linear_attn_qkv_prepare_shuffle_prototype_run(
+        linear_attn_qkv_prepare_shuffle_prototype_gpu_device(),
+        false,
+        &fixture,
+    );
+    for (label, actual, expected) in [
+        ("production conv output", &actual.conv, &expected.conv),
+        ("production q output", &actual.q, &expected.q),
+        ("production k output", &actual.k, &expected.k),
+        ("production v output", &actual.v, &expected.v),
+        (
+            "production conv history",
+            &actual.history,
+            &expected.history,
+        ),
+    ] {
+        assert_linear_attn_qkv_prepare_shuffle_prototype_matches_cpu(actual, expected, label);
+    }
+}
+
+#[test]
 #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_LINEAR_ATTN_QKV_PREPARE_SHUFFLE_PROTOTYPE_TIMING=1"]
 fn hip_linear_attn_qkv_prepare_shuffle_prototype_qwen35_m1_timing_vs_production_when_enabled() {
     assert_eq!(
