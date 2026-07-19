@@ -580,6 +580,15 @@ ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_f32(
     ullm_runtime_buffer *beta_output_buffer,
     ullm_runtime_stream *stream);
 
+/* Direct-only gfx1201 M=1 experiment: all four packed streams use aligned uint4 loads. */
+ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, size_t, size_t,
+    ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_stream *);
+
 ullm_status ullm_runtime_aq4_matvec_silu_mul_f32(
     const ullm_runtime_buffer *gate_index_buffer,
     const ullm_runtime_buffer *gate_scale_buffer,
@@ -604,6 +613,12 @@ ullm_status ullm_runtime_aq4_matvec_silu_mul_f32(
     size_t cols,
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream);
+
+/* Direct-only gfx1201 M=1 experiment: gate and up packed streams use aligned uint4 loads. */
+ullm_status ullm_runtime_aq4_matvec_silu_mul_wide_load_prototype_f32(
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, size_t, size_t, ullm_runtime_buffer *, ullm_runtime_stream *);
 
 ullm_status ullm_runtime_aq4_matvec_gate_beta_f32(
     const ullm_runtime_buffer *a_index_buffer,

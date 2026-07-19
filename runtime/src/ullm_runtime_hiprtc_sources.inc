@@ -716,6 +716,18 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_qkv_z_gate_beta_kernel_source();
     }
 
+    // Direct-only M=1 experiment. Keep the production fused body intact: this source replaces
+    // only its scalar packed-byte helpers and gives the resulting module a unique entry point.
+    static std::string aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   4u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_QKV_Z_GATE_BETA_RPB") +
+               aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_silu_mul_kernel_source_for_arch(const std::string &arch) {
         return aq4_fused_rows_per_block_preamble(
                    arch,
@@ -723,6 +735,17 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                    2u,
                    "ULLM_AQ4_MATVEC_SILU_MUL_RPB") +
                aq4_matvec_silu_mul_kernel_source();
+    }
+
+    // Direct-only M=1 experiment; see the qkv/z/gate/beta counterpart above.
+    static std::string aq4_matvec_silu_mul_wide_load_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   8u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_SILU_MUL_RPB") +
+               aq4_matvec_silu_mul_wide_load_prototype_kernel_source();
     }
 
     static std::string aq4_matvec_gate_beta_kernel_source_for_arch(const std::string &arch) {
@@ -3976,6 +3999,114 @@ extern "C" __global__ void ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel(
 )";
     }
 
+    static std::string aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_source() {
+        std::string production = aq4_matvec_qkv_z_gate_beta_kernel_source();
+        const size_t kernel_offset = production.find("extern \"C\" __global__ void");
+        if (kernel_offset == std::string::npos) {
+            return "";
+        }
+        production.erase(0u, kernel_offset);
+        const std::string production_name = "ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel";
+        const size_t name_offset = production.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        production.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32_kernel");
+        return R"(
+// Each uint4 is four 32-bit words = exactly sixteen packed bytes, never 32 bytes.
+static_assert(sizeof(uint4) == 16u, "AQ4 wide load must remain 128 bits");
+static_assert(alignof(uint4) == 16u, "AQ4 wide load must remain 16-byte aligned");
+
+__device__ unsigned int ullm_aq4_wide_load_packed_byte(uint4 words, unsigned int byte_index) {
+    const unsigned int word = byte_index < 4u ? words.x :
+        (byte_index < 8u ? words.y : (byte_index < 12u ? words.z : words.w));
+    return (word >> (8u * (byte_index & 3u))) & 0xffu;
+}
+
+__device__ float ullm_aq4_qkv_z_gate_beta_thread_sum(
+    const unsigned char *indices, const unsigned char *scale_indices,
+    const float *codebook, const float *scale_values, const float *input,
+    unsigned long long scale_count, unsigned long long group_size, float tensor_scale,
+    unsigned long long row, unsigned long long cols, unsigned int tid, unsigned int block_size) {
+    const unsigned long long groups_per_row = cols / group_size;
+    const unsigned long long row_byte_offset = (row * cols) >> 1;
+    const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
+    float sum = 0.0f;
+    for (unsigned long long chunk = tid; chunk < cols / 32ull; chunk += block_size) {
+        const uint4 packed = *reinterpret_cast<const uint4 *>(indices + row_byte_offset + chunk * 16ull);
+        const unsigned long long col_base = chunk * 32ull;
+        const unsigned long long group_base = row * groups_per_row + col_base / group_size;
+#pragma unroll
+        for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+            if (group_in_chunk >= groups_per_chunk) continue;
+            const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group_base + group_in_chunk]);
+            if (scale_index >= scale_count) continue;
+            const unsigned int byte_start = group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+            const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+            float raw_sum = 0.0f;
+#pragma unroll
+            for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                if (byte_offset >= byte_count) continue;
+                const unsigned int packed_byte_index = byte_start + byte_offset;
+                const unsigned int packed_byte = ullm_aq4_wide_load_packed_byte(packed, packed_byte_index);
+                const unsigned long long col = col_base + static_cast<unsigned long long>(packed_byte_index) * 2ull;
+                raw_sum += codebook[packed_byte & 0x0fu] * input[col];
+                raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
+            }
+            sum += raw_sum * scale_values[scale_index] * tensor_scale;
+        }
+    }
+    return sum;
+}
+
+__device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
+    const unsigned char *a_indices, const unsigned char *a_scale_indices,
+    const float *a_codebook, const float *a_scale_values, unsigned long long a_scale_count,
+    float a_tensor_scale, const unsigned char *b_indices, const unsigned char *b_scale_indices,
+    const float *b_codebook, const float *b_scale_values, unsigned long long b_scale_count,
+    float b_tensor_scale, const float *input, unsigned long long group_size,
+    unsigned long long row, unsigned long long cols, unsigned int tid, unsigned int block_size,
+    float *a_sum_output, float *b_sum_output) {
+    const unsigned long long groups_per_row = cols / group_size;
+    const unsigned long long row_byte_offset = (row * cols) >> 1;
+    const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
+    float a_sum = 0.0f, b_sum = 0.0f;
+    for (unsigned long long chunk = tid; chunk < cols / 32ull; chunk += block_size) {
+        // These are intentionally independent wide traversals: the matrices do not share bytes.
+        const uint4 a_packed = *reinterpret_cast<const uint4 *>(a_indices + row_byte_offset + chunk * 16ull);
+        const uint4 b_packed = *reinterpret_cast<const uint4 *>(b_indices + row_byte_offset + chunk * 16ull);
+        const unsigned long long col_base = chunk * 32ull;
+        const unsigned long long group_base = row * groups_per_row + col_base / group_size;
+#pragma unroll
+        for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+            if (group_in_chunk >= groups_per_chunk) continue;
+            const unsigned int a_scale_index = static_cast<unsigned int>(a_scale_indices[group_base + group_in_chunk]);
+            const unsigned int b_scale_index = static_cast<unsigned int>(b_scale_indices[group_base + group_in_chunk]);
+            const unsigned int byte_start = group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+            const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+            float a_raw_sum = 0.0f, b_raw_sum = 0.0f;
+#pragma unroll
+            for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                if (byte_offset >= byte_count) continue;
+                const unsigned int packed_byte_index = byte_start + byte_offset;
+                const unsigned int a_byte = ullm_aq4_wide_load_packed_byte(a_packed, packed_byte_index);
+                const unsigned int b_byte = ullm_aq4_wide_load_packed_byte(b_packed, packed_byte_index);
+                const unsigned long long col = col_base + static_cast<unsigned long long>(packed_byte_index) * 2ull;
+                a_raw_sum += a_codebook[a_byte & 0x0fu] * input[col] + a_codebook[(a_byte >> 4) & 0x0fu] * input[col + 1ull];
+                b_raw_sum += b_codebook[b_byte & 0x0fu] * input[col] + b_codebook[(b_byte >> 4) & 0x0fu] * input[col + 1ull];
+            }
+            if (a_scale_index < a_scale_count) a_sum += a_raw_sum * a_scale_values[a_scale_index] * a_tensor_scale;
+            if (b_scale_index < b_scale_count) b_sum += b_raw_sum * b_scale_values[b_scale_index] * b_tensor_scale;
+        }
+    }
+    *a_sum_output = a_sum; *b_sum_output = b_sum;
+}
+)" + production;
+    }
+
     static const char *aq4_matvec_silu_mul_kernel_source() {
         return R"(
 __device__ float ullm_aq4_matvec_thread_sum(
@@ -4245,6 +4376,105 @@ extern "C" __global__ void ullm_aq4_matvec_silu_mul_f32_kernel(
     }
 }
 )";
+    }
+
+    static std::string aq4_matvec_silu_mul_wide_load_prototype_kernel_source() {
+        std::string production = aq4_matvec_silu_mul_kernel_source();
+        const size_t kernel_offset = production.find("extern \"C\" __global__ void");
+        if (kernel_offset == std::string::npos) return "";
+        production.erase(0u, kernel_offset);
+        const std::string production_name = "ullm_aq4_matvec_silu_mul_f32_kernel";
+        const size_t name_offset = production.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        production.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_aq4_matvec_silu_mul_wide_load_prototype_f32_kernel");
+        return R"(
+static_assert(sizeof(uint4) == 16u, "AQ4 wide load must remain 128 bits");
+static_assert(alignof(uint4) == 16u, "AQ4 wide load must remain 16-byte aligned");
+__device__ unsigned int ullm_aq4_wide_load_packed_byte(uint4 words, unsigned int byte_index) {
+    const unsigned int word = byte_index < 4u ? words.x :
+        (byte_index < 8u ? words.y : (byte_index < 12u ? words.z : words.w));
+    return (word >> (8u * (byte_index & 3u))) & 0xffu;
+}
+__device__ float ullm_aq4_matvec_thread_sum(
+    const unsigned char *indices, const unsigned char *scale_indices,
+    const float *codebook, const float *scale_values, const float *input,
+    unsigned long long scale_count, unsigned long long group_size, float tensor_scale,
+    unsigned long long row, unsigned long long cols, unsigned int tid, unsigned int block_size) {
+    const unsigned long long groups_per_row = cols / group_size;
+    const unsigned long long row_byte_offset = (row * cols) >> 1;
+    const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
+    float sum = 0.0f;
+    for (unsigned long long chunk = tid; chunk < cols / 32ull; chunk += block_size) {
+        const uint4 packed = *reinterpret_cast<const uint4 *>(indices + row_byte_offset + chunk * 16ull);
+        const unsigned long long col_base = chunk * 32ull;
+        const unsigned long long group_base = row * groups_per_row + col_base / group_size;
+#pragma unroll
+        for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+            if (group_in_chunk >= groups_per_chunk) continue;
+            const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group_base + group_in_chunk]);
+            if (scale_index >= scale_count) continue;
+            const unsigned int byte_start = group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+            const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+            float raw_sum = 0.0f;
+#pragma unroll
+            for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                if (byte_offset >= byte_count) continue;
+                const unsigned int packed_byte_index = byte_start + byte_offset;
+                const unsigned int packed_byte = ullm_aq4_wide_load_packed_byte(packed, packed_byte_index);
+                const unsigned long long col = col_base + static_cast<unsigned long long>(packed_byte_index) * 2ull;
+                raw_sum += codebook[packed_byte & 0x0fu] * input[col];
+                raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
+            }
+            sum += raw_sum * scale_values[scale_index] * tensor_scale;
+        }
+    }
+    return sum;
+}
+__device__ void ullm_aq4_matvec_silu_mul_thread_sums(
+    const unsigned char *gate_indices, const unsigned char *gate_scale_indices,
+    const float *gate_codebook, const float *gate_scale_values, unsigned long long gate_scale_count,
+    float gate_tensor_scale, const unsigned char *up_indices, const unsigned char *up_scale_indices,
+    const float *up_codebook, const float *up_scale_values, unsigned long long up_scale_count,
+    float up_tensor_scale, const float *input, unsigned long long group_size,
+    unsigned long long row, unsigned long long cols, unsigned int tid, unsigned int block_size,
+    float *gate_sum_output, float *up_sum_output) {
+    const unsigned long long groups_per_row = cols / group_size;
+    const unsigned long long row_byte_offset = (row * cols) >> 1;
+    const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
+    float gate_sum = 0.0f, up_sum = 0.0f;
+    for (unsigned long long chunk = tid; chunk < cols / 32ull; chunk += block_size) {
+        const uint4 gate_packed = *reinterpret_cast<const uint4 *>(gate_indices + row_byte_offset + chunk * 16ull);
+        const uint4 up_packed = *reinterpret_cast<const uint4 *>(up_indices + row_byte_offset + chunk * 16ull);
+        const unsigned long long col_base = chunk * 32ull;
+        const unsigned long long group_base = row * groups_per_row + col_base / group_size;
+#pragma unroll
+        for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+            if (group_in_chunk >= groups_per_chunk) continue;
+            const unsigned int gate_scale_index = static_cast<unsigned int>(gate_scale_indices[group_base + group_in_chunk]);
+            const unsigned int up_scale_index = static_cast<unsigned int>(up_scale_indices[group_base + group_in_chunk]);
+            const unsigned int byte_start = group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+            const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+            float gate_raw_sum = 0.0f, up_raw_sum = 0.0f;
+#pragma unroll
+            for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                if (byte_offset >= byte_count) continue;
+                const unsigned int packed_byte_index = byte_start + byte_offset;
+                const unsigned int gate_byte = ullm_aq4_wide_load_packed_byte(gate_packed, packed_byte_index);
+                const unsigned int up_byte = ullm_aq4_wide_load_packed_byte(up_packed, packed_byte_index);
+                const unsigned long long col = col_base + static_cast<unsigned long long>(packed_byte_index) * 2ull;
+                gate_raw_sum += gate_codebook[gate_byte & 0x0fu] * input[col] + gate_codebook[(gate_byte >> 4) & 0x0fu] * input[col + 1ull];
+                up_raw_sum += up_codebook[up_byte & 0x0fu] * input[col] + up_codebook[(up_byte >> 4) & 0x0fu] * input[col + 1ull];
+            }
+            if (gate_scale_index < gate_scale_count) gate_sum += gate_raw_sum * gate_scale_values[gate_scale_index] * gate_tensor_scale;
+            if (up_scale_index < up_scale_count) up_sum += up_raw_sum * up_scale_values[up_scale_index] * up_tensor_scale;
+        }
+    }
+    *gate_sum_output = gate_sum; *up_sum_output = up_sum;
+}
+)" + production;
     }
 
     static const char *aq4_matvec_gate_beta_kernel_source() {
