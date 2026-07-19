@@ -2253,10 +2253,16 @@ impl<M: Qwen35Aq4SessionModel> Qwen35Aq4InferenceSession<M> {
         }
         let token_id = match forced_token {
             Some(token_id) => token_id,
-            None => match self.model.top_token_from_last_layer(label) {
-                Ok(token_id) => token_id,
-                Err(error) => return self.fail(format!("{label} top-1 failed: {error}")),
-            },
+            None => {
+                // This opt-in range includes final RMSNorm, LM-head top-1, and its existing
+                // device-to-host readback/synchronization.  Outside diagnostics it is a one-flag
+                // no-op, so regular production token preparation is unchanged.
+                let _lm_head_range = crate::roctx::range("ullm.aq4.decode.lm_head_top1.v1");
+                match self.model.top_token_from_last_layer(label) {
+                    Ok(token_id) => token_id,
+                    Err(error) => return self.fail(format!("{label} top-1 failed: {error}")),
+                }
+            }
         };
         let generation_state_epoch = if forced_token.is_none() {
             self.model.last_generation_state_epoch()

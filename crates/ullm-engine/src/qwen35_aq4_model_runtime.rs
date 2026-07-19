@@ -1143,6 +1143,9 @@ impl Qwen35Aq4ModelRuntime {
         let input = embedding.output_buffer();
         self.last_partial_operation_executions.clear();
         self.last_partial_prefill_invocations.clear();
+        // This marker is opt-in and is a one-flag no-op in normal serving.  It deliberately
+        // surrounds only the 32 resident decoder layers, excluding the embedding gather.
+        let _decoder_stack_range = crate::roctx::range("ullm.aq4.decode.decoder_stack.v1");
         dispatch_layer_stack(
             &mut self.layers,
             &mut self.stream,
