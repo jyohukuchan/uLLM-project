@@ -1410,10 +1410,10 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
-    // Production double-buffered gfx1201 AQ4 WMMA path for group16 M=128 projections. It lives
-    // in a separate HIPRTC source/module from the register kernels so rocWMMA compile options do
-    // not perturb their code generation.
-    static const char *aq4_matvec_wmma_prototype_kernel_source() {
+    // Superseded v2 reference for the gfx1201 AQ4 WMMA group16 M=128 kernel. It is deliberately
+    // not passed to HIPRTC: production uses the direct-output source below under this same
+    // entry-point ABI. Keep this source to make a controlled future rollback comparison possible.
+    [[maybe_unused]] static const char *aq4_matvec_wmma_prototype_v2_reference_kernel_source() {
         return R"(
 #include <rocwmma/rocwmma.hpp>
 
@@ -1664,14 +1664,12 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
-    // Experimental v4 keeps the proven v2 K-pipeline intact, but removes the 8 KiB output LDS
-    // staging tile.  rocWMMA stores C directly in the column-major final-output layout, then the
-    // existing CTA barrier makes those values visible before the regular per-element scale pass.
-    // This lowers the CTA footprint from 26,624 B to 18,432 B: three 8-wave CTAs fit in a 64 KiB
-    // gfx1201 CU while v2 is constrained to two.  Keep this source/module strictly separate from
-    // production until GPU differential and A/B tests establish that the occupancy gain wins.
-    static std::string aq4_matvec_wmma_prototype_v4_kernel_source() {
-        std::string source(aq4_matvec_wmma_prototype_kernel_source());
+    // Production direct-output gfx1201 AQ4 WMMA path for group16 M=128 projections. It retains
+    // v2's double-buffered Wide-K pipeline, but rocWMMA stores C directly in the column-major
+    // final-output layout rather than through an 8 KiB LDS staging tile. This lowers the CTA LDS
+    // footprint from 26,624 B to 18,432 B, allowing three 8-wave CTAs per gfx1201 CU.
+    static std::string aq4_matvec_wmma_prototype_kernel_source() {
+        std::string source(aq4_matvec_wmma_prototype_v2_reference_kernel_source());
         const auto replace_once = [&source](const char *from, const char *to) {
             const size_t position = source.find(from);
             if (position == std::string::npos) {
@@ -1681,9 +1679,6 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
             return true;
         };
         const bool replaced =
-            replace_once(
-                "ullm_aq4_gemm_wmma_prototype_f32_kernel",
-                "ullm_aq4_gemm_wmma_prototype_v4_f32_kernel") &&
             replace_once(
                 "using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;",
                 "using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, col_major>;") &&

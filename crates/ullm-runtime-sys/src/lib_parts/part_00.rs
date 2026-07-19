@@ -232,23 +232,6 @@ unsafe extern "C" {
         output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
-    fn ullm_runtime_aq4_matvec_batch_wmma_prototype_v4_f32(
-        index_buffer: *const RawRuntimeBuffer,
-        scale_buffer: *const RawRuntimeBuffer,
-        codebook_buffer: *const RawRuntimeBuffer,
-        scale_values_buffer: *const RawRuntimeBuffer,
-        input_buffer: *const RawRuntimeBuffer,
-        row_scale_buffer: *const RawRuntimeBuffer,
-        scale_count: usize,
-        group_size: usize,
-        tensor_scale: f32,
-        row_scale_count: usize,
-        rows: usize,
-        cols: usize,
-        batch_count: usize,
-        output_buffer: *mut RawRuntimeBuffer,
-        stream: *mut RawRuntimeStream,
-    ) -> c_int;
     fn ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
         index_buffer: *const RawRuntimeBuffer,
         scale_buffer: *const RawRuntimeBuffer,
@@ -2172,57 +2155,6 @@ pub fn aq4_matvec_batch_wmma_prototype_v3_f32(
             batch_count,
             output_buffer.raw.as_ptr(),
             stream,
-        )
-    })
-}
-
-/// Directly invokes the isolated v4 gfx1201 rocWMMA AQ4 group16 M=128 experiment.
-///
-/// V4 preserves v2's K%32 eligibility and replaces only the final output-LDS staging with a
-/// direct column-major rocWMMA store. It has no fallback and never changes production dispatch.
-#[allow(clippy::too_many_arguments)]
-pub fn aq4_matvec_batch_wmma_prototype_v4_f32(
-    index_buffer: &RuntimeBuffer,
-    scale_buffer: &RuntimeBuffer,
-    codebook_buffer: &RuntimeBuffer,
-    scale_values_buffer: &RuntimeBuffer,
-    input_buffer: &RuntimeBuffer,
-    row_scale_buffer: Option<&RuntimeBuffer>,
-    scale_count: usize,
-    group_size: usize,
-    tensor_scale: f32,
-    row_scale_count: usize,
-    rows: usize,
-    cols: usize,
-    batch_count: usize,
-    output_buffer: &mut RuntimeBuffer,
-    stream: Option<&mut RuntimeStream>,
-) -> Result<(), String> {
-    if scale_count == 0 || group_size != 16 || batch_count != 128 || rows == 0 || cols == 0 ||
-        !rows.is_multiple_of(16) || !cols.is_multiple_of(32) || !tensor_scale.is_finite() ||
-        tensor_scale <= 0.0 {
-        return Err("AQ4 WMMA prototype v4 requires finite group16/M=128 shapes with rows divisible by 16 and cols divisible by 32".to_string());
-    }
-    let elements = rows.checked_mul(cols).ok_or_else(|| "AQ4 WMMA prototype v4 matrix element count overflows".to_string())?;
-    let input_bytes = batch_count.checked_mul(cols).and_then(|n| n.checked_mul(std::mem::size_of::<f32>())).ok_or_else(|| "AQ4 WMMA prototype v4 input byte size overflows".to_string())?;
-    let output_bytes = batch_count.checked_mul(rows).and_then(|n| n.checked_mul(std::mem::size_of::<f32>())).ok_or_else(|| "AQ4 WMMA prototype v4 output byte size overflows".to_string())?;
-    check_copy_range(0, elements / 2, index_buffer.size()?)?;
-    check_copy_range(0, elements / group_size, scale_buffer.size()?)?;
-    check_copy_range(0, 16 * std::mem::size_of::<f32>(), codebook_buffer.size()?)?;
-    check_copy_range(0, scale_count.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| "AQ4 WMMA prototype v4 scale byte size overflows".to_string())?, scale_values_buffer.size()?)?;
-    check_copy_range(0, input_bytes, input_buffer.size()?)?;
-    if let Some(buffer) = row_scale_buffer {
-        check_copy_range(0, row_scale_count.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| "AQ4 WMMA prototype v4 row-scale byte size overflows".to_string())?, buffer.size()?)?;
-    }
-    check_copy_range(0, output_bytes, output_buffer.size()?)?;
-    let stream = stream.map_or(std::ptr::null_mut(), |stream| stream.raw.as_ptr());
-    let row_scale_raw = row_scale_buffer.map(|buffer| buffer.raw.as_ptr()).unwrap_or(std::ptr::null_mut());
-    status_to_result(unsafe {
-        ullm_runtime_aq4_matvec_batch_wmma_prototype_v4_f32(
-            index_buffer.raw.as_ptr(), scale_buffer.raw.as_ptr(), codebook_buffer.raw.as_ptr(),
-            scale_values_buffer.raw.as_ptr(), input_buffer.raw.as_ptr(), row_scale_raw,
-            scale_count, group_size, tensor_scale, row_scale_count, rows, cols, batch_count,
-            output_buffer.raw.as_ptr(), stream,
         )
     })
 }
