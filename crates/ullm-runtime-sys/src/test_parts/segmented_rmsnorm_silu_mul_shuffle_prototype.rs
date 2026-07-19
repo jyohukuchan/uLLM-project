@@ -282,6 +282,48 @@ fn hip_segmented_rmsnorm_silu_mul_shuffle_prototype_qwen35_m1_matches_cpu_when_e
 }
 
 #[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_SEGMENTED_RMSNORM_SILU_MUL_PRODUCTION_DIFFERENTIAL=1"]
+fn hip_segmented_rmsnorm_silu_mul_production_qwen35_m1_matches_cpu_when_enabled() {
+    assert_eq!(
+        std::env::var("ULLM_RUN_SEGMENTED_RMSNORM_SILU_MUL_PRODUCTION_DIFFERENTIAL").as_deref(),
+        Ok("1"),
+        "set ULLM_RUN_SEGMENTED_RMSNORM_SILU_MUL_PRODUCTION_DIFFERENTIAL=1 before running this GPU differential test"
+    );
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _require_production_kernel = ExperimentalEnvGuard::new(
+        "ULLM_REQUIRE_HIP_SEGMENTED_RMSNORM_SILU_MUL_KERNEL",
+        Some("1"),
+    );
+    let (input, weight, gate) = segmented_rmsnorm_silu_mul_shuffle_prototype_fixture();
+    let expected = segmented_rmsnorm_silu_mul_shuffle_prototype_run(
+        0, false, &input, &weight, &gate, 1e-6_f32,
+    );
+    let actual = segmented_rmsnorm_silu_mul_shuffle_prototype_run(
+        segmented_rmsnorm_silu_mul_shuffle_prototype_gpu_device(),
+        false,
+        &input,
+        &weight,
+        &gate,
+        1e-6_f32,
+    );
+    assert_segmented_rmsnorm_silu_mul_shuffle_prototype_matches_cpu(
+        &actual,
+        &expected,
+        "production Qwen3.5 M=1 linear-attention post output",
+    );
+    let max_abs_diff = actual
+        .iter()
+        .zip(&expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!(
+        "segmented RMSNorm SiLU-mul production differential passed M=1 segments=32 segment_size=128 epsilon=0.000001000 max_abs_diff={max_abs_diff:.9}"
+    );
+}
+
+#[test]
 #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_SEGMENTED_RMSNORM_SILU_MUL_SHUFFLE_PROTOTYPE_TIMING=1"]
 fn hip_segmented_rmsnorm_silu_mul_shuffle_prototype_qwen35_m1_timing_vs_production_when_enabled() {
     assert_eq!(

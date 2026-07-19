@@ -1039,9 +1039,10 @@ public:
         const std::string &arch,
         std::vector<char> *code,
         std::string *error) {
+        const std::string source = segmented_rmsnorm_silu_mul_kernel_source_for_arch(arch);
         return compile_kernel(
             arch,
-            segmented_rmsnorm_silu_mul_kernel_source(),
+            source.c_str(),
             "ullm_segmented_rmsnorm_silu_mul_f32.hip",
             code,
             error);

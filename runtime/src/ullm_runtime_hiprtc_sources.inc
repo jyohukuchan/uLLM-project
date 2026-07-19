@@ -5538,7 +5538,11 @@ extern "C" __global__ void ullm_segmented_rmsnorm_f32_kernel(
 )";
     }
 
-    static const char *segmented_rmsnorm_silu_mul_kernel_source() {
+    // Superseded scalar-reduction segmented RMSNorm SiLU-mul reference. It is deliberately not
+    // passed to HIPRTC for gfx1201: production keeps the same entry-point ABI but uses the
+    // validated wave32 shuffle reduction below. Retain this source for controlled rollback
+    // comparisons and for generic HIPRTC compilations outside that exact architecture.
+    [[maybe_unused]] static const char *segmented_rmsnorm_silu_mul_scalar_reference_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_segmented_rmsnorm_silu_mul_f32_kernel(
     const float *input,
@@ -5583,19 +5587,11 @@ extern "C" __global__ void ullm_segmented_rmsnorm_silu_mul_f32_kernel(
 )";
     }
 
-    // Direct-only gfx1201 experiment for Qwen3.5's M=1 linear-attention post path. It keeps
-    // the served scalar tree source intact and changes only the per-CTA RMS reduction under an
-    // isolated entry point, so production symbol selection and dispatch cannot change.
-    static std::string segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_source() {
-        std::string prototype = segmented_rmsnorm_silu_mul_kernel_source();
-        const std::string production_name = "ullm_segmented_rmsnorm_silu_mul_f32_kernel";
-        const size_t name_offset = prototype.find(production_name);
-        if (name_offset == std::string::npos) return "";
-        prototype.replace(
-            name_offset,
-            production_name.size(),
-            "ullm_segmented_rmsnorm_silu_mul_shuffle_prototype_f32_kernel");
-
+    // Production segmented RMSNorm SiLU-mul body. The host ABI and HIPRTC entry-point name
+    // remain unchanged, so Qwen3.5 decode continues through its existing linear-attention post
+    // dispatch.
+    static std::string segmented_rmsnorm_silu_mul_kernel_source() {
+        std::string production = segmented_rmsnorm_silu_mul_scalar_reference_kernel_source();
         const std::string lds_setup = R"(    const unsigned long long segment = blockIdx.x;
     const unsigned int tid = threadIdx.x;
     __shared__ float partial[256];
@@ -5604,12 +5600,12 @@ extern "C" __global__ void ullm_segmented_rmsnorm_silu_mul_f32_kernel(
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid % warpSize;
     const unsigned int wave = tid / warpSize;
-    // Eight wave32 leaders replace the 256-thread LDS tree for the fixed direct launch.
+    // Eight wave32 leaders replace the 256-thread LDS tree.
     __shared__ float wave_partials[8];
     float sum_squares = 0.0f;)";
-        const size_t setup_offset = prototype.find(lds_setup);
+        const size_t setup_offset = production.find(lds_setup);
         if (setup_offset == std::string::npos) return "";
-        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+        production.replace(setup_offset, lds_setup.size(), shuffle_setup);
 
         const std::string lds_reduction = R"(    partial[tid] = sum_squares;
     __syncthreads();
@@ -5647,10 +5643,29 @@ extern "C" __global__ void ullm_segmented_rmsnorm_silu_mul_f32_kernel(
     }
     const float inv_rms =
         rsqrtf(wave_partials[0] / static_cast<float>(segment_size) + epsilon);)";
-        const size_t reduction_offset = prototype.find(lds_reduction);
+        const size_t reduction_offset = production.find(lds_reduction);
         if (reduction_offset == std::string::npos) return "";
-        prototype.replace(reduction_offset, lds_reduction.size(), shuffle_reduction);
+        production.replace(reduction_offset, lds_reduction.size(), shuffle_reduction);
+        return production;
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string segmented_rmsnorm_silu_mul_shuffle_prototype_kernel_source() {
+        std::string prototype = segmented_rmsnorm_silu_mul_kernel_source();
+        const std::string production_name = "ullm_segmented_rmsnorm_silu_mul_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(
+            name_offset,
+            production_name.size(),
+            "ullm_segmented_rmsnorm_silu_mul_shuffle_prototype_f32_kernel");
         return prototype;
+    }
+
+    static std::string segmented_rmsnorm_silu_mul_kernel_source_for_arch(const std::string &arch) {
+        return arch == "gfx1201" ? segmented_rmsnorm_silu_mul_kernel_source()
+                                 : segmented_rmsnorm_silu_mul_scalar_reference_kernel_source();
     }
 
     static const char *silu_mul_kernel_source() {
