@@ -1454,6 +1454,80 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v3_f32(
     return ULLM_STATUS_OK;
 }
 
+// Isolated v4 occupancy experiment. Its full v2 eligibility contract is deliberately retained;
+// only the final C store changes, so production dispatch remains untouched.
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v4_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t batch_count,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    if (index_buffer == nullptr || scale_buffer == nullptr || codebook_buffer == nullptr ||
+        scale_values_buffer == nullptr || input_buffer == nullptr || output_buffer == nullptr) {
+        set_error("AQ4 WMMA prototype v4 received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (scale_count == 0u || group_size != kAq4RegisterGroup16 ||
+        batch_count != kAq4WmmaPrototypeBm || !std::isfinite(tensor_scale) ||
+        tensor_scale <= 0.0f) {
+        set_error("AQ4 WMMA prototype v4 received an invalid group16/M=128 configuration");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!buffers_share_backend(index_buffer, scale_buffer) ||
+        !buffers_share_backend(index_buffer, codebook_buffer) ||
+        !buffers_share_backend(index_buffer, scale_values_buffer) ||
+        !buffers_share_backend(index_buffer, input_buffer) ||
+        !buffers_share_backend(index_buffer, output_buffer) ||
+        (row_scale_buffer != nullptr && !buffers_share_backend(index_buffer, row_scale_buffer)) ||
+        !stream_matches_buffer(output_buffer, stream) || index_buffer->backend != BackendKind::Hip ||
+        !aq4_matvec_batch_wmma_prototype_v4_shape_is_supported(
+            hip_runtime().device_arch_name(index_buffer->hip_device_id), group_size, rows, cols,
+            batch_count)) {
+        set_error("AQ4 WMMA prototype v4 requires exact gfx1201, group16, M=128, rows divisible by 16, and cols divisible by 32");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / rows || cols > max_size / batch_count ||
+        rows > max_size / batch_count || cols * batch_count > max_size / sizeof(float) ||
+        rows * batch_count > max_size / sizeof(float) || scale_count > max_size / sizeof(float) ||
+        row_scale_count > max_size / sizeof(float)) {
+        set_error("AQ4 WMMA prototype v4 byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t elements = rows * cols;
+    const size_t input_bytes = cols * batch_count * sizeof(float);
+    const size_t output_bytes = rows * batch_count * sizeof(float);
+    if (index_buffer->bytes < elements / 2u || scale_buffer->bytes < elements / group_size ||
+        scale_values_buffer->bytes < scale_count * sizeof(float) || input_buffer->bytes < input_bytes ||
+        output_buffer->bytes < output_bytes ||
+        (row_scale_buffer != nullptr && row_scale_buffer->bytes < row_scale_count * sizeof(float)) ||
+        codebook_buffer->bytes < 16u * sizeof(float)) {
+        set_error("AQ4 WMMA prototype v4 buffer is too small");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    std::string hip_kernel_error;
+    if (!aq4_matvec_batch_f32_wmma_prototype_v4_hip_kernel(
+            index_buffer, scale_buffer, codebook_buffer, scale_values_buffer, input_buffer,
+            row_scale_buffer, scale_count, group_size, tensor_scale, row_scale_count, rows, cols,
+            batch_count, output_buffer, stream, &hip_kernel_error)) {
+        set_error(hip_kernel_error.empty() ? "AQ4 WMMA prototype v4 HIP kernel launch failed" :
+                                             hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
     const ullm_runtime_buffer *index_buffer,
     const ullm_runtime_buffer *scale_buffer,

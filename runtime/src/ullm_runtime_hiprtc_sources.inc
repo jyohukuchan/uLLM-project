@@ -1664,6 +1664,50 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_prototype_f32_kernel(
 )";
     }
 
+    // Experimental v4 keeps the proven v2 K-pipeline intact, but removes the 8 KiB output LDS
+    // staging tile.  rocWMMA stores C directly in the column-major final-output layout, then the
+    // existing CTA barrier makes those values visible before the regular per-element scale pass.
+    // This lowers the CTA footprint from 26,624 B to 18,432 B: three 8-wave CTAs fit in a 64 KiB
+    // gfx1201 CU while v2 is constrained to two.  Keep this source/module strictly separate from
+    // production until GPU differential and A/B tests establish that the occupancy gain wins.
+    static std::string aq4_matvec_wmma_prototype_v4_kernel_source() {
+        std::string source(aq4_matvec_wmma_prototype_kernel_source());
+        const auto replace_once = [&source](const char *from, const char *to) {
+            const size_t position = source.find(from);
+            if (position == std::string::npos) {
+                return false;
+            }
+            source.replace(position, std::strlen(from), to);
+            return true;
+        };
+        const bool replaced =
+            replace_once(
+                "ullm_aq4_gemm_wmma_prototype_f32_kernel",
+                "ullm_aq4_gemm_wmma_prototype_v4_f32_kernel") &&
+            replace_once(
+                "using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, row_major>;",
+                "using FragC = fragment<accumulator, kTileRows, kTileCols, kWmmaK, float32_t, col_major>;") &&
+            replace_once(
+                "constexpr unsigned int kOutputTileLdsBytes =\n"
+                "        kWavesPerBlock * kTileRows * kTileCols * sizeof(float);",
+                "constexpr unsigned int kOutputTileLdsBytes = 0u;") &&
+            replace_once("kStaticLdsBytes == 26624u", "kStaticLdsBytes == 18432u") &&
+            replace_once(
+                "    __shared__ __attribute__((aligned(16))) float output_tile[\n"
+                "        kWavesPerBlock * kTileRows * kTileCols];\n",
+                "") &&
+            replace_once(
+                "store_matrix_sync(output_tile + wave * kTileRows * kTileCols, c, kTileCols);",
+                "store_matrix_sync(output + (batch_base + wave * kTileCols) * rows + row_base, c, rows);") &&
+            replace_once(
+                "output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;",
+                "output[batch * rows + row] = output[batch * rows + row] * tensor_scale * row_scale;");
+        if (!replaced) {
+            return "";
+        }
+        return source;
+    }
+
     // Experimental v3 of the gfx1201 AQ4 WMMA path. It keeps v2's two-stage asynchronous
     // prefetch discipline, but each stage owns two physically independent Wide-K microtiles.
     // That permits four WMMA operations between producer/consumer barriers without changing

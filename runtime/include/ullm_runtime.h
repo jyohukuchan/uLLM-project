@@ -332,6 +332,28 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v3_f32(
     ullm_runtime_stream *stream);
 
 /*
+ * Isolated v4 gfx1201/group16/M=128 WMMA experiment. It retains v2's double-buffered Wide-K
+ * compute pipeline but stores the accumulator directly to the column-major output layout to
+ * remove the 8 KiB output LDS tile. It has its own HIPRTC module/cache and no fallback.
+ */
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v4_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t batch_count,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
  * Direct production gfx1201 rocWMMA AQ4 group8 GEMM for M=128. This stable ABI uses a separate
  * HIPRTC module and accepts only nonzero shapes with rows divisible by 16 and cols divisible by
  * 32; those constraints preserve complete 16-row output tiles and the Wide-K 16-byte source
