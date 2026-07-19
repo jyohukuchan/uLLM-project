@@ -100,6 +100,22 @@ fn aq4_fused_wide_load_assert_changed(actual: &[f32], baseline: &[f32], label: &
     );
 }
 
+fn aq4_fused_wide_load_assert_matches_cpu(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: output lengths differ");
+    // Match the established AQ4 differential convention: a small absolute floor plus 1%
+    // relative allowance.  The wide-load kernels keep FP32 arithmetic, but repartition each
+    // row's reduction across lanes, so their reduction tree is intentionally not the CPU's
+    // sequential accumulation order.  Exact GPU-to-GPU checks below still guard that a mutation
+    // of one packed stream cannot affect another stream.
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let tolerance = 5e-2_f32 + 1e-2_f32 * expected.abs();
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label} index {index}: actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn aq4_fused_wide_load_run_qkv(
     device: u32,
@@ -251,31 +267,55 @@ fn hip_aq4_fused_wide_load_prototypes_match_cpu_and_keep_packed_streams_independ
     let dt_bias = vec![-0.125; 32];
     let baseline_cpu = aq4_fused_wide_load_run_qkv(0, false, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
     let baseline_gpu = aq4_fused_wide_load_run_qkv(gpu, true, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
-    for (actual, expected) in [(&baseline_gpu.0, &baseline_cpu.0), (&baseline_gpu.1, &baseline_cpu.1), (&baseline_gpu.2, &baseline_cpu.2), (&baseline_gpu.3, &baseline_cpu.3)] { assert_f32s_close(actual, expected, 1e-3); }
+    for (label, actual, expected) in [
+        ("baseline qkv", &baseline_gpu.0, &baseline_cpu.0),
+        ("baseline z", &baseline_gpu.1, &baseline_cpu.1),
+        ("baseline gate", &baseline_gpu.2, &baseline_cpu.2),
+        ("baseline beta", &baseline_gpu.3, &baseline_cpu.3),
+    ] {
+        aq4_fused_wide_load_assert_matches_cpu(actual, expected, label);
+    }
     for stream_index in 0..4 {
         let (mut mqkv, mut mz, mut ma, mut mb) = (qkv.clone(), z.clone(), a.clone(), b.clone());
         match stream_index { 0 => mqkv.indices[0] ^= 0x11, 1 => mz.indices[0] ^= 0x11, 2 => ma.indices[0] ^= 0x11, _ => mb.indices[0] ^= 0x11 }
         let expected = aq4_fused_wide_load_run_qkv(0, false, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
         let actual = aq4_fused_wide_load_run_qkv(gpu, true, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
-        for (actual, expected) in [(&actual.0, &expected.0), (&actual.1, &expected.1), (&actual.2, &expected.2), (&actual.3, &expected.3)] { assert_f32s_close(actual, expected, 1e-3); }
+        let actual_streams = [&actual.0, &actual.1, &actual.2, &actual.3];
+        let expected_streams = [&expected.0, &expected.1, &expected.2, &expected.3];
+        let baseline_gpu_streams = [&baseline_gpu.0, &baseline_gpu.1, &baseline_gpu.2, &baseline_gpu.3];
+        for (label, actual, expected) in [
+            ("mutated qkv", actual_streams[0], expected_streams[0]),
+            ("mutated z", actual_streams[1], expected_streams[1]),
+            ("mutated gate", actual_streams[2], expected_streams[2]),
+            ("mutated beta", actual_streams[3], expected_streams[3]),
+        ] {
+            aq4_fused_wide_load_assert_matches_cpu(actual, expected, label);
+        }
         let changed = [&expected.0, &expected.1, &expected.2, &expected.3];
         let baseline = [&baseline_cpu.0, &baseline_cpu.1, &baseline_cpu.2, &baseline_cpu.3];
         aq4_fused_wide_load_assert_changed(changed[stream_index], baseline[stream_index], "qkv/z/gate/beta");
-        for other in 0..4 { if other != stream_index { assert_f32s_close(changed[other], baseline[other], 0.0); } }
+        aq4_fused_wide_load_assert_changed(actual_streams[stream_index], baseline_gpu_streams[stream_index], "GPU qkv/z/gate/beta");
+        for other in 0..4 {
+            if other != stream_index {
+                assert_f32s_close(changed[other], baseline[other], 0.0);
+                assert_f32s_close(actual_streams[other], baseline_gpu_streams[other], 0.0);
+            }
+        }
     }
     // The same production M=1 fusion serves both decode paths: gate/up=[12288,4096].
     let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
     let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
     let baseline_cpu = aq4_fused_wide_load_run_silu(0, false, &gate, &up, &input);
     let baseline_gpu = aq4_fused_wide_load_run_silu(gpu, true, &gate, &up, &input);
-    assert_f32s_close(&baseline_gpu, &baseline_cpu, 1e-3);
+    aq4_fused_wide_load_assert_matches_cpu(&baseline_gpu, &baseline_cpu, "baseline SiLU-mul");
     for gate_stream in [true, false] {
         let (mut modified_gate, mut modified_up) = (gate.clone(), up.clone());
         if gate_stream { modified_gate.indices[0] ^= 0x11; } else { modified_up.indices[0] ^= 0x11; }
         let expected = aq4_fused_wide_load_run_silu(0, false, &modified_gate, &modified_up, &input);
         let actual = aq4_fused_wide_load_run_silu(gpu, true, &modified_gate, &modified_up, &input);
-        assert_f32s_close(&actual, &expected, 1e-3);
+        aq4_fused_wide_load_assert_matches_cpu(&actual, &expected, "mutated SiLU-mul");
         aq4_fused_wide_load_assert_changed(&expected, &baseline_cpu, if gate_stream { "SiLU gate" } else { "SiLU up" });
+        aq4_fused_wide_load_assert_changed(&actual, &baseline_gpu, if gate_stream { "GPU SiLU gate" } else { "GPU SiLU up" });
     }
 }
 
