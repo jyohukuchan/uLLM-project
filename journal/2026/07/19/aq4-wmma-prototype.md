@@ -37,7 +37,7 @@ rows != 0 && cols != 0 && rows % 16 == 0 && cols % 32 == 0
 - `W \ R`: M=2--127 は legacy、M=128 のみ WMMA。
 - group8 は既存の `HipAq4GemmRegisterBm8Group8F32` の M=8--128 のままである。
 
-M=128 WMMA の feature guard は `ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL=1`。capability probe は実際の `linear_attn_a/b` geometry (`32x4096`, M=128) を direct ABI で起動するため、小さい row-grid も HIPRTC/probe 時点で検証される。別個に registry へ昇格した ragged M=65--127 WMMA path は `ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL=1` を必要とする。
+M=128 WMMA の feature guard は `ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL=1`。capability probe は実際の `linear_attn_a/b` geometry (`32x4096`, M=128) を direct ABI で起動するため、小さい row-grid も HIPRTC/probe 時点で検証される。別個に registry へ昇格した ragged M=65--127 WMMA path は group16 の `ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL=1` と group8 の `ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_RAGGED_M_KERNEL=1` を必要とする。
 
 ## Tile と復号設計
 

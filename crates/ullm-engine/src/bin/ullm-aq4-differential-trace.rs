@@ -64,7 +64,7 @@ const EMBEDDED_BUILD_GIT_COMMIT: Option<&str> = option_env!("ULLM_BUILD_GIT_COMM
 /// layers. The final two cover the package's BF16 embedding gather and full-logit top-1 selection.
 /// Keep this intentionally narrower than the worker's all-profile environment: enabling unrelated
 /// guards can add probes or change dispatch outside this trace's fixed M=1 path.
-const REQUIRED_PHASE3C_TRACE_ENV: [&str; 21] = [
+const REQUIRED_PHASE3C_TRACE_ENV: [&str; 22] = [
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_BATCH_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_MATVEC_ADD_KERNEL",
@@ -79,6 +79,7 @@ const REQUIRED_PHASE3C_TRACE_ENV: [&str; 21] = [
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_KERNEL",
     "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_RAGGED_M_KERNEL",
+    "ULLM_REQUIRE_HIP_AQ4_WMMA_GEMM_GROUP8_RAGGED_M_KERNEL",
     "ULLM_REQUIRE_HIP_PAGED_DECODE_ATTN_KERNEL",
     "ULLM_REQUIRE_HIP_QWEN35_QK_NORM_ROPE_PAGED_KV_WRITE_KERNEL",
     "ULLM_REQUIRE_HIP_PAGED_KV_WRITE_CHUNK_KERNEL",
