@@ -932,6 +932,35 @@ impl PackageAq4ResidentMatvec {
         }
     }
 
+    /// Direct-only gfx1201 M=1 wide-load AQ4 experiment. This is intentionally not wired into
+    /// the projection dispatcher; it exists solely for isolated differential and timing runs.
+    pub fn matvec_wide_load_prototype(
+        &self,
+        input_buffer: &ullm_runtime_sys::RuntimeBuffer,
+        output_buffer: &mut ullm_runtime_sys::RuntimeBuffer,
+        stream: &mut ullm_runtime_sys::RuntimeStream,
+        label: &str,
+    ) -> Result<(), String> {
+        let aq4 = self.aq4_storage(label)?;
+        ullm_runtime_sys::aq4_matvec_wide_load_prototype_f32(
+            aq4.index_buffer,
+            aq4.scale_buffer,
+            aq4.codebook_buffer,
+            aq4.scale_values_buffer,
+            input_buffer,
+            aq4.row_scale_buffer,
+            self.scale_count,
+            self.group_size,
+            self.tensor_scale,
+            self.row_scale_count,
+            self.rows,
+            self.cols,
+            output_buffer,
+            Some(stream),
+        )
+        .map_err(|err| format!("failed to run {label} AQ4 wide-load matvec prototype: {err}"))
+    }
+
     pub fn matvec_batch(
         &self,
         input_buffer: &ullm_runtime_sys::RuntimeBuffer,

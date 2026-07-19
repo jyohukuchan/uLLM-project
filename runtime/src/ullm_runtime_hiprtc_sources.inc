@@ -643,6 +643,14 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_kernel_source();
     }
 
+    // Isolated M=1 experiment. Unlike the scalar production kernel, each lane owns one
+    // 32-element chunk and obtains its sixteen packed AQ4 bytes with one uint4 load.
+    static std::string aq4_matvec_wide_load_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_rows_per_block_preamble(arch, "ULLM_AQ4_MATVEC_RPB") +
+               aq4_matvec_wide_load_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_batch_kernel_source_for_arch(const std::string &arch) {
         return aq4_rows_per_block_preamble(arch, "ULLM_AQ4_MATVEC_BATCH_RPB") +
                aq4_matvec_batch_kernel_source();
@@ -809,6 +817,104 @@ extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
                     const float value =
                         codebook[codebook_index] * scale_values[scale_index] * tensor_scale;
                     sum += value * input[col];
+                }
+            }
+        }
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[partial_offset + lane] += partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && row < rows) {
+        float value = partial[partial_offset];
+        if (row_scales != nullptr && row < row_scale_count) {
+            value *= row_scales[row];
+        }
+        output[row] = value;
+    }
+}
+)";
+    }
+
+    static const char *aq4_matvec_wide_load_prototype_kernel_source() {
+        return R"(
+// This direct-only M=1 prototype deliberately accepts only complete 32-element chunks.
+// `uint4` is the same explicit 128-bit packed-AQ4 load type used by the Wide-K WMMA kernels.
+extern "C" __global__ void ullm_aq4_matvec_wide_load_prototype_f32_kernel(
+    const unsigned char *indices,
+    const unsigned char *scale_indices,
+    const float *codebook,
+    const float *scale_values,
+    const float *input,
+    const float *row_scales,
+    unsigned long long scale_count,
+    unsigned long long group_size,
+    float tensor_scale,
+    unsigned long long row_scale_count,
+    unsigned long long rows,
+    unsigned long long cols,
+    float *output) {
+    static_assert(sizeof(uint4) == 16u, "AQ4 wide load must remain 128 bits");
+    const unsigned int tid = threadIdx.x;
+    constexpr unsigned int rows_per_block = ULLM_AQ4_ROWS_PER_BLOCK;
+    constexpr unsigned int threads_per_row = 256u / rows_per_block;
+    const unsigned int row_in_block = tid / threads_per_row;
+    const unsigned int lane = tid - row_in_block * threads_per_row;
+    const unsigned long long row =
+        static_cast<unsigned long long>(blockIdx.x) * rows_per_block + row_in_block;
+    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    if (row < rows) {
+        const unsigned long long row_offset = row * cols;
+        const unsigned long long chunks_per_row = cols / 32ull;
+        const unsigned long long groups_per_row = cols / group_size;
+        // `cols` is a multiple of 32, so row_offset/2 and every chunk address are 16-byte aligned.
+        const unsigned long long row_byte_offset = row_offset >> 1;
+        for (unsigned long long chunk = lane; chunk < chunks_per_row;
+             chunk += threads_per_row) {
+            const uint4 packed = *reinterpret_cast<const uint4 *>(
+                indices + row_byte_offset + chunk * 16ull);
+            const unsigned long long col_base = chunk * 32ull;
+            const unsigned long long group_base =
+                row * groups_per_row + (col_base / group_size);
+#pragma unroll
+            for (unsigned int word_index = 0; word_index < 4u; ++word_index) {
+                const unsigned int word = word_index == 0u ? packed.x :
+                    (word_index == 1u ? packed.y : (word_index == 2u ? packed.z : packed.w));
+                const unsigned int groups_in_word = group_size == 8ull ? 2u : 1u;
+#pragma unroll
+                for (unsigned int group_in_word = 0; group_in_word < 2u; ++group_in_word) {
+                    if (group_in_word >= groups_in_word) {
+                        continue;
+                    }
+                    const unsigned long long group = group_base +
+                        static_cast<unsigned long long>(word_index * groups_in_word + group_in_word);
+                    const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group]);
+                    if (scale_index >= scale_count) {
+                        continue;
+                    }
+                    const unsigned int byte_start = group_size == 8ull ? group_in_word * 4u : 0u;
+                    const unsigned int byte_count = group_size == 8ull ? 4u : 8u;
+                    float raw_sum = 0.0f;
+#pragma unroll
+                    for (unsigned int byte_offset = 0; byte_offset < 8u; ++byte_offset) {
+                        if (byte_offset >= byte_count) {
+                            continue;
+                        }
+                        const unsigned int packed_byte =
+                            (word >> (8u * (byte_start + byte_offset))) & 0xffu;
+                        const unsigned long long col = col_base +
+                            static_cast<unsigned long long>(word_index * 8u +
+                                (byte_start + byte_offset) * 2u);
+                        raw_sum += codebook[packed_byte & 0x0fu] * input[col];
+                        raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
+                    }
+                    sum += raw_sum * scale_values[scale_index] * tensor_scale;
                 }
             }
         }
