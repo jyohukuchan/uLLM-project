@@ -1606,6 +1606,96 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_prototype_v3_f32(
     return ULLM_STATUS_OK;
 }
 
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_ragged_m_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t m_actual,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream) {
+    if (index_buffer == nullptr || scale_buffer == nullptr || codebook_buffer == nullptr ||
+        scale_values_buffer == nullptr || input_buffer == nullptr || output_buffer == nullptr) {
+        set_error("AQ4 group8 ragged-M WMMA prototype received a null pointer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (scale_count == 0u || group_size != kAq4RegisterGroup8 || m_actual == 0u ||
+        m_actual > kAq4WmmaPrototypeBm || !std::isfinite(tensor_scale) || tensor_scale <= 0.0f) {
+        set_error("AQ4 group8 ragged-M WMMA prototype parameters are invalid");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!buffers_share_backend(index_buffer, scale_buffer) ||
+        !buffers_share_backend(index_buffer, codebook_buffer) ||
+        !buffers_share_backend(index_buffer, scale_values_buffer) ||
+        !buffers_share_backend(index_buffer, input_buffer) ||
+        !buffers_share_backend(index_buffer, output_buffer) ||
+        (row_scale_buffer != nullptr && !buffers_share_backend(index_buffer, row_scale_buffer))) {
+        set_error("AQ4 group8 ragged-M WMMA prototype buffers belong to different backends or devices");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!stream_matches_buffer(output_buffer, stream) || index_buffer->backend != BackendKind::Hip) {
+        set_error("AQ4 group8 ragged-M WMMA prototype requires a matching HIP gfx1201 stream");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!aq4_matvec_batch_wmma_group8_ragged_m_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(index_buffer->hip_device_id), group_size, rows, cols,
+            m_actual)) {
+        set_error("AQ4 group8 ragged-M WMMA prototype requires gfx1201, group8, 1<=M<=128, rows divisible by 16, and cols divisible by 32");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u ||
+        (reinterpret_cast<std::uintptr_t>(input_buffer->ptr) & 15u) != 0u) {
+        set_error("AQ4 group8 ragged-M WMMA prototype requires 16-byte-aligned index and input buffers");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / rows || cols > max_size / m_actual || rows > max_size / m_actual ||
+        scale_count > max_size / sizeof(float) || row_scale_count > max_size / sizeof(float)) {
+        set_error("AQ4 group8 ragged-M WMMA prototype byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t elements = rows * cols;
+    const size_t input_elements = cols * m_actual;
+    const size_t output_elements = rows * m_actual;
+    if (input_elements > max_size / sizeof(float) || output_elements > max_size / sizeof(float)) {
+        set_error("AQ4 group8 ragged-M WMMA prototype byte size overflows");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const size_t required_index_bytes = elements / 2u;
+    const size_t groups = elements / group_size;
+    const size_t required_input_bytes = input_elements * sizeof(float);
+    const size_t required_output_bytes = output_elements * sizeof(float);
+    const size_t required_scale_value_bytes = scale_count * sizeof(float);
+    const size_t required_row_scale_bytes = row_scale_count * sizeof(float);
+    if (index_buffer->bytes < required_index_bytes || scale_buffer->bytes < groups ||
+        scale_values_buffer->bytes < required_scale_value_bytes ||
+        input_buffer->bytes < required_input_bytes || output_buffer->bytes < required_output_bytes ||
+        (row_scale_buffer != nullptr && row_scale_buffer->bytes < required_row_scale_bytes) ||
+        codebook_buffer->bytes % sizeof(float) != 0u || codebook_buffer->bytes / sizeof(float) < 16u) {
+        set_error("AQ4 group8 ragged-M WMMA prototype buffer is too small or invalid");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    std::string hip_kernel_error;
+    if (!aq4_matvec_batch_f32_wmma_group8_ragged_m_prototype_hip_kernel(
+            index_buffer, scale_buffer, codebook_buffer, scale_values_buffer, input_buffer,
+            row_scale_buffer, scale_count, group_size, tensor_scale, row_scale_count, rows, cols,
+            m_actual, output_buffer, stream, &hip_kernel_error)) {
+        set_error(hip_kernel_error.empty() ?
+            "AQ4 group8 ragged-M WMMA prototype HIP kernel launch failed" : hip_kernel_error.c_str());
+        return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error("");
+    return ULLM_STATUS_OK;
+}
+
 ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
     const ullm_runtime_buffer *index_buffer,
     const ullm_runtime_buffer *scale_buffer,

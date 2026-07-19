@@ -377,6 +377,28 @@ ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_prototype_f32(
     ullm_runtime_stream *stream);
 
 /*
+ * Direct-only gfx1201/group8 ragged-M WMMA experiment. The kernel computes one physical M=128
+ * CTA while m_actual (1..128) guards activation loads and final output stores, allowing exact
+ * logical-M input/output buffers. It is independent of the M=128 group8 production module.
+ */
+ullm_status ullm_runtime_aq4_matvec_batch_wmma_group8_ragged_m_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t m_actual,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
+/*
  * Classifies the active AQ4 batch path, including explicit experiment environment gates,
  * without launching or timing a kernel.
  * device_index follows ullm_runtime_context_create: 0 is CPU and HIP devices start at 1.

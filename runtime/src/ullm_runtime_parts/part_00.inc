@@ -759,6 +759,24 @@ public:
             rocwmma_include_options());
     }
 
+    bool compile_aq4_matvec_wmma_group8_ragged_m_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source = aq4_matvec_wmma_group8_ragged_m_prototype_kernel_source();
+        if (source.empty()) {
+            append_error(error, "AQ4 group8 ragged-M WMMA prototype source transformation failed");
+            return false;
+        }
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_aq4_gemm_wmma_group8_ragged_m_prototype_f32.hip",
+            code,
+            error,
+            rocwmma_include_options());
+    }
+
     bool compile_aq4_matvec_top1_kernel(
         const std::string &arch,
         std::vector<char> *code,
@@ -3852,6 +3870,77 @@ hip_aq4_matvec_wmma_group8_prototype_kernel_cache() {
     return cache;
 }
 
+// Ragged group8 retains an output LDS tile for its guarded scalar final stores, so it requires a
+// separate code object from the direct M=128 group8 module.
+class HipAq4MatvecWmmaGroup8RaggedMPrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) {
+            return found->second->function;
+        }
+        auto failed = failures_.find(device_id);
+        if (failed != failures_.end()) {
+            append_error(error, failed->second);
+            return nullptr;
+        }
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "AQ4 group8 ragged-M WMMA prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_aq4_matvec_wmma_group8_ragged_m_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            return fail(
+                device_id,
+                compile_error.empty() ?
+                    "failed to build AQ4 group8 ragged-M WMMA prototype HIP kernel" :
+                    compile_error,
+                error);
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            return fail(device_id, "hipModuleLoadData failed for gfx1201 AQ4 group8 ragged-M WMMA prototype", error);
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function, module, "ullm_aq4_gemm_wmma_group8_ragged_m_prototype_f32_kernel", device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            return fail(device_id, "hipModuleGetFunction failed for AQ4 group8 ragged-M WMMA prototype", error);
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        void *result = loaded->function;
+        modules_.emplace(device_id, std::move(loaded));
+        return result;
+    }
+
+private:
+    struct LoadedModule { void *module = nullptr; void *function = nullptr; };
+    void *fail(int device_id, const std::string &message, std::string *error) {
+        failures_.emplace(device_id, message);
+        append_error(error, message);
+        return nullptr;
+    }
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) return;
+        if (!error->empty()) error->append("\n");
+        error->append(message);
+    }
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+    std::unordered_map<int, std::string> failures_;
+};
+
+HipAq4MatvecWmmaGroup8RaggedMPrototypeKernelCache &
+hip_aq4_matvec_wmma_group8_ragged_m_prototype_kernel_cache() {
+    static HipAq4MatvecWmmaGroup8RaggedMPrototypeKernelCache cache;
+    return cache;
+}
+
 class HipAq4MatvecTop1KernelCache {
 public:
     void *function_for_device(int device_id, std::string *error) {
@@ -4400,6 +4489,17 @@ bool aq4_matvec_batch_wmma_group8_prototype_shape_is_supported(
         rows % kAq4WmmaPrototypeBn == 0u && cols % kAq4WmmaPrototypeBk == 0u;
 }
 
+bool aq4_matvec_batch_wmma_group8_ragged_m_prototype_shape_is_supported(
+    const std::string &arch,
+    size_t group_size,
+    size_t rows,
+    size_t cols,
+    size_t m_actual) {
+    return arch == "gfx1201" && group_size == kAq4RegisterGroup8 && m_actual != 0u &&
+        m_actual <= kAq4WmmaPrototypeBm && rows != 0u && cols != 0u &&
+        rows % kAq4WmmaPrototypeBn == 0u && cols % kAq4WmmaPrototypeBk == 0u;
+}
+
 Aq4MatvecBatchDispatchKind aq4_matvec_batch_dispatch_kind_for_device(
     int device_id,
     size_t group_size,
@@ -4916,6 +5016,74 @@ bool aq4_matvec_batch_f32_wmma_prototype_v3_hip_kernel(
         if (error != nullptr) {
             *error = "hipModuleLaunchKernel failed for AQ4 WMMA prototype v3";
         }
+        return false;
+    }
+    return true;
+}
+
+bool aq4_matvec_batch_f32_wmma_group8_ragged_m_prototype_hip_kernel(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    size_t m_actual,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream,
+    std::string *error) {
+    const int device_id = index_buffer->hip_device_id;
+    if (!aq4_matvec_batch_wmma_group8_ragged_m_prototype_shape_is_supported(
+            hip_runtime().device_arch_name(device_id), group_size, rows, cols, m_actual)) {
+        if (error != nullptr) {
+            *error = "AQ4 group8 ragged-M WMMA prototype requires gfx1201, group8, 1<=M<=128, rows divisible by 16, and cols divisible by 32";
+        }
+        return false;
+    }
+    if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u ||
+        (reinterpret_cast<std::uintptr_t>(input_buffer->ptr) & 15u) != 0u) {
+        if (error != nullptr) {
+            *error = "AQ4 group8 ragged-M WMMA prototype requires 16-byte-aligned index and input buffers";
+        }
+        return false;
+    }
+    void *function = hip_aq4_matvec_wmma_group8_ragged_m_prototype_kernel_cache()
+                         .function_for_device(device_id, error);
+    if (function == nullptr) return false;
+    const size_t grid_x = rows / kAq4WmmaPrototypeBn;
+    if (grid_x == 0u || grid_x > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
+        if (error != nullptr) *error = "AQ4 group8 ragged-M WMMA prototype dimensions exceed HIP grid limit";
+        return false;
+    }
+    unsigned long long kernel_scale_count = static_cast<unsigned long long>(scale_count);
+    unsigned long long kernel_group_size = static_cast<unsigned long long>(group_size);
+    unsigned long long kernel_rows = static_cast<unsigned long long>(rows);
+    unsigned long long kernel_cols = static_cast<unsigned long long>(cols);
+    unsigned long long kernel_m_actual = static_cast<unsigned long long>(m_actual);
+    unsigned long long kernel_row_scale_count = static_cast<unsigned long long>(row_scale_count);
+    void *index_ptr = index_buffer->ptr;
+    void *scale_ptr = scale_buffer->ptr;
+    void *codebook_ptr = codebook_buffer->ptr;
+    void *scale_values_ptr = scale_values_buffer->ptr;
+    void *input_ptr = input_buffer->ptr;
+    void *row_scale_ptr = row_scale_buffer == nullptr ? nullptr : row_scale_buffer->ptr;
+    void *output_ptr = output_buffer->ptr;
+    void *kernel_params[] = {
+        &index_ptr, &scale_ptr, &codebook_ptr, &scale_values_ptr, &input_ptr, &row_scale_ptr,
+        &kernel_scale_count, &kernel_group_size, &tensor_scale, &kernel_row_scale_count,
+        &kernel_rows, &kernel_cols, &kernel_m_actual, &output_ptr,
+    };
+    void *hip_stream = stream == nullptr ? nullptr : stream->stream;
+    if (!hip_runtime().module_launch_kernel_2d(
+            function, static_cast<unsigned int>(grid_x), 1u, kAq4WmmaPrototypeThreads,
+            kernel_params, hip_stream, device_id)) {
+        if (error != nullptr) *error = "hipModuleLaunchKernel failed for AQ4 group8 ragged-M WMMA prototype";
         return false;
     }
     return true;

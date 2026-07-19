@@ -2378,6 +2378,109 @@ extern "C" __global__ void ullm_aq4_gemm_wmma_group8_prototype_f32_kernel(
 )";
     }
 
+    // Ragged-M group8 variant. Group8 has the same two-stage Wide-K ping-pong pipeline as the
+    // M=128 source above, so both the initial publication and steady-state prefetch must avoid
+    // forming addresses for physical rows outside m_actual. The group8 four-scale decode stays
+    // entirely in the shared source and is not changed by this additive experiment.
+    static std::string aq4_matvec_wmma_group8_ragged_m_prototype_kernel_source() {
+        std::string source(aq4_matvec_wmma_group8_prototype_kernel_source());
+        const auto replace_once = [&source](const char *from, const char *to) {
+            const size_t position = source.find(from);
+            if (position == std::string::npos) {
+                return false;
+            }
+            source.replace(position, std::strlen(from), to);
+            return true;
+        };
+        const bool replaced =
+            replace_once(
+                "ullm_aq4_gemm_wmma_group8_prototype_f32_kernel",
+                "ullm_aq4_gemm_wmma_group8_ragged_m_prototype_f32_kernel") &&
+            replace_once(
+                "unsigned long long batch_count,\n"
+                "    float *output)",
+                "unsigned long long m_actual,\n"
+                "    float *output)") &&
+            replace_once(
+                "if (group_size != 8ull || batch_count != kBatchTile || rows == 0ull || cols == 0ull ||\n"
+                "        (rows % kTileRows) != 0ull || (cols % kWideK) != 0ull) {",
+                "if (group_size != 8ull || m_actual == 0ull || m_actual > kBatchTile ||\n"
+                "        rows == 0ull || cols == 0ull || (rows % kTileRows) != 0ull ||\n"
+                "        (cols % kWideK) != 0ull) {") &&
+            replace_once(
+                "        const unsigned long long input_offset =\n"
+                "            (batch_base + batch_in_tile) * cols + k_in_tile;\n"
+                "        const ullm_aq4_wmma_group8_float4 values =\n"
+                "            *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);\n"
+                "        const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "        input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "        input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "        input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "        input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(values[3]);",
+                "        const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "        // Check before calculating an address: exact-sized ragged inputs have no tail.\n"
+                "        if (batch_base + batch_in_tile < m_actual) {\n"
+                "            const unsigned long long input_offset =\n"
+                "                (batch_base + batch_in_tile) * cols + k_in_tile;\n"
+                "            const ullm_aq4_wmma_group8_float4 values =\n"
+                "                *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);\n"
+                "            input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "            input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "            input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "            input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(values[3]);\n"
+                "        } else {\n"
+                "            input_tiles[0][shared_offset + 0u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 1u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 2u] = static_cast<float16_t>(0.0f);\n"
+                "            input_tiles[0][shared_offset + 3u] = static_cast<float16_t>(0.0f);\n"
+                "        }") &&
+            replace_once(
+                "                const unsigned long long input_offset =\n"
+                "                    (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;\n"
+                "                prefetched_input[prefetch_index] =\n"
+                "                    *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);",
+                "                if (batch_base + batch_in_tile < m_actual) {\n"
+                "                    const unsigned long long input_offset =\n"
+                "                        (batch_base + batch_in_tile) * cols + k_base + kWideK + k_in_tile;\n"
+                "                    prefetched_input[prefetch_index] =\n"
+                "                        *reinterpret_cast<const ullm_aq4_wmma_group8_float4 *>(input + input_offset);\n"
+                "                }") &&
+            replace_once(
+                "                const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "                const ullm_aq4_wmma_group8_float4 values = prefetched_input[prefetch_index];\n"
+                "                input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "                input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "                input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "                input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(values[3]);",
+                "                const unsigned int shared_offset = batch_in_tile * kWideK + k_in_tile;\n"
+                "                if (batch_base + batch_in_tile < m_actual) {\n"
+                "                    const ullm_aq4_wmma_group8_float4 values = prefetched_input[prefetch_index];\n"
+                "                    input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(values[0]);\n"
+                "                    input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(values[1]);\n"
+                "                    input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(values[2]);\n"
+                "                    input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(values[3]);\n"
+                "                } else {\n"
+                "                    input_tiles[next_stage][shared_offset + 0u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 1u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 2u] = static_cast<float16_t>(0.0f);\n"
+                "                    input_tiles[next_stage][shared_offset + 3u] = static_cast<float16_t>(0.0f);\n"
+                "                }") &&
+            replace_once(
+                "        const float row_scale =\n"
+                "            row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;\n"
+                "        output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;",
+                "        if (batch < m_actual) {\n"
+                "            const float row_scale =\n"
+                "                row_scales != nullptr && row < row_scale_count ? row_scales[row] : 1.0f;\n"
+                "            output[batch * rows + row] = output_tile[output_index] * tensor_scale * row_scale;\n"
+                "        }") &&
+            replace_once("    (void)batch_count;", "    (void)m_actual;");
+        if (!replaced) {
+            return "";
+        }
+        return source;
+    }
+
     static const char *aq4_matvec_top1_kernel_source() {
         return R"(
 extern "C" __global__ void ullm_aq4_matvec_top1_f32_kernel(

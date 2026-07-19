@@ -248,8 +248,26 @@
             .copy_to_host(0, &mut output_bytes, Some(&mut stream))
             .unwrap();
         stream.synchronize().unwrap();
-        assert_eq!(le_bytes_to_f32s(&output_bytes), vec![113.75, 28.0]);
+    assert_eq!(le_bytes_to_f32s(&output_bytes), vec![113.75, 28.0]);
+}
+
+#[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_RAGGED_M_DIFFERENTIAL=1"]
+fn hip_aq4_wmma_group8_ragged_m_exact_buffers_match_cpu_when_enabled() {
+    assert_eq!(std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_RAGGED_M_DIFFERENTIAL").as_deref(), Ok("1"));
+    let device_index = (1..device_count().unwrap()).find(|&candidate| device_info(candidate).is_ok_and(|info| info.gcn_arch_name == "gfx1201")).expect("isolated gfx1201 HIP device");
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    const ROWS: usize = 16; const COLS: usize = 4096; const SCALES: usize = 7;
+    let mut seed = 0x510e_527f_u32; let mut next = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed as f32 / u32::MAX as f32 };
+    let indices: Vec<u8> = (0..ROWS * COLS / 2).map(|_| ((next() * 16.0) as u8 & 15) | (((next() * 16.0) as u8 & 15) << 4)).collect(); let scales: Vec<u8> = (0..ROWS * COLS / 8).map(|_| ((next() * SCALES as f32) as u8).min(6)).collect(); let codebook: Vec<f32> = (0..16).map(|_| next() - 0.5).collect(); let values: Vec<f32> = (0..SCALES).map(|_| 0.5 + next() * 0.5).collect(); let row_scales: Vec<f32> = (0..ROWS).map(|_| 0.75 + next() * 0.5).collect();
+    for &m in &[127_usize, 113, 65, 8, 1, 128] {
+        let input: Vec<f32> = (0..m * COLS).map(|_| next() * 2.0 - 1.0).collect(); assert_eq!(input.len(), input.capacity());
+        let mut cpu = RuntimeContext::create(0).unwrap(); let mut cs = cpu.create_stream().unwrap(); let mut ci = cpu.alloc_buffer(indices.len()).unwrap(); let mut cg = cpu.alloc_buffer(scales.len()).unwrap(); let mut cc = cpu.alloc_buffer(64).unwrap(); let mut cv = cpu.alloc_buffer(SCALES * 4).unwrap(); let mut cx = cpu.alloc_buffer(input.len() * 4).unwrap(); let mut cr = cpu.alloc_buffer(ROWS * 4).unwrap(); let mut co = cpu.alloc_buffer(m * ROWS * 4).unwrap();
+        ci.copy_from_host(0, &indices, Some(&mut cs)).unwrap(); cg.copy_from_host(0, &scales, Some(&mut cs)).unwrap(); cc.copy_from_host(0, &f32s_to_le_bytes(&codebook), Some(&mut cs)).unwrap(); cv.copy_from_host(0, &f32s_to_le_bytes(&values), Some(&mut cs)).unwrap(); cx.copy_from_host(0, &f32s_to_le_bytes(&input), Some(&mut cs)).unwrap(); cr.copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut cs)).unwrap(); aq4_matvec_batch_f32(&ci, &cg, &cc, &cv, &cx, Some(&cr), SCALES, 8, 0.75, ROWS, ROWS, COLS, m, &mut co, Some(&mut cs)).unwrap(); cs.synchronize().unwrap(); let mut expected = vec![0; m * ROWS * 4]; co.copy_to_host(0, &mut expected, Some(&mut cs)).unwrap();
+        let mut hip = RuntimeContext::create(device_index).unwrap(); let mut hs = hip.create_stream().unwrap(); let mut hi = hip.alloc_buffer(indices.len()).unwrap(); let mut hg = hip.alloc_buffer(scales.len()).unwrap(); let mut hc = hip.alloc_buffer(64).unwrap(); let mut hv = hip.alloc_buffer(SCALES * 4).unwrap(); let mut hx = hip.alloc_buffer(input.len() * 4).unwrap(); let mut hr = hip.alloc_buffer(ROWS * 4).unwrap(); let mut ho = hip.alloc_buffer(m * ROWS * 4).unwrap(); assert_eq!(hx.size().unwrap(), input.len() * 4); assert_eq!(ho.size().unwrap(), m * ROWS * 4); hi.copy_from_host(0, &indices, Some(&mut hs)).unwrap(); hg.copy_from_host(0, &scales, Some(&mut hs)).unwrap(); hc.copy_from_host(0, &f32s_to_le_bytes(&codebook), Some(&mut hs)).unwrap(); hv.copy_from_host(0, &f32s_to_le_bytes(&values), Some(&mut hs)).unwrap(); hx.copy_from_host(0, &f32s_to_le_bytes(&input), Some(&mut hs)).unwrap(); hr.copy_from_host(0, &f32s_to_le_bytes(&row_scales), Some(&mut hs)).unwrap(); aq4_matvec_batch_wmma_group8_ragged_m_prototype_f32(&hi, &hg, &hc, &hv, &hx, Some(&hr), SCALES, 8, 0.75, ROWS, ROWS, COLS, m, &mut ho, Some(&mut hs)).unwrap(); hs.synchronize().unwrap(); let mut actual = vec![0; m * ROWS * 4]; ho.copy_to_host(0, &mut actual, Some(&mut hs)).unwrap(); for (a, e) in le_bytes_to_f32s(&actual).iter().zip(le_bytes_to_f32s(&expected)) { assert!((a - e).abs() <= 0.05 + 0.01 * e.abs()); }
+        if m == 128 { let mut production = hip.alloc_buffer(m * ROWS * 4).unwrap(); aq4_matvec_batch_wmma_group8_prototype_f32(&hi, &hg, &hc, &hv, &hx, Some(&hr), SCALES, 8, 0.75, ROWS, ROWS, COLS, m, &mut production, Some(&mut hs)).unwrap(); hs.synchronize().unwrap(); let mut bytes = vec![0; m * ROWS * 4]; production.copy_to_host(0, &mut bytes, Some(&mut hs)).unwrap(); assert_f32s_close(&le_bytes_to_f32s(&actual), &le_bytes_to_f32s(&bytes), 1e-5); }
     }
+}
 
     #[test]
     fn cpu_aq4_matvec_silu_mul_f32_computes_expected_values() {
@@ -2297,13 +2315,13 @@
     }
 
     #[test]
-    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_TIMING=1"]
-    fn hip_aq4_wmma_group8_m128_target_shapes_timing_vs_register_bm8_group8_when_enabled()
+    #[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_WMMA_GROUP8_RAGGED_M_TIMING=1"]
+    fn hip_aq4_wmma_group8_ragged_m127_target_shapes_timing_vs_register_bm8_group8_when_enabled()
     {
         assert_eq!(
-            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_TIMING").as_deref(),
+            std::env::var("ULLM_RUN_AQ4_WMMA_GROUP8_RAGGED_M_TIMING").as_deref(),
             Ok("1"),
-            "set ULLM_RUN_AQ4_WMMA_GROUP8_TIMING=1 before running this GPU timing test"
+            "set ULLM_RUN_AQ4_WMMA_GROUP8_RAGGED_M_TIMING=1 before running this GPU timing test"
         );
         let device_index = (1..device_count().unwrap())
             .find(|&candidate| {
@@ -2327,7 +2345,7 @@
             ("attn_o + linear_attn_out", 4_096_usize, 4_096),
             ("attn_k + attn_v", 1_024, 4_096),
         ] {
-            let batch_count = 128_usize;
+            let batch_count = 127_usize;
             assert_eq!(rows % 16, 0, "{family} must fill WMMA row tiles");
             assert_eq!(cols % 32, 0, "{family} must fill Wide-K groups");
             assert_eq!(32 / 8, 4, "{family} must decode four group8 scales per Wide-K load");
@@ -2419,7 +2437,7 @@
             }
             hip_stream.synchronize().unwrap();
             for _ in 0..WARMUP_ITERATIONS {
-                aq4_matvec_batch_wmma_group8_prototype_f32(
+                aq4_matvec_batch_wmma_group8_ragged_m_prototype_f32(
                     &hip_index,
                     &hip_scale,
                     &hip_codebook,
@@ -2466,7 +2484,7 @@
 
             let wmma_started = std::time::Instant::now();
             for _ in 0..TIMED_ITERATIONS {
-                aq4_matvec_batch_wmma_group8_prototype_f32(
+                aq4_matvec_batch_wmma_group8_ragged_m_prototype_f32(
                     &hip_index,
                     &hip_scale,
                     &hip_codebook,
