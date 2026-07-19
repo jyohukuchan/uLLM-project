@@ -740,6 +740,19 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
                aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_source();
     }
 
+    // Direct-only gfx1201 experiment. It retains the production scalar packed-byte traversal and
+    // paired streams, but changes the 64-thread-per-row LDS trees into wave32 shuffles followed
+    // by the minimal two-wave-per-row LDS combine.
+    static std::string aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        return aq4_fused_rows_per_block_preamble(
+                   arch,
+                   4u,
+                   2u,
+                   "ULLM_AQ4_MATVEC_QKV_Z_GATE_BETA_RPB") +
+               aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source();
+    }
+
     static std::string aq4_matvec_silu_mul_kernel_source_for_arch(const std::string &arch) {
         const unsigned int rows_per_block = aq4_fused_rows_per_block_for_arch(
             arch,
@@ -4274,6 +4287,82 @@ __device__ void ullm_aq4_qkv_z_gate_beta_pair_thread_sums(
     *a_sum_output = a_sum; *b_sum_output = b_sum;
 }
 )" + production;
+    }
+
+    static std::string aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source() {
+        std::string prototype = aq4_matvec_qkv_z_gate_beta_kernel_source();
+        const std::string production_name = "ullm_aq4_matvec_qkv_z_gate_beta_f32_kernel";
+        const size_t name_offset = prototype.find(production_name);
+        if (name_offset == std::string::npos) return "";
+        prototype.replace(name_offset, production_name.size(),
+            "ullm_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32_kernel");
+
+        const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float primary_partial[256];
+    __shared__ float secondary_partial[256];
+    float primary_sum = 0.0f;
+    float secondary_sum = 0.0f;)";
+        const std::string shuffle_setup = R"(    // RPB=4 yields 64 contiguous threads per row: exactly two gfx1201 wave32s.
+    // Preserve the two independent pair-stream accumulators while retaining only one value per
+    // stream/wave for the cross-wave combine (4 rows * 2 waves = 8 values each).
+    const unsigned int wave_in_row = lane / warpSize;
+    const unsigned int lane_in_wave = lane % warpSize;
+    const unsigned int wave_partial_offset = row_in_block * 2u + wave_in_row;
+    __shared__ float primary_wave_partial[8];
+    __shared__ float secondary_wave_partial[8];
+    float primary_sum = 0.0f;
+    float secondary_sum = 0.0f;)";
+        const size_t setup_offset = prototype.find(lds_setup);
+        if (setup_offset == std::string::npos) return "";
+        prototype.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_tree = R"(    primary_partial[tid] = primary_sum;
+    secondary_partial[tid] = secondary_sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            primary_partial[partial_offset + lane] += primary_partial[partial_offset + lane + offset];
+            secondary_partial[partial_offset + lane] +=
+                secondary_partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && logical_row < total_rows) {
+        float value = primary_partial[partial_offset];)";
+        const std::string shuffle_reduction = R"(    // Shuffle within each wave first. The source has exactly 64 threads per row, so
+    // no shuffle crosses row boundaries; the remaining cross-wave sum is two LDS reads.
+    for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+        primary_sum += __shfl_down(primary_sum, offset, warpSize);
+        secondary_sum += __shfl_down(secondary_sum, offset, warpSize);
+    }
+    if (lane_in_wave == 0u) {
+        primary_wave_partial[wave_partial_offset] = primary_sum;
+        secondary_wave_partial[wave_partial_offset] = secondary_sum;
+    }
+    __syncthreads();
+    if (lane == 0 && logical_row < total_rows) {
+        float value = primary_wave_partial[row_in_block * 2u] +
+            primary_wave_partial[row_in_block * 2u + 1u];)";
+        const size_t tree_offset = prototype.find(lds_tree);
+        if (tree_offset == std::string::npos) return "";
+        prototype.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+
+        const std::string secondary_value = "float z_value = secondary_partial[partial_offset];";
+        const std::string secondary_wave_value =
+            "float z_value = secondary_wave_partial[row_in_block * 2u] + "
+            "secondary_wave_partial[row_in_block * 2u + 1u];";
+        const size_t z_value_offset = prototype.find(secondary_value);
+        if (z_value_offset == std::string::npos) return "";
+        prototype.replace(z_value_offset, secondary_value.size(), secondary_wave_value);
+
+        const std::string b_value = "float b_value = secondary_partial[partial_offset];";
+        const std::string secondary_b_value =
+            "float b_value = secondary_wave_partial[row_in_block * 2u] + "
+            "secondary_wave_partial[row_in_block * 2u + 1u];";
+        const size_t b_value_offset = prototype.find(b_value);
+        if (b_value_offset == std::string::npos) return "";
+        prototype.replace(b_value_offset, b_value.size(), secondary_b_value);
+        return prototype;
     }
 
     // Superseded scalar-reduction AQ4 matvec SiLU-mul reference. It is deliberately not passed

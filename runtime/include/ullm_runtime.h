@@ -610,6 +610,15 @@ ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(
     const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, size_t, size_t,
     ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_stream *);
 
+/* Direct-only gfx1201 M=1 experiment: scalar packed loads, wave32 reductions, and a two-wave LDS combine. */
+ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, float, size_t,
+    const ullm_runtime_buffer *, const ullm_runtime_buffer *, const ullm_runtime_buffer *, size_t, size_t, size_t, size_t,
+    ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_buffer *, ullm_runtime_stream *);
+
 ullm_status ullm_runtime_aq4_matvec_silu_mul_f32(
     const ullm_runtime_buffer *gate_index_buffer,
     const ullm_runtime_buffer *gate_scale_buffer,

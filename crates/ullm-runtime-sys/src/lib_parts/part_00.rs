@@ -485,6 +485,27 @@ unsafe extern "C" {
         gate_output_buffer: *mut RawRuntimeBuffer, beta_output_buffer: *mut RawRuntimeBuffer,
         stream: *mut RawRuntimeStream,
     ) -> c_int;
+    fn ullm_runtime_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
+        qkv_index_buffer: *const RawRuntimeBuffer, qkv_scale_buffer: *const RawRuntimeBuffer,
+        qkv_codebook_buffer: *const RawRuntimeBuffer, qkv_scale_values_buffer: *const RawRuntimeBuffer,
+        qkv_row_scale_buffer: *const RawRuntimeBuffer, qkv_scale_count: usize, qkv_group_size: usize,
+        qkv_tensor_scale: f32, qkv_row_scale_count: usize, z_index_buffer: *const RawRuntimeBuffer,
+        z_scale_buffer: *const RawRuntimeBuffer, z_codebook_buffer: *const RawRuntimeBuffer,
+        z_scale_values_buffer: *const RawRuntimeBuffer, z_row_scale_buffer: *const RawRuntimeBuffer,
+        z_scale_count: usize, z_group_size: usize, z_tensor_scale: f32, z_row_scale_count: usize,
+        a_index_buffer: *const RawRuntimeBuffer, a_scale_buffer: *const RawRuntimeBuffer,
+        a_codebook_buffer: *const RawRuntimeBuffer, a_scale_values_buffer: *const RawRuntimeBuffer,
+        a_row_scale_buffer: *const RawRuntimeBuffer, a_scale_count: usize, a_group_size: usize,
+        a_tensor_scale: f32, a_row_scale_count: usize, b_index_buffer: *const RawRuntimeBuffer,
+        b_scale_buffer: *const RawRuntimeBuffer, b_codebook_buffer: *const RawRuntimeBuffer,
+        b_scale_values_buffer: *const RawRuntimeBuffer, b_row_scale_buffer: *const RawRuntimeBuffer,
+        b_scale_count: usize, b_group_size: usize, b_tensor_scale: f32, b_row_scale_count: usize,
+        input_buffer: *const RawRuntimeBuffer, a_log_buffer: *const RawRuntimeBuffer,
+        dt_bias_buffer: *const RawRuntimeBuffer, qkv_rows: usize, z_rows: usize, heads: usize,
+        cols: usize, qkv_output_buffer: *mut RawRuntimeBuffer, z_output_buffer: *mut RawRuntimeBuffer,
+        gate_output_buffer: *mut RawRuntimeBuffer, beta_output_buffer: *mut RawRuntimeBuffer,
+        stream: *mut RawRuntimeStream,
+    ) -> c_int;
     fn ullm_runtime_aq4_matvec_silu_mul_f32(
         gate_index_buffer: *const RawRuntimeBuffer,
         gate_scale_buffer: *const RawRuntimeBuffer,
@@ -3574,6 +3595,29 @@ pub fn aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(
             b_index.raw.as_ptr(), b_scale.raw.as_ptr(), b_codebook.raw.as_ptr(), b_scale_values.raw.as_ptr(), b_row_scale.map_or(std::ptr::null_mut(), |v| v.raw.as_ptr()), b_scale_count, b_group_size, b_tensor_scale, b_row_scale_count,
             input.raw.as_ptr(), a_log.raw.as_ptr(), dt_bias.raw.as_ptr(), qkv_rows, z_rows, heads, cols,
             qkv_output.raw.as_ptr(), z_output.raw.as_ptr(), gate_output.raw.as_ptr(), beta_output.raw.as_ptr(), stream_raw,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Direct-only gfx1201 scalar-load experiment. The C++ ABI performs full prototype shape/buffer validation before launch.
+pub fn aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
+    qkv_index: &RuntimeBuffer, qkv_scale: &RuntimeBuffer, qkv_codebook: &RuntimeBuffer, qkv_scale_values: &RuntimeBuffer, qkv_row_scale: Option<&RuntimeBuffer>, qkv_scale_count: usize, qkv_group_size: usize, qkv_tensor_scale: f32, qkv_row_scale_count: usize,
+    z_index: &RuntimeBuffer, z_scale: &RuntimeBuffer, z_codebook: &RuntimeBuffer, z_scale_values: &RuntimeBuffer, z_row_scale: Option<&RuntimeBuffer>, z_scale_count: usize, z_group_size: usize, z_tensor_scale: f32, z_row_scale_count: usize,
+    a_index: &RuntimeBuffer, a_scale: &RuntimeBuffer, a_codebook: &RuntimeBuffer, a_scale_values: &RuntimeBuffer, a_row_scale: Option<&RuntimeBuffer>, a_scale_count: usize, a_group_size: usize, a_tensor_scale: f32, a_row_scale_count: usize,
+    b_index: &RuntimeBuffer, b_scale: &RuntimeBuffer, b_codebook: &RuntimeBuffer, b_scale_values: &RuntimeBuffer, b_row_scale: Option<&RuntimeBuffer>, b_scale_count: usize, b_group_size: usize, b_tensor_scale: f32, b_row_scale_count: usize,
+    input: &RuntimeBuffer, a_log: &RuntimeBuffer, dt_bias: &RuntimeBuffer, qkv_rows: usize, z_rows: usize, heads: usize, cols: usize,
+    qkv_output: &mut RuntimeBuffer, z_output: &mut RuntimeBuffer, gate_output: &mut RuntimeBuffer, beta_output: &mut RuntimeBuffer, stream: Option<&mut RuntimeStream>,
+) -> Result<(), String> {
+    let stream_raw = stream.map_or(std::ptr::null_mut(), |value| value.raw.as_ptr());
+    status_to_result(unsafe {
+        ullm_runtime_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
+            qkv_index.raw.as_ptr(),qkv_scale.raw.as_ptr(),qkv_codebook.raw.as_ptr(),qkv_scale_values.raw.as_ptr(),qkv_row_scale.map_or(std::ptr::null_mut(),|v|v.raw.as_ptr()),qkv_scale_count,qkv_group_size,qkv_tensor_scale,qkv_row_scale_count,
+            z_index.raw.as_ptr(),z_scale.raw.as_ptr(),z_codebook.raw.as_ptr(),z_scale_values.raw.as_ptr(),z_row_scale.map_or(std::ptr::null_mut(),|v|v.raw.as_ptr()),z_scale_count,z_group_size,z_tensor_scale,z_row_scale_count,
+            a_index.raw.as_ptr(),a_scale.raw.as_ptr(),a_codebook.raw.as_ptr(),a_scale_values.raw.as_ptr(),a_row_scale.map_or(std::ptr::null_mut(),|v|v.raw.as_ptr()),a_scale_count,a_group_size,a_tensor_scale,a_row_scale_count,
+            b_index.raw.as_ptr(),b_scale.raw.as_ptr(),b_codebook.raw.as_ptr(),b_scale_values.raw.as_ptr(),b_row_scale.map_or(std::ptr::null_mut(),|v|v.raw.as_ptr()),b_scale_count,b_group_size,b_tensor_scale,b_row_scale_count,
+            input.raw.as_ptr(),a_log.raw.as_ptr(),dt_bias.raw.as_ptr(),qkv_rows,z_rows,heads,cols,
+            qkv_output.raw.as_ptr(),z_output.raw.as_ptr(),gate_output.raw.as_ptr(),beta_output.raw.as_ptr(),stream_raw,
         )
     })
 }

@@ -882,6 +882,20 @@ public:
             error);
     }
 
+    bool compile_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel(
+        const std::string &arch,
+        std::vector<char> *code,
+        std::string *error) {
+        const std::string source =
+            aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_source_for_arch(arch);
+        return compile_kernel(
+            arch,
+            source.c_str(),
+            "ullm_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32.hip",
+            code,
+            error);
+    }
+
     bool compile_aq4_matvec_silu_mul_kernel(
         const std::string &arch,
         std::vector<char> *code,
@@ -4629,6 +4643,65 @@ HipAq4FusedWideLoadPrototypeKernelCache &hip_aq4_matvec_silu_mul_wide_load_proto
     return cache;
 }
 
+// This source stays independent from production and the failed wide-load experiment: it changes
+// only the reduction, so its code object remains a direct scalar-load comparison point.
+class HipAq4MatvecQkvZGateBetaShufflePrototypeKernelCache {
+public:
+    void *function_for_device(int device_id, std::string *error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = modules_.find(device_id);
+        if (found != modules_.end()) return found->second->function;
+        if (hip_runtime().device_arch_name(device_id) != "gfx1201") {
+            append_error(error, "AQ4 qkv/z gate/beta shuffle prototype requires exact gfx1201 architecture");
+            return nullptr;
+        }
+        std::vector<char> code;
+        std::string compile_error;
+        if (!hiprtc_runtime().compile_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel(
+                "gfx1201", &code, &compile_error)) {
+            append_error(error, compile_error.empty() ?
+                "failed to build AQ4 qkv/z gate/beta shuffle prototype HIP kernel" : compile_error);
+            return nullptr;
+        }
+        void *module = nullptr;
+        if (!hip_runtime().module_load_data(&module, code.data(), device_id)) {
+            append_error(error, "hipModuleLoadData failed for AQ4 qkv/z gate/beta shuffle prototype");
+            return nullptr;
+        }
+        void *function = nullptr;
+        if (!hip_runtime().module_get_function(
+                &function,
+                module,
+                "ullm_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32_kernel",
+                device_id)) {
+            hip_runtime().module_unload(module, device_id);
+            append_error(error, "hipModuleGetFunction failed for AQ4 qkv/z gate/beta shuffle prototype");
+            return nullptr;
+        }
+        auto loaded = std::make_unique<LoadedModule>();
+        loaded->module = module;
+        loaded->function = function;
+        modules_.emplace(device_id, std::move(loaded));
+        return function;
+    }
+
+private:
+    struct LoadedModule { void *module = nullptr; void *function = nullptr; };
+    static void append_error(std::string *error, const std::string &message) {
+        if (error == nullptr || message.empty()) return;
+        if (!error->empty()) error->append("\n");
+        error->append(message);
+    }
+    std::mutex mutex_;
+    std::unordered_map<int, std::unique_ptr<LoadedModule>> modules_;
+};
+
+HipAq4MatvecQkvZGateBetaShufflePrototypeKernelCache &
+hip_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_cache() {
+    static HipAq4MatvecQkvZGateBetaShufflePrototypeKernelCache cache;
+    return cache;
+}
+
 // This stays independent from both production and the wide-load experiment: its source changes
 // only the reduction and must not perturb either comparison code object.
 class HipAq4MatvecSiluMulShufflePrototypeKernelCache {
@@ -6294,6 +6367,12 @@ bool aq4_matvec_triple_f32_hip_kernel(
     return true;
 }
 
+enum class Aq4MatvecQkvZGateBetaKernelKind : uint32_t {
+    Production,
+    WideLoadPrototype,
+    ShufflePrototype,
+};
+
 bool aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(
     const ullm_runtime_buffer *qkv_index_buffer,
     const ullm_runtime_buffer *qkv_scale_buffer,
@@ -6344,9 +6423,9 @@ bool aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(
     ullm_runtime_buffer *beta_output_buffer,
     ullm_runtime_stream *stream,
     std::string *error,
-    bool wide_load_prototype = false) {
+    Aq4MatvecQkvZGateBetaKernelKind kind = Aq4MatvecQkvZGateBetaKernelKind::Production) {
     const int device_id = qkv_index_buffer->hip_device_id;
-    if (wide_load_prototype &&
+    if (kind == Aq4MatvecQkvZGateBetaKernelKind::WideLoadPrototype &&
         ((reinterpret_cast<uintptr_t>(qkv_index_buffer->ptr) & 15u) != 0u ||
          (reinterpret_cast<uintptr_t>(z_index_buffer->ptr) & 15u) != 0u ||
          (reinterpret_cast<uintptr_t>(a_index_buffer->ptr) & 15u) != 0u ||
@@ -6354,9 +6433,11 @@ bool aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(
         if (error != nullptr) *error = "AQ4 qkv/z gate/beta wide-load prototype requires 16-byte aligned index buffers";
         return false;
     }
-    void *function = wide_load_prototype
+    void *function = kind == Aq4MatvecQkvZGateBetaKernelKind::WideLoadPrototype
         ? hip_aq4_matvec_qkv_z_gate_beta_wide_load_prototype_kernel_cache().function_for_device(device_id, error)
-        : hip_aq4_matvec_qkv_z_gate_beta_kernel_cache().function_for_device(device_id, error);
+        : kind == Aq4MatvecQkvZGateBetaKernelKind::ShufflePrototype
+            ? hip_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_kernel_cache().function_for_device(device_id, error)
+            : hip_aq4_matvec_qkv_z_gate_beta_kernel_cache().function_for_device(device_id, error);
     if (function == nullptr) {
         return false;
     }

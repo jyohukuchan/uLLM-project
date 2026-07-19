@@ -3458,8 +3458,43 @@ ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(
         set_error("AQ4 qkv/z gate/beta wide-load prototype buffer is too small or malformed"); return ULLM_STATUS_INVALID_ARGUMENT;
     }
     std::string error;
-    if (!aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(qkv_i,qkv_s,qkv_c,qkv_v,qkv_r,qkv_sc,qkv_g,qkv_t,qkv_rc,z_i,z_s,z_c,z_v,z_r,z_sc,z_g,z_t,z_rc,a_i,a_s,a_c,a_v,a_r,a_sc,a_g,a_t,a_rc,b_i,b_s,b_c,b_v,b_r,b_sc,b_g,b_t,b_rc,input,a_log,dt_bias,qkv_rows,z_rows,heads,cols,qkv_out,z_out,gate_out,beta_out,stream,&error,true)) {
+    if (!aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(qkv_i,qkv_s,qkv_c,qkv_v,qkv_r,qkv_sc,qkv_g,qkv_t,qkv_rc,z_i,z_s,z_c,z_v,z_r,z_sc,z_g,z_t,z_rc,a_i,a_s,a_c,a_v,a_r,a_sc,a_g,a_t,a_rc,b_i,b_s,b_c,b_v,b_r,b_sc,b_g,b_t,b_rc,input,a_log,dt_bias,qkv_rows,z_rows,heads,cols,qkv_out,z_out,gate_out,beta_out,stream,&error,Aq4MatvecQkvZGateBetaKernelKind::WideLoadPrototype)) {
         set_error(error.empty() ? "AQ4 qkv/z gate/beta wide-load prototype HIP launch failed" : error.c_str()); return ULLM_STATUS_RUNTIME_ERROR;
+    }
+    set_error(""); return ULLM_STATUS_OK;
+}
+
+ullm_status ullm_runtime_aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
+    const ullm_runtime_buffer *qkv_i, const ullm_runtime_buffer *qkv_s, const ullm_runtime_buffer *qkv_c, const ullm_runtime_buffer *qkv_v, const ullm_runtime_buffer *qkv_r, size_t qkv_sc, size_t qkv_g, float qkv_t, size_t qkv_rc,
+    const ullm_runtime_buffer *z_i, const ullm_runtime_buffer *z_s, const ullm_runtime_buffer *z_c, const ullm_runtime_buffer *z_v, const ullm_runtime_buffer *z_r, size_t z_sc, size_t z_g, float z_t, size_t z_rc,
+    const ullm_runtime_buffer *a_i, const ullm_runtime_buffer *a_s, const ullm_runtime_buffer *a_c, const ullm_runtime_buffer *a_v, const ullm_runtime_buffer *a_r, size_t a_sc, size_t a_g, float a_t, size_t a_rc,
+    const ullm_runtime_buffer *b_i, const ullm_runtime_buffer *b_s, const ullm_runtime_buffer *b_c, const ullm_runtime_buffer *b_v, const ullm_runtime_buffer *b_r, size_t b_sc, size_t b_g, float b_t, size_t b_rc,
+    const ullm_runtime_buffer *input, const ullm_runtime_buffer *a_log, const ullm_runtime_buffer *dt_bias, size_t qkv_rows, size_t z_rows, size_t heads, size_t cols,
+    ullm_runtime_buffer *qkv_out, ullm_runtime_buffer *z_out, ullm_runtime_buffer *gate_out, ullm_runtime_buffer *beta_out, ullm_runtime_stream *stream) {
+    const ullm_runtime_buffer *all[] = {qkv_i,qkv_s,qkv_c,qkv_v,z_i,z_s,z_c,z_v,a_i,a_s,a_c,a_v,b_i,b_s,b_c,b_v,input,a_log,dt_bias,qkv_out,z_out,gate_out,beta_out};
+    for (const ullm_runtime_buffer *buffer : all) if (buffer == nullptr) { set_error("AQ4 qkv/z gate/beta shuffle prototype received a null pointer"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    if ((qkv_rc != 0u && qkv_r == nullptr) || (z_rc != 0u && z_r == nullptr) || (a_rc != 0u && a_r == nullptr) || (b_rc != 0u && b_r == nullptr)) { set_error("AQ4 qkv/z gate/beta shuffle prototype row-scale count requires its row-scale buffer"); return ULLM_STATUS_INVALID_ARGUMENT; }
+    if (qkv_i->backend != BackendKind::Hip || qkv_i->hip_device_id < 0 || hip_runtime().device_arch_name(qkv_i->hip_device_id) != "gfx1201" ||
+        (qkv_g != 8u && qkv_g != 16u) || (z_g != 8u && z_g != 16u) || (a_g != 8u && a_g != 16u) || (b_g != 8u && b_g != 16u) || cols == 0u || cols % 32u != 0u ||
+        qkv_rows == 0u || z_rows == 0u || heads == 0u || qkv_sc == 0u || z_sc == 0u || a_sc == 0u || b_sc == 0u ||
+        !std::isfinite(qkv_t) || qkv_t <= 0.0f || !std::isfinite(z_t) || z_t <= 0.0f || !std::isfinite(a_t) || a_t <= 0.0f || !std::isfinite(b_t) || b_t <= 0.0f ||
+        !buffers_share_backend(qkv_i,qkv_s) || !buffers_share_backend(qkv_i,qkv_c) || !buffers_share_backend(qkv_i,qkv_v) || !buffers_share_backend(qkv_i,z_i) || !buffers_share_backend(qkv_i,z_s) || !buffers_share_backend(qkv_i,z_c) || !buffers_share_backend(qkv_i,z_v) || !buffers_share_backend(qkv_i,a_i) || !buffers_share_backend(qkv_i,a_s) || !buffers_share_backend(qkv_i,a_c) || !buffers_share_backend(qkv_i,a_v) || !buffers_share_backend(qkv_i,b_i) || !buffers_share_backend(qkv_i,b_s) || !buffers_share_backend(qkv_i,b_c) || !buffers_share_backend(qkv_i,b_v) || !buffers_share_backend(qkv_i,input) || !buffers_share_backend(qkv_i,a_log) || !buffers_share_backend(qkv_i,dt_bias) || !buffers_share_backend(qkv_i,qkv_out) || !buffers_share_backend(qkv_i,z_out) || !buffers_share_backend(qkv_i,gate_out) || !buffers_share_backend(qkv_i,beta_out) ||
+        (qkv_r != nullptr && !buffers_share_backend(qkv_i,qkv_r)) || (z_r != nullptr && !buffers_share_backend(qkv_i,z_r)) || (a_r != nullptr && !buffers_share_backend(qkv_i,a_r)) || (b_r != nullptr && !buffers_share_backend(qkv_i,b_r)) || !stream_matches_buffer(qkv_out,stream)) {
+        set_error("AQ4 qkv/z gate/beta shuffle prototype requires valid gfx1201 group8/group16 HIP buffers with cols divisible by 32"); return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    const auto matrix_valid = [cols](const ullm_runtime_buffer *index, const ullm_runtime_buffer *scale, const ullm_runtime_buffer *codebook, const ullm_runtime_buffer *scale_values, const ullm_runtime_buffer *row_scale, size_t scale_count, size_t group_size, size_t row_scale_count, size_t rows) {
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        if (rows == 0u || row_scale_count > rows || rows > max_size / cols || scale_count > max_size / sizeof(float) || row_scale_count > max_size / sizeof(float)) return false;
+        const size_t elements = rows * cols;
+        return index->bytes >= elements / 2u && scale->bytes >= elements / group_size && codebook->bytes >= 16u * sizeof(float) && codebook->bytes % sizeof(float) == 0u && scale_values->bytes >= scale_count * sizeof(float) && (row_scale == nullptr || row_scale->bytes >= row_scale_count * sizeof(float));
+    };
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (cols > max_size / sizeof(float) || qkv_rows > max_size / sizeof(float) || z_rows > max_size / sizeof(float) || heads > max_size / sizeof(float) || !matrix_valid(qkv_i,qkv_s,qkv_c,qkv_v,qkv_r,qkv_sc,qkv_g,qkv_rc,qkv_rows) || !matrix_valid(z_i,z_s,z_c,z_v,z_r,z_sc,z_g,z_rc,z_rows) || !matrix_valid(a_i,a_s,a_c,a_v,a_r,a_sc,a_g,a_rc,heads) || !matrix_valid(b_i,b_s,b_c,b_v,b_r,b_sc,b_g,b_rc,heads) || input->bytes < cols * sizeof(float) || a_log->bytes < heads * sizeof(float) || dt_bias->bytes < heads * sizeof(float) || qkv_out->bytes < qkv_rows * sizeof(float) || z_out->bytes < z_rows * sizeof(float) || gate_out->bytes < heads * sizeof(float) || beta_out->bytes < heads * sizeof(float)) {
+        set_error("AQ4 qkv/z gate/beta shuffle prototype buffer is too small or malformed"); return ULLM_STATUS_INVALID_ARGUMENT;
+    }
+    std::string error;
+    if (!aq4_matvec_qkv_z_gate_beta_f32_hip_kernel(qkv_i,qkv_s,qkv_c,qkv_v,qkv_r,qkv_sc,qkv_g,qkv_t,qkv_rc,z_i,z_s,z_c,z_v,z_r,z_sc,z_g,z_t,z_rc,a_i,a_s,a_c,a_v,a_r,a_sc,a_g,a_t,a_rc,b_i,b_s,b_c,b_v,b_r,b_sc,b_g,b_t,b_rc,input,a_log,dt_bias,qkv_rows,z_rows,heads,cols,qkv_out,z_out,gate_out,beta_out,stream,&error,Aq4MatvecQkvZGateBetaKernelKind::ShufflePrototype)) {
+        set_error(error.empty() ? "AQ4 qkv/z gate/beta shuffle prototype HIP launch failed" : error.c_str()); return ULLM_STATUS_RUNTIME_ERROR;
     }
     set_error(""); return ULLM_STATUS_OK;
 }

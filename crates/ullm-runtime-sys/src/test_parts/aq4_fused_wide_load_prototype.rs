@@ -119,7 +119,7 @@ fn aq4_fused_wide_load_assert_matches_cpu(actual: &[f32], expected: &[f32], labe
 #[allow(clippy::too_many_arguments)]
 fn aq4_fused_wide_load_run_qkv(
     device: u32,
-    wide: bool,
+    variant: u8,
     qkv: &Aq4WideLoadMatrixHost,
     z: &Aq4WideLoadMatrixHost,
     a: &Aq4WideLoadMatrixHost,
@@ -148,8 +148,17 @@ fn aq4_fused_wide_load_run_qkv(
     let z_count = z.row_scales.as_ref().map_or(0, Vec::len);
     let a_count = a.row_scales.as_ref().map_or(0, Vec::len);
     let b_count = b.row_scales.as_ref().map_or(0, Vec::len);
-    if wide {
+    if variant == 1 {
         aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(
+            &qkv_device.index, &qkv_device.scale, &qkv_device.codebook, &qkv_device.scale_values, qkv_device.row_scale.as_ref(), qkv.scale_count, qkv.group_size, qkv.tensor_scale, qkv_count,
+            &z_device.index, &z_device.scale, &z_device.codebook, &z_device.scale_values, z_device.row_scale.as_ref(), z.scale_count, z.group_size, z.tensor_scale, z_count,
+            &a_device.index, &a_device.scale, &a_device.codebook, &a_device.scale_values, a_device.row_scale.as_ref(), a.scale_count, a.group_size, a.tensor_scale, a_count,
+            &b_device.index, &b_device.scale, &b_device.codebook, &b_device.scale_values, b_device.row_scale.as_ref(), b.scale_count, b.group_size, b.tensor_scale, b_count,
+            &input_device, &a_log_device, &dt_bias_device, qkv.rows, z.rows, a.rows, qkv.cols,
+            &mut qkv_output, &mut z_output, &mut gate_output, &mut beta_output, Some(&mut stream),
+        ).unwrap();
+    } else if variant == 2 {
+        aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(
             &qkv_device.index, &qkv_device.scale, &qkv_device.codebook, &qkv_device.scale_values, qkv_device.row_scale.as_ref(), qkv.scale_count, qkv.group_size, qkv.tensor_scale, qkv_count,
             &z_device.index, &z_device.scale, &z_device.codebook, &z_device.scale_values, z_device.row_scale.as_ref(), z.scale_count, z.group_size, z.tensor_scale, z_count,
             &a_device.index, &a_device.scale, &a_device.codebook, &a_device.scale_values, a_device.row_scale.as_ref(), a.scale_count, a.group_size, a.tensor_scale, a_count,
@@ -218,7 +227,7 @@ fn aq4_fused_wide_load_run_silu(
 
 #[allow(clippy::too_many_arguments)]
 fn aq4_fused_wide_load_time_qkv(
-    device: u32, wide: bool, qkv: &Aq4WideLoadMatrixHost, z: &Aq4WideLoadMatrixHost,
+    device: u32, variant: u8, qkv: &Aq4WideLoadMatrixHost, z: &Aq4WideLoadMatrixHost,
     a: &Aq4WideLoadMatrixHost, b: &Aq4WideLoadMatrixHost, input: &[f32], a_log: &[f32],
     dt_bias: &[f32], rounds: usize,
 ) -> f64 {
@@ -229,8 +238,10 @@ fn aq4_fused_wide_load_time_qkv(
     input_q.copy_from_host(0, &f32s_to_le_bytes(input), Some(&mut stream)).unwrap(); a_log_q.copy_from_host(0, &f32s_to_le_bytes(a_log), Some(&mut stream)).unwrap(); dt_bias_q.copy_from_host(0, &f32s_to_le_bytes(dt_bias), Some(&mut stream)).unwrap();
     let mut q_out = context.alloc_buffer(qkv.rows * 4).unwrap(); let mut z_out = context.alloc_buffer(z.rows * 4).unwrap(); let mut gate_out = context.alloc_buffer(a.rows * 4).unwrap(); let mut beta_out = context.alloc_buffer(b.rows * 4).unwrap();
     let q_count = qkv.row_scales.as_ref().map_or(0, Vec::len); let z_count = z.row_scales.as_ref().map_or(0, Vec::len); let a_count = a.row_scales.as_ref().map_or(0, Vec::len); let b_count = b.row_scales.as_ref().map_or(0, Vec::len);
-    let mut launch = |mut stream: &mut RuntimeStream| if wide {
+    let mut launch = |mut stream: &mut RuntimeStream| if variant == 1 {
         aq4_matvec_qkv_z_gate_beta_wide_load_prototype_f32(&q.index, &q.scale, &q.codebook, &q.scale_values, q.row_scale.as_ref(), qkv.scale_count, qkv.group_size, qkv.tensor_scale, q_count, &zq.index, &zq.scale, &zq.codebook, &zq.scale_values, zq.row_scale.as_ref(), z.scale_count, z.group_size, z.tensor_scale, z_count, &aq.index, &aq.scale, &aq.codebook, &aq.scale_values, aq.row_scale.as_ref(), a.scale_count, a.group_size, a.tensor_scale, a_count, &bq.index, &bq.scale, &bq.codebook, &bq.scale_values, bq.row_scale.as_ref(), b.scale_count, b.group_size, b.tensor_scale, b_count, &input_q, &a_log_q, &dt_bias_q, qkv.rows, z.rows, a.rows, qkv.cols, &mut q_out, &mut z_out, &mut gate_out, &mut beta_out, Some(&mut stream)).unwrap();
+    } else if variant == 2 {
+        aq4_matvec_qkv_z_gate_beta_shuffle_prototype_f32(&q.index, &q.scale, &q.codebook, &q.scale_values, q.row_scale.as_ref(), qkv.scale_count, qkv.group_size, qkv.tensor_scale, q_count, &zq.index, &zq.scale, &zq.codebook, &zq.scale_values, zq.row_scale.as_ref(), z.scale_count, z.group_size, z.tensor_scale, z_count, &aq.index, &aq.scale, &aq.codebook, &aq.scale_values, aq.row_scale.as_ref(), a.scale_count, a.group_size, a.tensor_scale, a_count, &bq.index, &bq.scale, &bq.codebook, &bq.scale_values, bq.row_scale.as_ref(), b.scale_count, b.group_size, b.tensor_scale, b_count, &input_q, &a_log_q, &dt_bias_q, qkv.rows, z.rows, a.rows, qkv.cols, &mut q_out, &mut z_out, &mut gate_out, &mut beta_out, Some(&mut stream)).unwrap();
     } else {
         aq4_matvec_qkv_z_gate_beta_f32(&q.index, &q.scale, &q.codebook, &q.scale_values, q.row_scale.as_ref(), qkv.scale_count, qkv.group_size, qkv.tensor_scale, q_count, &zq.index, &zq.scale, &zq.codebook, &zq.scale_values, zq.row_scale.as_ref(), z.scale_count, z.group_size, z.tensor_scale, z_count, &aq.index, &aq.scale, &aq.codebook, &aq.scale_values, aq.row_scale.as_ref(), a.scale_count, a.group_size, a.tensor_scale, a_count, &bq.index, &bq.scale, &bq.codebook, &bq.scale_values, bq.row_scale.as_ref(), b.scale_count, b.group_size, b.tensor_scale, b_count, &input_q, &a_log_q, &dt_bias_q, qkv.rows, z.rows, a.rows, qkv.cols, &mut q_out, &mut z_out, &mut gate_out, &mut beta_out, Some(&mut stream)).unwrap();
     };
@@ -273,8 +284,8 @@ fn hip_aq4_fused_wide_load_prototypes_match_cpu_and_keep_packed_streams_independ
     let input: Vec<f32> = (0..4_096).map(|_| { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
     let a_log = vec![0.25; 32];
     let dt_bias = vec![-0.125; 32];
-    let baseline_cpu = aq4_fused_wide_load_run_qkv(0, false, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
-    let baseline_gpu = aq4_fused_wide_load_run_qkv(gpu, true, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
+    let baseline_cpu = aq4_fused_wide_load_run_qkv(0, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
+    let baseline_gpu = aq4_fused_wide_load_run_qkv(gpu, 1, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
     for (label, actual, expected) in [
         ("baseline qkv", &baseline_gpu.0, &baseline_cpu.0),
         ("baseline z", &baseline_gpu.1, &baseline_cpu.1),
@@ -286,8 +297,8 @@ fn hip_aq4_fused_wide_load_prototypes_match_cpu_and_keep_packed_streams_independ
     for stream_index in 0..4 {
         let (mut mqkv, mut mz, mut ma, mut mb) = (qkv.clone(), z.clone(), a.clone(), b.clone());
         match stream_index { 0 => mqkv.indices[0] ^= 0x11, 1 => mz.indices[0] ^= 0x11, 2 => ma.indices[0] ^= 0x11, _ => mb.indices[0] ^= 0x11 }
-        let expected = aq4_fused_wide_load_run_qkv(0, false, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
-        let actual = aq4_fused_wide_load_run_qkv(gpu, true, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
+        let expected = aq4_fused_wide_load_run_qkv(0, 0, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
+        let actual = aq4_fused_wide_load_run_qkv(gpu, 1, &mqkv, &mz, &ma, &mb, &input, &a_log, &dt_bias);
         let actual_streams = [&actual.0, &actual.1, &actual.2, &actual.3];
         let expected_streams = [&expected.0, &expected.1, &expected.2, &expected.3];
         let baseline_gpu_streams = [&baseline_gpu.0, &baseline_gpu.1, &baseline_gpu.2, &baseline_gpu.3];
@@ -341,13 +352,45 @@ fn hip_aq4_fused_wide_load_prototypes_timing_vs_production() {
     let input = vec![0.125; 4_096]; let a_log = vec![0.25; 32]; let dt_bias = vec![-0.125; 32];
     let gate = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, true, &mut state);
     let up = aq4_fused_wide_load_host_matrix(12_288, 4_096, 16, false, &mut state);
-    let qkv_production = aq4_fused_wide_load_time_qkv(gpu, false, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
-    let qkv_wide = aq4_fused_wide_load_time_qkv(gpu, true, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
+    let qkv_production = aq4_fused_wide_load_time_qkv(gpu, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
+    let qkv_wide = aq4_fused_wide_load_time_qkv(gpu, 1, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
     let silu_production = aq4_fused_wide_load_time_silu(gpu, 0, &gate, &up, &input, 20);
     let silu_wide = aq4_fused_wide_load_time_silu(gpu, 1, &gate, &up, &input, 20);
     assert!(qkv_production > 0.0 && qkv_wide > 0.0 && silu_production > 0.0 && silu_wide > 0.0);
     eprintln!("AQ4 fused qkv/z gate/beta [8192/4096/32,4096]: production={qkv_production:.3} ms, wide={qkv_wide:.3} ms, speedup={:.3}x", qkv_production / qkv_wide);
     eprintln!("AQ4 fused SiLU-mul [12288,4096]: production={silu_production:.3} ms, wide={silu_wide:.3} ms, speedup={:.3}x", silu_production / silu_wide);
+}
+
+#[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_DIFFERENTIAL=1"]
+fn hip_aq4_qkv_z_gate_beta_shuffle_prototype_matches_cpu_for_production_shapes() {
+    assert_eq!(std::env::var("ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_DIFFERENTIAL").as_deref(), Ok("1"));
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = aq4_fused_wide_load_gpu_device();
+    let mut state = 0x3c6e_f372;
+    // Qwen3.5-9B linear-attention decode: QKV=[8192,4096], Z=[4096,4096], A/B=[32,4096].
+    let qkv = aq4_fused_wide_load_host_matrix(8_192, 4_096, 16, true, &mut state); let z = aq4_fused_wide_load_host_matrix(4_096, 4_096, 16, false, &mut state);
+    let a = aq4_fused_wide_load_host_matrix(32, 4_096, 16, true, &mut state); let b = aq4_fused_wide_load_host_matrix(32, 4_096, 16, false, &mut state);
+    let input: Vec<f32> = (0..4_096).map(|_| { state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); state as f32 / u32::MAX as f32 * 2.0 - 1.0 }).collect();
+    let a_log = vec![0.25; 32]; let dt_bias = vec![-0.125; 32];
+    let expected = aq4_fused_wide_load_run_qkv(0, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
+    let actual = aq4_fused_wide_load_run_qkv(gpu, 2, &qkv, &z, &a, &b, &input, &a_log, &dt_bias);
+    for (label, actual, expected) in [("shuffle qkv", &actual.0, &expected.0), ("shuffle z", &actual.1, &expected.1), ("shuffle gate", &actual.2, &expected.2), ("shuffle beta", &actual.3, &expected.3)] { aq4_fused_wide_load_assert_matches_cpu(actual, expected, label); }
+}
+
+#[test]
+#[ignore = "requires an isolated gfx1201 HIP device and ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_TIMING=1"]
+fn hip_aq4_qkv_z_gate_beta_shuffle_prototype_timing_vs_production() {
+    assert_eq!(std::env::var("ULLM_RUN_AQ4_QKV_Z_GATE_BETA_SHUFFLE_TIMING").as_deref(), Ok("1"));
+    let _lock = AQ4_EXPERIMENTAL_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = aq4_fused_wide_load_gpu_device(); let mut state = 0xa54f_f53a;
+    let qkv = aq4_fused_wide_load_host_matrix(8_192, 4_096, 16, true, &mut state); let z = aq4_fused_wide_load_host_matrix(4_096, 4_096, 16, false, &mut state);
+    let a = aq4_fused_wide_load_host_matrix(32, 4_096, 16, true, &mut state); let b = aq4_fused_wide_load_host_matrix(32, 4_096, 16, false, &mut state);
+    let input = vec![0.125; 4_096]; let a_log = vec![0.25; 32]; let dt_bias = vec![-0.125; 32];
+    let production = aq4_fused_wide_load_time_qkv(gpu, 0, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
+    let shuffle = aq4_fused_wide_load_time_qkv(gpu, 2, &qkv, &z, &a, &b, &input, &a_log, &dt_bias, 20);
+    assert!(production > 0.0 && shuffle > 0.0);
+    eprintln!("AQ4 qkv/z gate/beta shuffle [8192/4096/32,4096]: production={production:.3} ms, shuffle={shuffle:.3} ms, speedup={:.3}x", production / shuffle);
 }
 
 #[test]
