@@ -371,7 +371,7 @@ pub enum RuntimeFeature {
     HipAq4RegisterBm8Group8 = 13,
     /// Direct gfx1201/group16 rocWMMA AQ4 GEMM ABI capability for M=128.
     HipAq4GemmWmma = 14,
-    /// Direct gfx1201 rocWMMA-QK ABI for Qwen3.5 paged causal GQA M=128 prefill chunks.
+    /// Direct gfx1201 rocWMMA-QK ABI for Qwen3.5 paged causal GQA M=1..=128 prefill chunks.
     HipPagedCausalGqaChunkWmma = 15,
     /// Direct gfx1201/group8 rocWMMA AQ4 GEMM ABI capability for M=128.
     HipAq4GemmWmmaGroup8 = 16,
@@ -823,9 +823,9 @@ impl DeviceCapabilities {
                 proven = proven.with(RuntimeFeature::HipPagedCausalGqaChunk);
             }
             if policy.contains(RuntimeFeature::HipPagedCausalGqaChunkWmma) {
-                // Probe the served Qwen3.5 gated cold-prefill ABI at its exclusive M=128
-                // dispatch width. This must compile, load, launch, and synchronize before the
-                // WMMA feature becomes eligible for registry resolution.
+                // Probe the largest served Qwen3.5 gated cold-prefill ABI shape. This must
+                // compile, load, launch, and synchronize before the WMMA feature becomes
+                // eligible for registry resolution.
                 const CHUNK: usize = 128;
                 let q = zeros(context, stream, CHUNK * 16 * 256)?;
                 let gate = zeros(context, stream, CHUNK * 16 * 256)?;
@@ -1771,7 +1771,7 @@ pub struct OperationExecutionAudit {
     pub prefill_tokens_committed: u64,
     /// Index is the execution width. Index zero is reserved and must remain zero.
     pub prefill_width_histogram: Vec<u64>,
-    pub implementation_counts: [OperationExecutionCount; 16],
+    pub implementation_counts: [OperationExecutionCount; 15],
     #[serde(serialize_with = "serialize_sha256_hex")]
     pub deterministic_digest_sha256: [u8; 32],
     pub coverage_complete: bool,
@@ -3026,8 +3026,8 @@ impl StartedOperationPlan<'_> {
         .map_err(|error| error.to_string())
     }
 
-    /// Executes the exclusive gfx1201/Qwen3.5 M=128 WMMA-QK cold-prefill ABI selected at load
-    /// time. AV intentionally remains in the kernel's reviewed scalar FP32 path.
+    /// Executes the gfx1201/Qwen3.5 M=2..=128 WMMA-QK cold-prefill ABI selected at load time.
+    /// AV intentionally remains in the kernel's reviewed scalar FP32 path.
     ///
     /// There is no execution-time fallback: a plan admitted to this ABI has already required a
     /// separately probed WMMA feature, so an ABI failure must remain visible to the caller.
@@ -3050,7 +3050,7 @@ impl StartedOperationPlan<'_> {
         let plan = self.plan();
         if plan.device.backend != OperationBackend::Hip
             || plan.device.architecture.as_deref() != Some("gfx1201")
-            || chunk_width != 128
+            || !(2..=128).contains(&chunk_width)
             || q_heads != 16
             || kv_heads != 4
             || head_dim != 256
@@ -3058,7 +3058,7 @@ impl StartedOperationPlan<'_> {
             || block_size != 256
         {
             return Err(format!(
-                "resolved backend operation {} is not a gfx1201/Qwen3.5/M=128 paged causal GQA WMMA operation",
+                "resolved backend operation {} is not a gfx1201/Qwen3.5/M=2..=128 paged causal GQA WMMA operation",
                 plan.implementation_id
             ));
         }
@@ -4619,10 +4619,9 @@ pub fn paged_causal_gqa_chunk_production_registry(
                 .ok_or_else(|| "paged GQA chunk workspace overflows".to_string())?,
         )
         .ok_or_else(|| "paged GQA chunk workspace overflows".to_string())?;
-    // The production WMMA ABI is deliberately exclusive only at the fully validated Qwen3.5
-    // gated M=128 point. Scalar remains the descriptor for all tails, other geometries, and
-    // other architectures. Matching M=128 has no scalar fallback: its independently guarded
-    // WMMA probe must succeed before the registry may resolve it.
+    // The production WMMA ABI covers the Qwen3.5 gated M=2..=128 chunk range. The scalar
+    // descriptor remains available for the same range and wins only when its independently
+    // guarded WMMA feature is unavailable; when both are available, WMMA's higher priority wins.
     let wmma_eligible = device.backend == OperationBackend::Hip
         && device.architecture.as_deref() == Some("gfx1201")
         && sigmoid_gate
@@ -4642,24 +4641,19 @@ pub fn paged_causal_gqa_chunk_production_registry(
             RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunk)
         }
     };
-    let scalar_id = match (device.backend, sigmoid_gate, wmma_eligible) {
-        (OperationBackend::Host, true, _) => "host.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128",
-        (OperationBackend::Host, false, _) => "host.paged-causal-gqa-chunk-f32.m2-m128",
-        (OperationBackend::Hip, true, true) => {
-            "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m127"
-        }
-        (OperationBackend::Hip, true, false) => {
-            "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128"
-        }
-        (OperationBackend::Hip, false, _) => "hip.paged-causal-gqa-chunk-f32.m2-m128",
+    let scalar_id = match (device.backend, sigmoid_gate) {
+        (OperationBackend::Host, true) => "host.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128",
+        (OperationBackend::Host, false) => "host.paged-causal-gqa-chunk-f32.m2-m128",
+        (OperationBackend::Hip, true) => "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128",
+        (OperationBackend::Hip, false) => "hip.paged-causal-gqa-chunk-f32.m2-m128",
     };
-    let scalar_maximum_chunk_width = if wmma_eligible { 127 } else { 128 };
     let descriptor = |minimum_chunk_width,
                       maximum_chunk_width,
                       id,
                       required_features,
                       executable,
-                      architecture| {
+                      architecture,
+                      priority| {
         ImplementationDescriptor {
             id,
             semantic_version: "1.0.0",
@@ -4699,7 +4693,7 @@ pub fn paged_causal_gqa_chunk_production_registry(
                 externally_visible_before_commit: false,
             },
             promotion: PromotionStatus::Production,
-            priority: 100,
+            priority,
             fallback_id: None,
             deterministic: true,
             executable,
@@ -4709,20 +4703,22 @@ pub fn paged_causal_gqa_chunk_production_registry(
     let mut descriptors = Vec::with_capacity(if wmma_eligible { 2 } else { 1 });
     descriptors.push(descriptor(
         2,
-        scalar_maximum_chunk_width,
+        128,
         scalar_id,
         scalar_required_features,
         scalar_executable,
         None,
+        100,
     ));
     if wmma_eligible {
         descriptors.push(descriptor(
+            2,
             128,
-            128,
-            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128",
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m2-m128",
             RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunkWmma),
             ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
             Some("gfx1201"),
+            101,
         ));
     }
     BackendOperationRegistry::new(descriptors)
@@ -6375,7 +6371,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_wmma_paged_chunk_registry_reserves_m128_and_keeps_scalar_fallbacks() {
+    fn qwen35_wmma_paged_chunk_registry_prefers_wmma_across_chunk_range() {
         let geometry = wmma_paged_gqa_geometry();
         let device = test_hip_capabilities();
         let registry = paged_causal_gqa_chunk_production_registry(geometry, &device).unwrap();
@@ -6388,7 +6384,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(scalar.minimum_chunk_width, 2);
-        assert_eq!(scalar.maximum_chunk_width, 127);
+        assert_eq!(scalar.maximum_chunk_width, 128);
         assert_eq!(
             scalar.required_features,
             RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunk)
@@ -6401,28 +6397,18 @@ mod tests {
                     == ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32
             })
             .unwrap();
-        assert_eq!(wmma.minimum_chunk_width, 128);
+        assert_eq!(wmma.minimum_chunk_width, 2);
         assert_eq!(wmma.maximum_chunk_width, 128);
         assert_eq!(
             wmma.id,
-            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128"
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m2-m128"
         );
         assert_eq!(
             wmma.required_features,
             RuntimeFeatureSet::from_feature(RuntimeFeature::HipPagedCausalGqaChunkWmma)
         );
 
-        for (width, executable) in [
-            (2, ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32),
-            (
-                127,
-                ExecutableOperation::HipPagedCausalGqaChunkSigmoidGateF32,
-            ),
-            (
-                128,
-                ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32,
-            ),
-        ] {
+        for width in [2, 17, 113, 127, 128] {
             let trace = registry
                 .resolve(
                     &paged_causal_gqa_chunk_operation_request(
@@ -6436,7 +6422,10 @@ mod tests {
                 )
                 .unwrap()
                 .trace();
-            assert_eq!(trace.executable, executable);
+            assert_eq!(
+                trace.executable,
+                ExecutableOperation::HipPagedCausalGqaChunkWmmaSigmoidGateF32
+            );
         }
 
         let mut missing_wmma = device.clone();
@@ -6456,8 +6445,8 @@ mod tests {
                     )
                     .unwrap(),
                 )
-                .is_err(),
-            "the exact M=128 WMMA dispatch must fail closed without its own proven feature"
+                .is_ok(),
+            "the scalar reader must remain available when the WMMA feature is absent"
         );
         assert!(
             missing_wmma_registry
@@ -7999,7 +7988,7 @@ mod tests {
         let plan = registry.resolve(&request).unwrap();
         assert_eq!(
             plan.trace().implementation_id,
-            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128"
+            "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m2-m128"
         );
         assert_eq!(
             plan.trace().executable,

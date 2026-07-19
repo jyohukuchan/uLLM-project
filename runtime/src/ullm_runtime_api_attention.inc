@@ -2959,7 +2959,7 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_sigmoid_gate_f32(
 
 // This remains intentionally separate from paged_causal_gqa_chunk_f32_impl: the scalar reader
 // keeps its CPU fallback and HIP module unchanged while the production WMMA reader loads its own
-// gfx1201 rocWMMA module for the validated Qwen3.5-9B M=128 cold-prefill shape.
+// gfx1201 rocWMMA module for the validated Qwen3.5-9B M=1..=128 prefill shapes.
 static ullm_status paged_causal_gqa_chunk_wmma_f32_impl(
     const ullm_runtime_buffer *q_buffer,
     const ullm_runtime_buffer *gate_buffer,
@@ -2984,8 +2984,8 @@ static ullm_status paged_causal_gqa_chunk_wmma_f32_impl(
         set_error("paged causal GQA WMMA received a null or aliased pointer");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
-    if (m != 128u || cache_blocks == 0u) {
-        set_error("paged causal GQA WMMA requires M=128 and nonzero cache blocks");
+    if (m == 0u || m > 128u || cache_blocks == 0u) {
+        set_error("paged causal GQA WMMA requires M in 1..=128 and nonzero cache blocks");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
     if (gate_buffer != nullptr && head_dim != value_dim) {

@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn structured_backend_log_contains_counts_but_no_prompt_or_token_content() {
-        const IMPLEMENTATION_COUNT_FIXTURE: [(&str, &str, u64); 16] = [
+        const IMPLEMENTATION_COUNT_FIXTURE: [(&str, &str, u64); 15] = [
             ("kind", "a", 0),
             ("kind", "b", 1),
             ("kind", "c", 2),
@@ -262,13 +262,8 @@ mod tests {
             ),
             (
                 "paged_causal_gqa_read",
-                "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m127",
+                "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m2-m128",
                 14,
-            ),
-            (
-                "paged_causal_gqa_read",
-                "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128",
-                15,
             ),
         ];
         let audit = OperationExecutionAudit {
@@ -368,7 +363,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            16
+            15
         );
         assert_eq!(
             value["operation_execution_audit"]["coverage_complete"],

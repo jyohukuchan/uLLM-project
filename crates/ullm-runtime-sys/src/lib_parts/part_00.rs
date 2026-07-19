@@ -6727,10 +6727,8 @@ pub fn paged_causal_gqa_chunk_wmma_f32(
                 .to_string(),
         );
     }
-    if m != 128 {
-        return Err(
-            "paged causal GQA WMMA requires the validated M=128 cold-prefill chunk".to_string(),
-        );
+    if m == 0 || m > 128 {
+        return Err("paged causal GQA WMMA requires M in 1..=128".to_string());
     }
     if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
         return Err(
@@ -6795,10 +6793,8 @@ pub fn paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
                 .to_string(),
         );
     }
-    if m != 128 {
-        return Err(
-            "paged causal GQA WMMA requires the validated M=128 cold-prefill chunk".to_string(),
-        );
+    if m == 0 || m > 128 {
+        return Err("paged causal GQA WMMA requires M in 1..=128".to_string());
     }
     if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
         return Err(
@@ -6847,10 +6843,10 @@ pub fn paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
 }
 
 /// Compatibility alias for the validate-first direct ABI name; it now invokes the production
-/// M=128 WMMA-QK implementation.
+/// M=1..=128 WMMA-QK implementation.
 pub use paged_causal_gqa_chunk_wmma_f32 as paged_causal_gqa_chunk_wmma_prototype_f32;
 /// Compatibility alias for the gated validate-first direct ABI name; it now invokes the
-/// production M=128 WMMA-QK implementation.
+/// production M=1..=128 WMMA-QK implementation.
 pub use paged_causal_gqa_chunk_wmma_sigmoid_gate_f32
     as paged_causal_gqa_chunk_wmma_prototype_sigmoid_gate_f32;
 

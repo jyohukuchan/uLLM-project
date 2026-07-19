@@ -4669,9 +4669,9 @@ bool paged_causal_gqa_chunk_wmma_f32_hip_kernel(
         }
         return false;
     }
-    if (m != 128u) {
+    if (m == 0u || m > 128u) {
         if (error != nullptr) {
-            *error = "paged causal GQA WMMA requires the validated M=128 cold-prefill chunk";
+            *error = "paged causal GQA WMMA requires M in 1..=128";
         }
         return false;
     }

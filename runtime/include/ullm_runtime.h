@@ -1144,7 +1144,7 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_sigmoid_gate_f32(
 
 /*
  * Production, direct-only gfx1201 rocWMMA Qwen3.5 cold-prefill implementation. It accepts the
- * same paged F32 buffer layouts as the scalar reader, but only the validated M=128 geometry:
+ * same paged F32 buffer layouts as the scalar reader, with validated M=1..=128 chunks and
  * Q=16, KV=4, head_dim=value_dim=256, and a 256-token page. It uses FP16 Q/K staging and FP32
  * online softmax/output accumulation; AV deliberately remains scalar.
  */
@@ -1187,7 +1187,7 @@ ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_sigmoid_gate_f32(
 
 /*
  * Compatibility aliases for the validate-first direct ABI names exported before this kernel was
- * promoted. They retain the production M=128 contract and forward to the entries above, keeping
+ * promoted. They retain the production M=1..=128 contract and forward to the entries above, keeping
  * this additive runtime ABI at version 1 for existing callers.
  */
 ullm_status ullm_runtime_paged_causal_gqa_chunk_wmma_prototype_f32(

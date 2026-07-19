@@ -788,18 +788,16 @@ struct ActiveCalibrationReplay {
 
 const PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128: &str =
     "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m128";
-const PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127: &str =
-    "hip.paged-causal-gqa-chunk-sigmoid-gate-f32.m2-m127";
-const PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128: &str =
-    "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m128";
+const PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M2_M128: &str =
+    "hip.paged-causal-gqa-chunk-wmma-sigmoid-gate-f32.gfx1201.q16-kv4-d256-page256.m2-m128";
 
 /// Compares one runtime implementation with the canonical load-time contract entry.
 ///
 /// Split paged-decode readers are typed alternates of their matching single-reader family. No
 /// writer, unrelated reader, linear-attention operation, unknown id, or plain/gated cross-family
-/// substitution is accepted. The gated M=2..=128 chunk reader additionally admits its exact
-/// gfx1201 M=127 scalar and M=128 WMMA alternatives. The load-time contract intentionally keeps
-/// the generic M=2..=128 id; the exact prefill width is known only at dispatch time.
+/// substitution is accepted. The gated M=2..=128 chunk reader additionally admits its gfx1201
+/// WMMA alternate across the whole chunk range. The load-time contract intentionally keeps the
+/// generic M=2..=128 id; the exact prefill width is known only at dispatch time.
 fn operation_implementation_matches_contract(expected: &str, actual: &str) -> bool {
     if expected == actual {
         return EXECUTION_IMPLEMENTATIONS
@@ -818,14 +816,13 @@ fn operation_implementation_matches_contract(expected: &str, actual: &str) -> bo
                 | "hip.paged-decode-attention-split-sigmoid-gate-f32.tile256"
         ),
         PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M128 => {
-            actual == PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127
-                || actual == PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128
+            actual == PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M2_M128
         }
         _ => false,
     }
 }
 
-const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 16] = [
+const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 15] = [
     (
         "linear_attention_qkv_prepare",
         "hip.linear-attention-qkv-prepare-f32.m1",
@@ -878,11 +875,7 @@ const EXECUTION_IMPLEMENTATIONS: [(&str, &str); 16] = [
     ),
     (
         "paged_causal_gqa_read",
-        PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127,
-    ),
-    (
-        "paged_causal_gqa_read",
-        PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128,
+        PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M2_M128,
     ),
 ];
 
@@ -906,7 +899,7 @@ struct OperationAuditAccumulator {
     prefill_tokens_executed: u64,
     prefill_tokens_committed: u64,
     prefill_width_histogram: Vec<u64>,
-    implementation_counts: [u64; 16],
+    implementation_counts: [u64; 15],
     digest: Sha256,
 }
 
@@ -923,7 +916,7 @@ impl OperationAuditAccumulator {
             prefill_tokens_executed: 0,
             prefill_tokens_committed: 0,
             prefill_width_histogram: vec![0; QWEN35_AQ4_MAX_PREFILL_CHUNK + 1],
-            implementation_counts: [0; 16],
+            implementation_counts: [0; 15],
             digest: Sha256::new(),
         }
     }
@@ -3036,13 +3029,10 @@ mod tests {
     #[test]
     fn prefill_audit_accepts_every_promoted_gated_chunk_reader_alternate() {
         // The M=1 load-time contract remaps self-attention prefill to the generic chunk-reader
-        // id. At runtime, gfx1201's WMMA-enabled registry narrows the scalar fallback to M=127
-        // and resolves M=128 to WMMA. Exercise both full 32-layer traces here so either omitted
-        // audit entry fails without requiring a GPU or a model package.
-        for (execution_width, reader_implementation) in [
-            (127, PAGED_CAUSAL_GQA_CHUNK_SIGMOID_GATE_M2_M127),
-            (128, PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M128),
-        ] {
+        // id. At runtime, gfx1201's WMMA-enabled registry resolves every M=2..=128 chunk width
+        // to WMMA. Exercise ragged and complete tiles so the audit cannot regress to M=128-only.
+        for execution_width in [2, 17, 113, 127, 128] {
+            let reader_implementation = PAGED_CAUSAL_GQA_CHUNK_WMMA_SIGMOID_GATE_M2_M128;
             assert!(
                 EXECUTION_IMPLEMENTATIONS
                     .iter()
