@@ -859,6 +859,7 @@ extern "C" __global__ void ullm_aq4_matvec_wide_load_prototype_f32_kernel(
     unsigned long long cols,
     float *output) {
     static_assert(sizeof(uint4) == 16u, "AQ4 wide load must remain 128 bits");
+    static_assert(alignof(uint4) == 16u, "AQ4 wide load must remain 16-byte aligned");
     const unsigned int tid = threadIdx.x;
     constexpr unsigned int rows_per_block = ULLM_AQ4_ROWS_PER_BLOCK;
     constexpr unsigned int threads_per_row = 256u / rows_per_block;
@@ -882,40 +883,41 @@ extern "C" __global__ void ullm_aq4_matvec_wide_load_prototype_f32_kernel(
             const unsigned long long col_base = chunk * 32ull;
             const unsigned long long group_base =
                 row * groups_per_row + (col_base / group_size);
+            // A uint4 has four 32-bit words, hence sixteen packed AQ4 bytes total. A group8
+            // consumes four bytes and a group16 consumes eight bytes, possibly spanning words.
+            const unsigned int groups_per_chunk = group_size == 8ull ? 4u : 2u;
 #pragma unroll
-            for (unsigned int word_index = 0; word_index < 4u; ++word_index) {
-                const unsigned int word = word_index == 0u ? packed.x :
-                    (word_index == 1u ? packed.y : (word_index == 2u ? packed.z : packed.w));
-                const unsigned int groups_in_word = group_size == 8ull ? 2u : 1u;
-#pragma unroll
-                for (unsigned int group_in_word = 0; group_in_word < 2u; ++group_in_word) {
-                    if (group_in_word >= groups_in_word) {
-                        continue;
-                    }
-                    const unsigned long long group = group_base +
-                        static_cast<unsigned long long>(word_index * groups_in_word + group_in_word);
-                    const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group]);
-                    if (scale_index >= scale_count) {
-                        continue;
-                    }
-                    const unsigned int byte_start = group_size == 8ull ? group_in_word * 4u : 0u;
-                    const unsigned int byte_count = group_size == 8ull ? 4u : 8u;
-                    float raw_sum = 0.0f;
-#pragma unroll
-                    for (unsigned int byte_offset = 0; byte_offset < 8u; ++byte_offset) {
-                        if (byte_offset >= byte_count) {
-                            continue;
-                        }
-                        const unsigned int packed_byte =
-                            (word >> (8u * (byte_start + byte_offset))) & 0xffu;
-                        const unsigned long long col = col_base +
-                            static_cast<unsigned long long>(word_index * 8u +
-                                (byte_start + byte_offset) * 2u);
-                        raw_sum += codebook[packed_byte & 0x0fu] * input[col];
-                        raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
-                    }
-                    sum += raw_sum * scale_values[scale_index] * tensor_scale;
+            for (unsigned int group_in_chunk = 0u; group_in_chunk < 4u; ++group_in_chunk) {
+                if (group_in_chunk >= groups_per_chunk) {
+                    continue;
                 }
+                const unsigned long long group = group_base + group_in_chunk;
+                const unsigned int scale_index = static_cast<unsigned int>(scale_indices[group]);
+                if (scale_index >= scale_count) {
+                    continue;
+                }
+                const unsigned int byte_start =
+                    group_in_chunk * static_cast<unsigned int>(group_size >> 1);
+                const unsigned int byte_count = static_cast<unsigned int>(group_size >> 1);
+                float raw_sum = 0.0f;
+#pragma unroll
+                for (unsigned int byte_offset = 0u; byte_offset < 8u; ++byte_offset) {
+                    if (byte_offset >= byte_count) {
+                        continue;
+                    }
+                    const unsigned int packed_byte_index = byte_start + byte_offset;
+                    const unsigned int word_index = packed_byte_index >> 2;
+                    const unsigned int word = word_index == 0u ? packed.x :
+                        (word_index == 1u ? packed.y :
+                            (word_index == 2u ? packed.z : packed.w));
+                    const unsigned int packed_byte =
+                        (word >> (8u * (packed_byte_index & 3u))) & 0xffu;
+                    const unsigned long long col = col_base +
+                        static_cast<unsigned long long>(packed_byte_index * 2u);
+                    raw_sum += codebook[packed_byte & 0x0fu] * input[col];
+                    raw_sum += codebook[(packed_byte >> 4) & 0x0fu] * input[col + 1ull];
+                }
+                sum += raw_sum * scale_values[scale_index] * tensor_scale;
             }
         }
     }

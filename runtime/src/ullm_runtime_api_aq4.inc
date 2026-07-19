@@ -600,6 +600,10 @@ ullm_status ullm_runtime_aq4_matvec_wide_load_prototype_f32(
         set_error("AQ4 wide-load matvec prototype requires exact gfx1201 architecture");
         return ULLM_STATUS_INVALID_ARGUMENT;
     }
+    if ((reinterpret_cast<std::uintptr_t>(index_buffer->ptr) & 15u) != 0u) {
+        set_error("AQ4 wide-load matvec prototype requires a 16-byte-aligned index buffer");
+        return ULLM_STATUS_INVALID_ARGUMENT;
+    }
     const size_t max_size = std::numeric_limits<size_t>::max();
     if (cols > max_size / rows || cols > max_size / sizeof(float) ||
         rows > max_size / sizeof(float) || scale_count > max_size / sizeof(float) ||
