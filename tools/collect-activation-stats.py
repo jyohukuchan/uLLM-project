@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -284,6 +285,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-id", default=None)
     parser.add_argument("--max-samples", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=0,
+        help="Emit a compact JSON progress row to stderr every N batches; 0 disables it.",
+    )
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--repeat-to-length", action="store_true")
     parser.add_argument(
@@ -314,8 +321,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.max_samples < 1 or args.batch_size < 1:
-        raise SystemExit("--max-samples and --batch-size must be >= 1")
+    if args.max_samples < 1 or args.batch_size < 1 or args.progress_every_batches < 0:
+        raise SystemExit("--max-samples/--batch-size must be >= 1 and progress interval >= 0")
     if args.sequence_length < 1:
         raise SystemExit("--sequence-length must be >= 1")
     if args.max_modules is not None and args.max_modules < 1:
@@ -346,6 +353,7 @@ def main() -> int:
     domain_counts: Counter[str] = Counter()
     render_kind_counts: Counter[str] = Counter()
     record_id_digest = hashlib.sha256()
+    batches_seen = 0
 
     try:
         with torch.inference_mode():
@@ -376,11 +384,26 @@ def main() -> int:
                         raise
                     model(**batch)
                 samples_seen += len(examples)
+                batches_seen += 1
                 for example, render_kind in zip(examples, render_kinds, strict=True):
                     domain_counts[str(example.get("domain", "unknown"))] += 1
                     render_kind_counts[render_kind] += 1
                     record_id_digest.update(str(example["record_id"]).encode("utf-8"))
                     record_id_digest.update(b"\n")
+                if args.progress_every_batches and batches_seen % args.progress_every_batches == 0:
+                    print(
+                        json.dumps(
+                            {
+                                "run_id": args.run_id,
+                                "batches_seen": batches_seen,
+                                "samples_seen": samples_seen,
+                                "tokens_seen": tokens_seen,
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 active_attention_mask["value"] = None
     finally:
         for handle in handles:
@@ -400,6 +423,8 @@ def main() -> int:
         "shard_id": args.shard_id,
         "max_samples": args.max_samples,
         "batch_size": args.batch_size,
+        "batches_seen": batches_seen,
+        "progress_every_batches": args.progress_every_batches,
         "samples_seen": samples_seen,
         "tokens_seen": tokens_seen,
         "domain_counts": dict(sorted(domain_counts.items())),
