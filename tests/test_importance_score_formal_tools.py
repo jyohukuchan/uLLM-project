@@ -105,6 +105,31 @@ def test_cpu_subset_shard_views_are_an_exact_partition(tmp_path: Path) -> None:
     assert restored == rows
 
 
+def test_source_roster_kl_selection_is_score_blind(tmp_path: Path) -> None:
+    tool = load_tool("freeze-importance-score-cpu-subsets.py", "test_roster_kl_core")
+    paths = [tmp_path / "left.jsonl", tmp_path / "right.jsonl"]
+    rows = [
+        {
+            "model_id": "m",
+            "hf_name": f"model.language_model.layers.{index}.mlp.up_proj.weight",
+            "canonical_family": "mlp_up",
+            "layer_id": index,
+            "shape": [8, 8],
+        }
+        for index in range(20)
+    ]
+    for path, reverse_scores in zip(paths, (False, True), strict=True):
+        with path.open("w", encoding="utf-8") as handle:
+            for index, row in enumerate(rows):
+                item = dict(row)
+                item["candidate_score"] = -index if reverse_scores else index
+                handle.write(tool.canonical_json(item) + "\n")
+
+    assert tool.select_kl_core_from_source_roster(
+        paths[0], 0.10
+    ) == tool.select_kl_core_from_source_roster(paths[1], 0.10)
+
+
 def test_single_safetensors_header_audit_without_index(tmp_path: Path) -> None:
     tool = load_tool("build-ud-tensor-labels.py", "test_ud_label_builder")
     save_file(

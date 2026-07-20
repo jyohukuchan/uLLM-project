@@ -246,6 +246,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("docs/registries/importance-score-method-registry-v0.1.json"),
     )
+    parser.add_argument(
+        "--candidate-manifest",
+        type=Path,
+        help="Copy an already-frozen candidate manifest byte-for-byte instead of regenerating it.",
+    )
     parser.add_argument("--model-id", default="qwen3.5-9b")
     return parser.parse_args()
 
@@ -261,6 +266,9 @@ def main() -> int:
     )
     static_gguf_path = args.static_gguf_path.expanduser().resolve() if args.static_gguf_path else None
     registry_path = args.registry_path.expanduser().resolve()
+    frozen_candidate_manifest = (
+        args.candidate_manifest.expanduser().resolve() if args.candidate_manifest else None
+    )
     required_paths = [(model_dir, "model directory"), (gguf_path, "GGUF"), (registry_path, "registry")]
     required_paths.append(
         (formal_corpus_manifest, "corpus manifest")
@@ -269,6 +277,8 @@ def main() -> int:
     )
     if static_gguf_path is not None:
         required_paths.append((static_gguf_path, "static GGUF"))
+    if frozen_candidate_manifest is not None:
+        required_paths.append((frozen_candidate_manifest, "frozen candidate manifest"))
     for path, label in required_paths:
         assert path is not None
         if not path.exists():
@@ -276,7 +286,11 @@ def main() -> int:
 
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     revision = git_revision()
-    candidates = candidate_manifest(revision)
+    candidates = (
+        json.loads(frozen_candidate_manifest.read_text(encoding="utf-8"))
+        if frozen_candidate_manifest is not None
+        else candidate_manifest(revision)
+    )
     corpus = (
         json.loads(formal_corpus_manifest.read_text(encoding="utf-8"))
         if formal_corpus_manifest is not None
@@ -291,7 +305,10 @@ def main() -> int:
         raise SystemExit(f"staging directory already exists: {staging}")
     staging.mkdir()
     write_json(staging / "score-method-registry.json", registry)
-    write_json(staging / "quantization-candidate-manifest.json", candidates)
+    if frozen_candidate_manifest is not None:
+        shutil.copyfile(frozen_candidate_manifest, staging / "quantization-candidate-manifest.json")
+    else:
+        write_json(staging / "quantization-candidate-manifest.json", candidates)
     if formal_corpus_manifest is not None:
         shutil.copyfile(formal_corpus_manifest, staging / "corpus-manifest.json")
     else:
@@ -326,6 +343,10 @@ def main() -> int:
         "source_plan": "docs/plans/importance-score-algorithm-selection-plan-v0.1.md",
         "source_plan_sha256": sha256_file(Path("docs/plans/importance-score-algorithm-selection-plan-v0.1.md")),
         "git_revision_at_bootstrap": revision,
+        "candidate_manifest_origin": {
+            "mode": "copied_frozen_manifest" if frozen_candidate_manifest else "generated_at_bootstrap",
+            "path": str(frozen_candidate_manifest) if frozen_candidate_manifest else None,
+        },
         "model": {
             "model_id": args.model_id,
             "architecture": "unknown until config audit",

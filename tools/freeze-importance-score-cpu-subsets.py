@@ -149,6 +149,49 @@ def select_kl_core(labels_path: Path, rate: float) -> list[dict[str, Any]]:
     return selected
 
 
+def select_kl_core_from_source_roster(roster_path: Path, rate: float) -> list[dict[str, Any]]:
+    rows = read_jsonl(roster_path)
+    by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_family[str(row["canonical_family"])].append(row)
+    selected = []
+    for family, members in sorted(by_family.items()):
+        count = max(1, math.ceil(rate * len(members)))
+        members.sort(
+            key=lambda row: hashlib.sha256(
+                (
+                    "importance-score-kl-core-v1\0"
+                    + family
+                    + "\0"
+                    + str(row["hf_name"])
+                    + "\0"
+                    + str(row["layer_id"])
+                    + "\0"
+                    + canonical_json(row["shape"])
+                ).encode()
+            ).digest()
+        )
+        for row in members[:count]:
+            selected.append(
+                {
+                    "model_id": row["model_id"],
+                    "hf_name": row["hf_name"],
+                    "canonical_family": family,
+                    "layer_id": int(row["layer_id"]),
+                    "shape": row["shape"],
+                    "selection_inputs": [
+                        "model_id",
+                        "hf_name",
+                        "canonical_family",
+                        "layer_id",
+                        "shape",
+                    ],
+                }
+            )
+    selected.sort(key=lambda row: (row["canonical_family"], row["layer_id"], row["hf_name"]))
+    return selected
+
+
 def tokenizer_counts(specs: list[str], splits: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     if not specs:
         return {}
@@ -187,7 +230,9 @@ def tokenizer_counts(specs: list[str], splits: dict[str, list[dict[str, Any]]]) 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus-root", type=Path, required=True)
-    parser.add_argument("--labels", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--labels", type=Path)
+    source.add_argument("--source-roster", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--c4-per-shard", type=int, default=4)
     parser.add_argument("--c6-per-shard", type=int, default=2)
@@ -203,12 +248,17 @@ def main() -> int:
     if not 0.10 <= args.kl_core_rate <= 0.15:
         raise SystemExit("KL-core requested rate must remain within the frozen 10-15% interval")
     corpus_root = args.corpus_root.expanduser().resolve()
-    labels_path = args.labels.expanduser().resolve()
+    labels_path = args.labels.expanduser().resolve() if args.labels else None
+    source_roster = args.source_roster.expanduser().resolve() if args.source_roster else None
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     c4_rows = select_records(corpus_root, "D_block", args.c4_per_shard)
     c6_rows = select_records(corpus_root, "D_KL", args.c6_per_shard)
-    kl_core = select_kl_core(labels_path, args.kl_core_rate)
+    kl_core = (
+        select_kl_core(labels_path, args.kl_core_rate)
+        if labels_path is not None
+        else select_kl_core_from_source_roster(source_roster, args.kl_core_rate)
+    )
     c4 = write_jsonl(output_dir / "D_block-cpu-subset.jsonl", c4_rows)
     c6 = write_jsonl(output_dir / "D_KL-cpu-subset.jsonl", c6_rows)
     c4_shards = write_shard_jsonl_files(output_dir, "D_block", c4_rows)
@@ -216,10 +266,24 @@ def main() -> int:
     kl_path = output_dir / "KL-core.json"
     kl_path.write_text(canonical_json(kl_core) + "\n", encoding="utf-8")
     family_counts = Counter(row["canonical_family"] for row in kl_core)
-    with labels_path.open(encoding="utf-8", newline="") as handle:
-        eligible_count = sum(
-            row["eligible"] == "true" for row in csv.DictReader(handle, delimiter="\t")
-        )
+    if labels_path is not None:
+        with labels_path.open(encoding="utf-8", newline="") as handle:
+            eligible_count = sum(
+                row["eligible"] == "true" for row in csv.DictReader(handle, delimiter="\t")
+            )
+        kl_selection_source = {
+            "kind": "paired-label manifest with qtype/promotion fields excluded from selection",
+            "path": str(labels_path),
+            "sha256": sha256_file(labels_path),
+        }
+    else:
+        roster_rows = read_jsonl(source_roster)
+        eligible_count = len(roster_rows)
+        kl_selection_source = {
+            "kind": "BF16 source-only roster; no GGUF tensor label was opened",
+            "path": str(source_roster),
+            "sha256": sha256_file(source_roster),
+        }
     manifest = {
         "schema_version": "importance-score-cpu-subsets-v0.1",
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -247,6 +311,7 @@ def main() -> int:
             "eligible_tensor_count": eligible_count,
             "actual_fraction": len(kl_core) / max(1, eligible_count),
             "family_counts": dict(sorted(family_counts.items())),
+            "selection_source": kl_selection_source,
             "forbidden_selection_inputs": [
                 "qtype_ud",
                 "ordinal_ud",
