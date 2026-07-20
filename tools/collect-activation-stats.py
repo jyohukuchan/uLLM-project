@@ -321,6 +321,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    implementation_sha256_at_start = sha256_file(Path(__file__).resolve())
+    git_revision_at_start = git_revision()
     if args.max_samples < 1 or args.batch_size < 1 or args.progress_every_batches < 0:
         raise SystemExit("--max-samples/--batch-size must be >= 1 and progress interval >= 0")
     if args.sequence_length < 1:
@@ -441,12 +443,17 @@ def main() -> int:
         "torch_threads": args.torch_threads,
         "torch_interop_threads": args.torch_interop_threads,
         "seed": args.seed,
-        "git_revision": git_revision(),
+        "git_revision_at_start": git_revision_at_start,
+        "git_revision_at_finalize": git_revision(),
+        "collector_implementation_sha256_at_start": implementation_sha256_at_start,
         "model_config_sha256": sha256_file(args.model_dir / "config.json"),
         "model_weight_index_sha256": sha256_file(args.model_dir / "model.safetensors.index.json"),
         "tokenizer_config_sha256": sha256_file(args.model_dir / "tokenizer_config.json"),
         "chat_template_sha256": sha256_file(args.model_dir / "chat_template.jinja"),
-        "padding_mask_policy": "attention_mask filters [batch, sequence, hidden] pre-hook activations; this run uses one unpadded example per forward.",
+        "padding_mask_policy": (
+            "attention_mask filters padded positions from batched [batch, sequence, hidden] "
+            "pre-hook activations before every reduction"
+        ),
         "chat_template_policy": "records with messages use tokenizer.apply_chat_template(add_generation_prompt=False); text records are tokenized verbatim",
         "reduction_dtype": "float64",
         "stored_second_moment_dtype": "float64",
