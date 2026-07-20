@@ -87,6 +87,23 @@ def test_kl_core_selection_does_not_depend_on_type_or_promotion_columns(tmp_path
     assert tool.select_kl_core(left, 0.10) == tool.select_kl_core(right, 0.10)
 
 
+def test_cpu_subset_shard_views_are_an_exact_partition(tmp_path: Path) -> None:
+    tool = load_tool("freeze-importance-score-cpu-subsets.py", "test_cpu_subset_shards")
+    rows = [
+        {"record_id": f"r-{shard}-{index}", "domain": "general", "shard": shard}
+        for shard in range(4)
+        for index in range(2)
+    ]
+
+    metadata = tool.write_shard_jsonl_files(tmp_path, "D_block", rows)
+
+    assert [item["records"] for item in metadata] == [2, 2, 2, 2]
+    restored = []
+    for item in metadata:
+        restored.extend(tool.read_jsonl(Path(item["path"])))
+    assert restored == rows
+
+
 def test_single_safetensors_header_audit_without_index(tmp_path: Path) -> None:
     tool = load_tool("build-ud-tensor-labels.py", "test_ud_label_builder")
     save_file(

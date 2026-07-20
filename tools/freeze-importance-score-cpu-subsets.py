@@ -43,6 +43,29 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def write_shard_jsonl_files(
+    output_dir: Path, split: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Write exact, non-overlapping views of an already-selected CPU subset."""
+    result = []
+    for shard in range(4):
+        shard_rows = [row for row in rows if int(row["shard"]) == shard]
+        if not shard_rows:
+            raise RuntimeError(f"{split}: selected CPU subset has no rows for shard {shard}")
+        result.append(
+            {
+                "shard": shard,
+                **write_jsonl(
+                    output_dir / f"{split}-cpu-subset-shard-{shard:02d}.jsonl",
+                    shard_rows,
+                ),
+            }
+        )
+    if sum(int(item["records"]) for item in result) != len(rows):
+        raise RuntimeError(f"{split}: shard views do not partition the selected CPU subset")
+    return result
+
+
 def select_records(corpus_root: Path, split: str, per_shard: int) -> list[dict[str, Any]]:
     selected = []
     for shard in range(4):
@@ -188,6 +211,8 @@ def main() -> int:
     kl_core = select_kl_core(labels_path, args.kl_core_rate)
     c4 = write_jsonl(output_dir / "D_block-cpu-subset.jsonl", c4_rows)
     c6 = write_jsonl(output_dir / "D_KL-cpu-subset.jsonl", c6_rows)
+    c4_shards = write_shard_jsonl_files(output_dir, "D_block", c4_rows)
+    c6_shards = write_shard_jsonl_files(output_dir, "D_KL", c6_rows)
     kl_path = output_dir / "KL-core.json"
     kl_path.write_text(canonical_json(kl_core) + "\n", encoding="utf-8")
     family_counts = Counter(row["canonical_family"] for row in kl_core)
@@ -202,12 +227,14 @@ def main() -> int:
         "selection_version": "importance-score-cpu-subset-v1 / importance-score-kl-core-v1",
         "C4": {
             **c4,
+            "shard_files": c4_shards,
             "full_split_records": 128,
             "record_fraction": len(c4_rows) / 128,
             "reason": "CPU-only block perturbation feasibility cap; four records per fixed shard",
         },
         "C6": {
             **c6,
+            "shard_files": c6_shards,
             "full_split_records": 64,
             "record_fraction": len(c6_rows) / 64,
             "reason": "CPU-only full-vocabulary single-tensor KL feasibility cap; two records per fixed shard",
