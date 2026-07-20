@@ -109,6 +109,10 @@ def main() -> int:
         },
         "aggregation": {
             "primary": "equal-weight macro mean of defined within-family layer Spearman/Kendall",
+            "common_family_secondary": (
+                "fixed attn_q/k/v/o and mlp_gate/up/down family set; reported for both models but "
+                "never substituted for the architecture-specific admission primary"
+            ),
             "bootstrap": "10,000 whole-layer cluster resamples; 95% percentile CI",
             "permutation": "10,000 common global-layer permutations restricted to each family; BH correction",
             "binary": "G_t for C0/C1; S_t itself for format-independent candidates",

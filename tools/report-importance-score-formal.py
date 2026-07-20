@@ -26,6 +26,15 @@ from sklearn.metrics import average_precision_score, ndcg_score, roc_auc_score
 LOW = "aq4_e4m3_g16_ts_flloyd16"
 HIGH = "aq5_e4m3_g16_ts_flloyd32"
 EPSILON = 1e-30
+COMMON_QWEN_GEMMA_FAMILIES = {
+    "attn_k",
+    "attn_o",
+    "attn_q",
+    "attn_v",
+    "mlp_down",
+    "mlp_gate",
+    "mlp_up",
+}
 
 
 def load_screen_module():
@@ -933,6 +942,19 @@ def main() -> int:
     for score in full_scores:
         families, rank = SCREEN.all_rank_metrics(rows, score)
         family_rows.extend(families)
+        common_rows = [
+            row for row in rows if row["canonical_family"] in COMMON_QWEN_GEMMA_FAMILIES
+        ]
+        common_families, common_rank = SCREEN.all_rank_metrics(common_rows, score)
+        for family in common_families:
+            family["scope"] = "within_common_qwen_gemma_family"
+        family_rows.extend(common_families)
+        common_rank["admission_use"] = (
+            "pre-registered cross-architecture secondary; the full architecture-specific family set "
+            "remains the admission primary"
+        )
+        common_rank["families"] = sorted(COMMON_QWEN_GEMMA_FAMILIES)
+        rank["common_family_secondary"] = common_rank
         rank["secondary_targets"] = {}
         for target in (
             "packed_bpp_ud",
