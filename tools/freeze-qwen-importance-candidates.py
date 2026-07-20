@@ -129,6 +129,7 @@ def main() -> int:
         "implementation_hashes": {
             name: sha256_file(Path(__file__).resolve().parent / name)
             for name in (
+                "build-importance-score-prejoin.py",
                 "report-importance-score-formal.py",
                 "run-aq-tensor-sample.py",
                 "score-block-covariance-c1.py",

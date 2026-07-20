@@ -117,7 +117,7 @@ def full_loss(metrics: dict[str, Any]) -> float:
 
 
 def score_features(
-    labels: list[dict[str, str]],
+    labels: list[dict[str, Any]],
     model_dir: Path,
     combined_stats: dict[str, torch.Tensor],
     shard_stats: list[dict[str, torch.Tensor]],
@@ -141,6 +141,16 @@ def score_features(
         sample, shape, n_params = SCREEN.deterministic_weight_sample(
             files[name], name, weight_sample_size, seed, 128
         )
+        declared_shape = label["shape"]
+        if isinstance(declared_shape, str):
+            declared_shape = json.loads(declared_shape)
+        if [int(value) for value in declared_shape] != shape:
+            raise ValueError(f"source/roster shape mismatch for {name}: {declared_shape} != {shape}")
+        if int(label["n_params"]) != n_params:
+            raise ValueError(
+                f"source/roster parameter-count mismatch for {name}: "
+                f"{label['n_params']} != {n_params}"
+            )
         sample64 = sample.to(torch.float64)
         rms_w = float(sample64.square().mean().sqrt())
         q999_w = SCREEN.safe_quantile(sample64.abs(), 0.999)
@@ -166,19 +176,9 @@ def score_features(
             "architecture": label["architecture"],
             "layer_id": int(label["layer_id"]),
             "canonical_family": label["canonical_family"],
-            "gguf_name": label["gguf_name"],
             "hf_name": name,
-            "shape": label["shape"],
+            "shape": shape,
             "n_params": int(label["n_params"]),
-            "qtype_ud": label["qtype_ud"],
-            "qtype_static": label["qtype_static"],
-            "ordinal_ud": float(label["ordinal_ud"]),
-            "ordinal_static": float(label["ordinal_static"]),
-            "packed_bpp_ud": float(label["packed_bpp_ud"]),
-            "packed_bpp_static": float(label["packed_bpp_static"]),
-            "promotion_delta_ordinal": float(label["promotion_delta_ordinal"]),
-            "promotion_delta_bpp": float(label["promotion_delta_bpp"]),
-            "promoted": label["promoted"] == "true",
             "C0_I": float(c0_low["weighted_relative_mse"]),
             "C0_A_low": c0_a_low,
             "C0_A_high": c0_a_high,
@@ -202,6 +202,21 @@ def score_features(
             "weight_shape_audit": shape,
             "weight_n_params_audit": n_params,
         }
+        if "qtype_ud" in label:
+            row.update(
+                {
+                    "gguf_name": label["gguf_name"],
+                    "qtype_ud": label["qtype_ud"],
+                    "qtype_static": label["qtype_static"],
+                    "ordinal_ud": float(label["ordinal_ud"]),
+                    "ordinal_static": float(label["ordinal_static"]),
+                    "packed_bpp_ud": float(label["packed_bpp_ud"]),
+                    "packed_bpp_static": float(label["packed_bpp_static"]),
+                    "promotion_delta_ordinal": float(label["promotion_delta_ordinal"]),
+                    "promotion_delta_bpp": float(label["promotion_delta_bpp"]),
+                    "promoted": label["promoted"] == "true",
+                }
+            )
         if name in c1 and set(c1[name]) == {LOW, HIGH}:
             low = c1[name][LOW]
             high = c1[name][HIGH]
@@ -482,6 +497,105 @@ def paired_cohort_audit(path: Path, eligible_count: int) -> dict[str, Any]:
     return result
 
 
+def load_and_join_prejoin_scores(
+    scores_path: Path,
+    receipt_path: Path,
+    shard_scores_path: Path,
+    labels: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[dict[str, dict[str, float]]], dict[str, Any]]:
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if receipt.get("status") != (
+        "sealed score table generated without accepting or opening a GGUF label manifest"
+    ):
+        raise ValueError("prejoin receipt does not assert a label-blind sealed score table")
+    if receipt.get("score_table_sha256") != sha256_file(scores_path):
+        raise ValueError("prejoin score table hash differs from its receipt")
+    if receipt.get("shard_scores_sha256") != sha256_file(shard_scores_path):
+        raise ValueError("prejoin shard-score hash differs from its receipt")
+    rows = [
+        json.loads(line)
+        for line in scores_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    forbidden = {
+        "gguf_name",
+        "qtype_ud",
+        "qtype_static",
+        "ordinal_ud",
+        "ordinal_static",
+        "packed_bpp_ud",
+        "packed_bpp_static",
+        "promotion_delta_ordinal",
+        "promotion_delta_bpp",
+        "promoted",
+    }
+    leaked = sorted({key for row in rows for key in forbidden if key in row})
+    if leaked:
+        raise ValueError(f"sealed prejoin score table contains teacher-label fields: {leaked}")
+    labels_by_name = {row["hf_name"]: row for row in labels}
+    rows_by_name = {str(row["hf_name"]): row for row in rows}
+    if len(labels_by_name) != len(labels) or len(rows_by_name) != len(rows):
+        raise ValueError("duplicate tensor name in prejoin score table or paired labels")
+    if set(labels_by_name) != set(rows_by_name):
+        missing = sorted(set(labels_by_name) - set(rows_by_name))
+        extra = sorted(set(rows_by_name) - set(labels_by_name))
+        raise ValueError(f"prejoin/label tensor set mismatch: missing={missing}, extra={extra}")
+    expected_tensor_digest = hashlib.sha256(
+        ("\n".join(sorted(rows_by_name)) + "\n").encode("utf-8")
+    ).hexdigest()
+    if receipt.get("tensor_name_set_sha256") != expected_tensor_digest:
+        raise ValueError("prejoin tensor-name set hash differs from its receipt")
+    if int(receipt.get("tensor_count", -1)) != len(rows):
+        raise ValueError("prejoin tensor count differs from its receipt")
+    for name, row in rows_by_name.items():
+        label = labels_by_name[name]
+        label_shape = json.loads(label["shape"])
+        if [int(value) for value in row["shape"]] != [int(value) for value in label_shape]:
+            raise ValueError(f"prejoin/label shape mismatch for {name}")
+        structural_checks = {
+            "model_id": label["model_id"],
+            "architecture": label["architecture"],
+            "canonical_family": label["canonical_family"],
+            "layer_id": int(label["layer_id"]),
+            "n_params": int(label["n_params"]),
+        }
+        for key, expected in structural_checks.items():
+            if row[key] != expected:
+                raise ValueError(
+                    f"prejoin/label structural mismatch for {name}: {key}={row[key]} != {expected}"
+                )
+        row.update(
+            {
+                "gguf_name": label["gguf_name"],
+                "qtype_ud": label["qtype_ud"],
+                "qtype_static": label["qtype_static"],
+                "ordinal_ud": float(label["ordinal_ud"]),
+                "ordinal_static": float(label["ordinal_static"]),
+                "packed_bpp_ud": float(label["packed_bpp_ud"]),
+                "packed_bpp_static": float(label["packed_bpp_static"]),
+                "promotion_delta_ordinal": float(label["promotion_delta_ordinal"]),
+                "promotion_delta_bpp": float(label["promotion_delta_bpp"]),
+                "promoted": label["promoted"] == "true",
+            }
+        )
+    per_shard = json.loads(shard_scores_path.read_text(encoding="utf-8"))
+    if not isinstance(per_shard, list) or len(per_shard) != 4:
+        raise ValueError("prejoin shard-score table must contain exactly four shards")
+    prejoin_audit = {
+        "score_table_path": str(scores_path),
+        "score_table_sha256": sha256_file(scores_path),
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+        "shard_scores_path": str(shard_scores_path),
+        "shard_scores_sha256": sha256_file(shard_scores_path),
+        "tensor_count": len(rows),
+        "label_join_performed_after_receipt": True,
+        "receipt_workspace_git_head": receipt.get("workspace_git_head"),
+        "receipt_implementation_hashes": receipt.get("implementation_hashes"),
+    }
+    return rows, per_shard, prejoin_audit
+
+
 def cluster_bootstrap(rows, score_columns, replicates, seed):
     return SCREEN.layer_cluster_bootstrap(rows, score_columns, replicates, seed)
 
@@ -700,16 +814,19 @@ def disagreement_rows(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--labels", type=Path, required=True)
     parser.add_argument("--label-audit-summary", type=Path, required=True)
-    parser.add_argument("--combined-stats", type=Path, required=True)
-    parser.add_argument("--shard-stats", type=Path, action="append", required=True)
-    parser.add_argument("--c0-jsonl", type=Path, required=True)
+    parser.add_argument("--combined-stats", type=Path)
+    parser.add_argument("--shard-stats", type=Path, action="append", default=[])
+    parser.add_argument("--c0-jsonl", type=Path)
     parser.add_argument("--c0-shard-jsonl", type=Path, action="append", default=[])
     parser.add_argument("--c1-jsonl", type=Path)
     parser.add_argument("--c4-jsonl", type=Path)
     parser.add_argument("--c6-jsonl", type=Path)
+    parser.add_argument("--prejoin-scores", type=Path)
+    parser.add_argument("--prejoin-receipt", type=Path)
+    parser.add_argument("--prejoin-shard-scores", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-sample-size", type=int, default=65536)
     parser.add_argument("--bootstrap-replicates", type=int, default=10000)
@@ -720,25 +837,50 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if len(args.shard_stats) != 4:
-        raise SystemExit("formal report requires exactly four activation-stat shards")
-    model_dir = args.model_dir.expanduser().resolve()
+    prejoin_args = (args.prejoin_scores, args.prejoin_receipt, args.prejoin_shard_scores)
+    using_prejoin = any(prejoin_args)
+    if using_prejoin and not all(prejoin_args):
+        raise SystemExit("prejoin mode requires scores, receipt, and shard scores together")
+    if not using_prejoin and (
+        args.model_dir is None
+        or args.combined_stats is None
+        or args.c0_jsonl is None
+        or len(args.shard_stats) != 4
+    ):
+        raise SystemExit(
+            "legacy direct mode requires model-dir, combined-stats, C0, and four activation-stat shards"
+        )
     labels_path = args.labels.expanduser().resolve()
     labels = read_labels(labels_path)
     cohort = paired_cohort_audit(
         args.label_audit_summary.expanduser().resolve(), len(labels)
     )
-    combined = SCREEN.load_stats(args.combined_stats.expanduser().resolve())
-    shards = [SCREEN.load_stats(path.expanduser().resolve()) for path in args.shard_stats]
-    c0 = parse_quantizer_rows(args.c0_jsonl.expanduser().resolve())
-    c1 = parse_c1(args.c1_jsonl.expanduser().resolve() if args.c1_jsonl else None)
-    c4 = parse_perturbation(args.c4_jsonl.expanduser().resolve() if args.c4_jsonl else None, "c4")
     c6 = parse_perturbation(args.c6_jsonl.expanduser().resolve() if args.c6_jsonl else None, "c6")
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows, per_shard = score_features(
-        labels, model_dir, combined, shards, c0, c1, c4, args.weight_sample_size, args.seed
-    )
+    if using_prejoin:
+        rows, per_shard, prejoin_audit = load_and_join_prejoin_scores(
+            args.prejoin_scores.expanduser().resolve(),
+            args.prejoin_receipt.expanduser().resolve(),
+            args.prejoin_shard_scores.expanduser().resolve(),
+            labels,
+        )
+    else:
+        model_dir = args.model_dir.expanduser().resolve()
+        combined = SCREEN.load_stats(args.combined_stats.expanduser().resolve())
+        shards = [SCREEN.load_stats(path.expanduser().resolve()) for path in args.shard_stats]
+        c0 = parse_quantizer_rows(args.c0_jsonl.expanduser().resolve())
+        c1 = parse_c1(args.c1_jsonl.expanduser().resolve() if args.c1_jsonl else None)
+        c4 = parse_perturbation(
+            args.c4_jsonl.expanduser().resolve() if args.c4_jsonl else None, "c4"
+        )
+        rows, per_shard = score_features(
+            labels, model_dir, combined, shards, c0, c1, c4, args.weight_sample_size, args.seed
+        )
+        prejoin_audit = {
+            "label_join_performed_after_receipt": False,
+            "mode": "legacy direct score/label mode; do not use this mode for a lockbox model",
+        }
     full_scores = ["C0_I", "S_AWQ_level", "S_AWQ_tail", "S_range"]
     if all("C1_I" in row for row in rows):
         full_scores.append("C1_I")
@@ -756,6 +898,7 @@ def main() -> int:
         "eligible_tensor_count": len(rows),
         "paired_labels_sha256": sha256_file(labels_path),
         "paired_cohort_audit": cohort,
+        "prejoin_audit": prejoin_audit,
         "teacher_coverage": teacher_coverage(rows),
         "scores": {},
     }

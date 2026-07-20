@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.util
 import json
 import sys
@@ -183,3 +184,115 @@ def test_paired_cohort_gate_requires_exact_full_pairing(tmp_path: Path) -> None:
 
     assert tool.paired_cohort_audit(path, 8)["pass"] is True
     assert tool.paired_cohort_audit(path, 9)["pass"] is False
+
+
+def test_prejoin_score_receipt_is_verified_before_label_join(tmp_path: Path) -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_formal_prejoin")
+    score_path = tmp_path / "scores-prejoin.jsonl"
+    shard_path = tmp_path / "shard-scores-prejoin.json"
+    receipt_path = tmp_path / "scores-prejoin.receipt.json"
+    score_row = {
+        "model_id": "m",
+        "architecture": "a",
+        "canonical_family": "mlp_up",
+        "layer_id": 0,
+        "hf_name": "model.layers.0.mlp.up_proj.weight",
+        "shape": [2, 2],
+        "n_params": 4,
+        "C0_I": 0.1,
+    }
+    score_path.write_text(json.dumps(score_row, sort_keys=True) + "\n", encoding="utf-8")
+    shard_path.write_text(json.dumps([{}, {}, {}, {}]), encoding="utf-8")
+    name_digest = hashlib.sha256((score_row["hf_name"] + "\n").encode()).hexdigest()
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "status": (
+                    "sealed score table generated without accepting or opening a GGUF label manifest"
+                ),
+                "score_table_sha256": tool.sha256_file(score_path),
+                "shard_scores_sha256": tool.sha256_file(shard_path),
+                "tensor_name_set_sha256": name_digest,
+                "tensor_count": 1,
+                "workspace_git_head": "test",
+                "implementation_hashes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    labels = [
+        {
+            "model_id": "m",
+            "architecture": "a",
+            "canonical_family": "mlp_up",
+            "layer_id": "0",
+            "hf_name": score_row["hf_name"],
+            "gguf_name": "blk.0.ffn_up.weight",
+            "shape": "[2,2]",
+            "n_params": "4",
+            "qtype_ud": "Q5_K",
+            "qtype_static": "Q4_K",
+            "ordinal_ud": "1",
+            "ordinal_static": "0",
+            "packed_bpp_ud": "5.5",
+            "packed_bpp_static": "4.5",
+            "promotion_delta_ordinal": "1",
+            "promotion_delta_bpp": "1.0",
+            "promoted": "true",
+        }
+    ]
+
+    rows, shards, audit = tool.load_and_join_prejoin_scores(
+        score_path, receipt_path, shard_path, labels
+    )
+
+    assert rows[0]["qtype_ud"] == "Q5_K"
+    assert rows[0]["promoted"] is True
+    assert len(shards) == 4
+    assert audit["label_join_performed_after_receipt"] is True
+
+
+def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_formal_source_score")
+    name = "model.layers.0.mlp.up_proj.weight"
+    module = name.removesuffix(".weight")
+    save_file({name: torch.tensor([[1.0, -1.0], [0.5, -0.5]])}, str(tmp_path / "model.safetensors"))
+    stats = {
+        module: torch.tensor([1.0, 4.0]),
+        f"{module}.mean_abs": torch.tensor([0.5, 1.0]),
+        f"{module}.max_abs": torch.tensor([1.0, 2.0]),
+    }
+    candidates = {
+        tool.LOW: {
+            "metrics": {
+                "weighted_relative_mse": 0.1,
+                "weighted_sse_estimated_full_tensor": 2.0,
+            }
+        },
+        tool.HIGH: {
+            "metrics": {
+                "weighted_relative_mse": 0.05,
+                "weighted_sse_estimated_full_tensor": 1.0,
+            }
+        },
+    }
+    roster = [
+        {
+            "model_id": "m",
+            "architecture": "a",
+            "layer_id": 0,
+            "canonical_family": "mlp_up",
+            "hf_name": name,
+            "shape": [2, 2],
+            "n_params": 4,
+        }
+    ]
+
+    rows, per_shard = tool.score_features(
+        roster, tmp_path, stats, [stats] * 4, {name: candidates}, {}, {}, 4, 0
+    )
+
+    assert rows[0]["C0_I"] == 0.1
+    assert rows[0]["C0_G"] == 1.0
+    assert "qtype_ud" not in rows[0]
+    assert all(name in shard for shard in per_shard)
