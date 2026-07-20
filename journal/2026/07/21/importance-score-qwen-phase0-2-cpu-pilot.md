@@ -10,6 +10,7 @@
 
 - score-method registryとadmission gateを`49fceeeb`でcommitした。AQ6はregistryへ追加していない。
 - run rootに`quantization-candidate-manifest.json`と`corpus-manifest.json`を作成した。AQ4は現行FP32 sampled evaluatorの情報だけを記録し、storage rounding、serialized byte formula、fit/eval splitなど未確定項目を`unknown`にした。AQ5は現行実装で再現不能のため全contractを`unknown`にし、両candidateをgain/allocationから除外した。
+- immutable candidate manifestはrun-idへhash済みのpre-screen contractである。実行したcollector/sampler/summarizer/mergerのsource SHA-256は`experiment-manifest.json`へ別記録し、future bootstrapはsource hashを動的に採るよう修正した。これはAQ4をfinal-storage candidateへ昇格させるものではない。
 - `gguf-dump --json`でQwen3.5-9B UD-Q4_K_XLの427 GGUF tensorを取得し、BF16との対応を監査した。text cohortは427/427対応、core eligibleは200。unmatched/duplicateは0、`ssm_conv1d` 24件のrank-3 shape mismatchとvision/MTP 348件のscope exclusionを`eligibility-audit.tsv`にfatalとして全件残した。
 - local `/home/homelab1/datapool/ai_models`にはsame-cohort Qwen3.5-9B `Q4_K_M`が無かった。ダウンロードはせず、paired analysisとAUC/Precision@KはHOLDにした。
 - GPUなし・service/systemd非接触で、既存32 promptを4 shardへ固定してCPUでD_stats pilotを実行した。32 sample、3,416 valid token、248 module、FP64 second moment/mean_absを得た。これはformal 256k mixed-domain corpusではない。

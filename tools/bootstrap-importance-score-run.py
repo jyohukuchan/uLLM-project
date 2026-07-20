@@ -56,6 +56,7 @@ def file_record(path: Path, *, required: bool = True) -> dict[str, Any]:
 
 
 def candidate_manifest(revision: str) -> dict[str, Any]:
+    tools_dir = Path(__file__).resolve().parent
     aq4 = {
         "candidate_id": "aq4_e4m3_g16_ts_flloyd16",
         "index_bits": 4,
@@ -66,16 +67,16 @@ def candidate_manifest(revision: str) -> dict[str, Any]:
         "codebook_storage_dtype": UNKNOWN,
         "scale/codebook objective": UNKNOWN,
         "family taxonomy": UNKNOWN,
-        "fit/eval split": UNKNOWN,
-        "seed": UNKNOWN,
+        "fit/eval split": "none: sampled groups with replacement are used for both fitting and evaluation",
+        "seed": 0,
         "iterations": 8,
         "rounding mode": UNKNOWN,
         "serialized byte formula": UNKNOWN,
         "implementation revision": {
             "workspace_git_head": revision,
-            "sampler_sha256": "8c5d395d853cecd7f9362ee27305c040f1ac9fc35aa87ba57be96f5b649f5b2c",
-            "family_exporter_sha256": "2a71abdc459c309dcda82f1f4ad0ee3ec993d3d4fc60d84459980c23be11f91b",
-            "scale_helper_sha256": "8a2bbe7084afbd3fdcb43d9682b1eeac41b0168c084bf5ca40937fe093a7541a",
+            "sampler_sha256": sha256_file(tools_dir / "run-aq-tensor-sample.py"),
+            "family_exporter_sha256": sha256_file(tools_dir / "export-aq-family-codebooks.py"),
+            "scale_helper_sha256": sha256_file(tools_dir / "aq_scale_formats.py"),
             "meaning": "FP32 sampled evaluator revision, not a final-storage Q_b revision"
         },
         "contract_status": "incomplete",

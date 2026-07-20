@@ -40,6 +40,7 @@ def main() -> int:
     args = parse_args()
     root = args.run_root.expanduser().resolve()
     gguf_dump = args.gguf_dump.expanduser().resolve()
+    tools_dir = Path(__file__).resolve().parent
     paths = {
         "experiment": root / "experiment-manifest.json",
         "registry": root / "score-method-registry.json",
@@ -95,6 +96,16 @@ def main() -> int:
     }
     manifest["measurement"] = {
         "execution": "CPU-only offline; CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES were blank for collection and scoring.",
+        "execution_code": {
+            "collector_sha256": sha256_file(tools_dir / "collect-activation-stats.py"),
+            "sampler_sha256": sha256_file(tools_dir / "run-aq-tensor-sample.py"),
+            "summarizer_sha256": sha256_file(tools_dir / "summarize-importance-score-screen.py"),
+            "merger_sha256": sha256_file(tools_dir / "merge-activation-stats.py"),
+            "note": (
+                "These per-tool source hashes identify the provisional CPU observations. "
+                "The candidate manifest remains the pre-screen incomplete format contract and is not a final-storage Q_b revision."
+            ),
+        },
         "D_stats_cpu_pilot": {
             "samples_seen": int(combined_stats["samples_seen"]),
             "valid_tokens_seen": int(combined_stats["tokens_seen"]),
