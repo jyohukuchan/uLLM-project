@@ -308,6 +308,47 @@ def binary_metrics(rows: list[dict[str, Any]], score: str) -> dict[str, Any]:
     }
 
 
+def byte_matched_metrics(rows: list[dict[str, Any]], gain_column: str) -> dict[str, Any]:
+    budget = sum(
+        float(row["promotion_delta_bpp"]) * int(row["n_params"]) / 8.0 for row in rows
+    )
+    budget = max(0.0, budget)
+    candidates = []
+    for row in rows:
+        n = int(row["n_params"])
+        delta = math.ceil(5 * n / 8) - math.ceil(4 * n / 8)
+        gain = float(row[gain_column])
+        candidates.append((gain / max(delta, 1), row, delta))
+    candidates.sort(
+        key=lambda item: (
+            -item[0],
+            hashlib.sha256(str(item[1]["hf_name"]).encode()).digest(),
+        )
+    )
+    selected = []
+    used = 0
+    for utility, row, delta in candidates:
+        if used + delta > budget:
+            continue
+        selected.append(row)
+        used += delta
+    positive_count = sum(bool(row["promoted"]) for row in rows)
+    true_positive = sum(bool(row["promoted"]) for row in selected)
+    return {
+        "gain_column": gain_column,
+        "actual_UD_net_additional_byte_budget": budget,
+        "AQ5_tensor_payload_bytes_used": used,
+        "selected_tensor_count": len(selected),
+        "Precision": true_positive / len(selected) if selected else None,
+        "Recall": true_positive / max(positive_count, 1),
+        "family_codebook_fixed_charge_note": (
+            "The 32-byte AQ5-vs-AQ4 codebook delta per activated family is omitted from U_t ordering; "
+            "it is negligible here but the final integer policy must include it exactly."
+        ),
+        "budget_definition": "sum_t promotion_delta_bpp*n_params/8, clipped at zero",
+    }
+
+
 def direction_gate(family_rows: list[dict[str, Any]]) -> dict[str, Any]:
     defined = [row for row in family_rows if row["defined"]]
     fraction = (
@@ -418,7 +459,7 @@ def kl_metrics(
         column = f"{prefix}_G"
         if f"{prefix}_I" in score_columns:
             values = [float(by_name[name][column]) for name in common]
-            result["scores"][column]["rho_gain_vs_KL_recovery_secondary"] = (
+            result["scores"][f"{prefix}_I"]["rho_gain_vs_KL_recovery_secondary"] = (
                 float(spearmanr(values, gains).statistic)
                 if len(set(values)) > 1 and len(set(gains)) > 1
                 else None
@@ -471,6 +512,75 @@ def teacher_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "pass": nonconstant >= 4 and mixed >= 3,
         "families": details,
     }
+
+
+def disagreement_rows(
+    rows: list[dict[str, Any]],
+    score_columns: list[str],
+    c6: dict[str, dict[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+    for score in score_columns:
+        by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            by_family[row["canonical_family"]].append(row)
+        residual_values = []
+        annotated = []
+        for members in by_family.values():
+            score_rank = rankdata([row[score] for row in members], method="average") / len(members)
+            label_rank = rankdata([row["ordinal_ud"] for row in members], method="average") / len(members)
+            for row, s_rank, l_rank in zip(members, score_rank, label_rank, strict=True):
+                residual = float(s_rank - l_rank)
+                residual_values.append(abs(residual))
+                annotated.append((row, float(s_rank), float(l_rank), residual))
+        cutoff = float(np.quantile(np.asarray(residual_values), 0.95))
+        k = sum(bool(row["promoted"]) for row in rows)
+        top_k = sorted(rows, key=lambda item: float(item[score]), reverse=True)[:k]
+        bottom_k = sorted(rows, key=lambda item: float(item[score]))[:k]
+        high_false = {row["hf_name"] for row in top_k if not row["promoted"]}
+        low_positive = {row["hf_name"] for row in bottom_k if row["promoted"]}
+        for row, score_rank, label_rank, residual in annotated:
+            reasons = []
+            if row["hf_name"] in high_false:
+                reasons.append("score_high_not_promoted")
+            if row["hf_name"] in low_positive:
+                reasons.append("score_low_but_promoted")
+            if abs(residual) >= cutoff:
+                reasons.append("family_rank_residual_top_5pct")
+            if not reasons:
+                continue
+            key = (row["hf_name"], score)
+            kl = c6.get(row["hf_name"], {}).get(LOW, {}).get("metrics", {})
+            selected[key] = {
+                "model": row["model_id"],
+                "layer": row["layer_id"],
+                "family": row["canonical_family"],
+                "gguf_name": row["gguf_name"],
+                "hf_name": row["hf_name"],
+                "shape": row["shape"],
+                "n_params": row["n_params"],
+                "ud_type": row["qtype_ud"],
+                "static_type": row["qtype_static"],
+                "promotion_delta_ordinal": row["promotion_delta_ordinal"],
+                "promotion_delta_bpp": row["promotion_delta_bpp"],
+                "score_id": score,
+                "score_raw": row[score],
+                "score_family_rank": score_rank,
+                "ud_family_rank": label_rank,
+                "rank_residual": residual,
+                "activation_rms": row["activation_rms_mean"],
+                "activation_tail": row["activation_tail"],
+                "range_score": row["S_range"],
+                "diag_mse": row["C0_I"],
+                "block_cov_mse": row.get("C1_I"),
+                "block_output_mse": row.get("C4_I_subset"),
+                "fisher": None,
+                "kl": kl.get("C6_L"),
+                "flip_rate": kl.get("top1_flip_rate"),
+                "qualitative_class": "unknown",
+                "notes": ";".join(reasons),
+            }
+    return list(selected.values())
 
 
 def parse_args() -> argparse.Namespace:
@@ -534,6 +644,10 @@ def main() -> int:
         family_rows.extend(families)
         rank["direction_gate"] = direction_gate(families)
         rank["binary"] = binary_metrics(rows, binary_score[score])
+        if score in {"C0_I", "C1_I"}:
+            rank["binary"]["byte_matched"] = byte_matched_metrics(
+                rows, binary_score[score]
+            )
         metrics["scores"][score] = rank
 
     bootstrap_rows, bootstrap = cluster_bootstrap(
@@ -632,6 +746,18 @@ def main() -> int:
         output_dir / "shard-stability.tsv",
         stability,
         ["score_id", "shard_left", "shard_right", "n", "spearman_rho", "top_k", "top_k_jaccard"],
+    )
+    disagreements = disagreement_rows(rows, full_scores, c6)
+    SCREEN.write_tsv(
+        output_dir / "disagreements.tsv",
+        disagreements,
+        [
+            "model", "layer", "family", "gguf_name", "hf_name", "shape", "n_params",
+            "ud_type", "static_type", "promotion_delta_ordinal", "promotion_delta_bpp",
+            "score_id", "score_raw", "score_family_rank", "ud_family_rank", "rank_residual",
+            "activation_rms", "activation_tail", "range_score", "diag_mse", "block_cov_mse",
+            "block_output_mse", "fisher", "kl", "flip_rate", "qualitative_class", "notes",
+        ],
     )
     (output_dir / "metrics-by-model.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"

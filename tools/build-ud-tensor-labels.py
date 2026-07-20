@@ -35,6 +35,20 @@ PACKED_BPP = {
     "F16": 16.0,
     "F32": 32.0,
 }
+COHORT_METADATA_KEYS = (
+    "general.architecture",
+    "general.base_model.0.name",
+    "general.base_model.0.organization",
+    "general.base_model.0.repo_url",
+    "general.basename",
+    "general.name",
+    "general.quantization_version",
+    "general.quantized_by",
+    "quantize.imatrix.file",
+    "quantize.imatrix.dataset",
+    "quantize.imatrix.entries_count",
+    "quantize.imatrix.chunks_count",
+)
 CORE_FAMILIES = {
     "attn_q",
     "attn_k",
@@ -157,6 +171,15 @@ def fallback_label(qtype: str) -> bool:
     return qtype in {"Q5_K", "Q6_K", "Q8_0"}
 
 
+def metadata_values(gguf: dict[str, Any]) -> dict[str, Any]:
+    metadata = gguf.get("metadata", {})
+    return {
+        key: metadata[key].get("value")
+        for key in COHORT_METADATA_KEYS
+        if key in metadata and isinstance(metadata[key], dict)
+    }
+
+
 def static_candidates(root: Path) -> list[str]:
     """Read-only, deliberately strict local static-baseline search."""
     candidates: list[str] = []
@@ -202,6 +225,7 @@ def main() -> int:
     tensors: dict[str, dict[str, Any]] = gguf["tensors"]
     static_path = args.static_gguf_path.expanduser().resolve() if args.static_gguf_path else None
     static_tensors: dict[str, dict[str, Any]] | None = None
+    static_gguf: dict[str, Any] | None = None
     static_pair_errors: list[str] = []
     if static_path is not None:
         if not static_path.is_file():
@@ -436,6 +460,13 @@ def main() -> int:
             "admission_use": (
                 "eligible" if eligible and all(row["label_mode"] == "paired_same_cohort_q4_k_m" for row in eligible)
                 else "HOLD: paired binary teacher incomplete"
+            ),
+            "teacher_cohort_metadata": metadata_values(gguf),
+            "static_cohort_metadata": metadata_values(static_gguf) if static_gguf is not None else None,
+            "cohort_metadata_exact_match": (
+                metadata_values(gguf) == metadata_values(static_gguf)
+                if static_gguf is not None
+                else False
             ),
         },
         "fallback": {

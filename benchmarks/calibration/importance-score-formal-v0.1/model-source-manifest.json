@@ -59,8 +59,9 @@
       "repo": "unsloth/gemma-4-E4B-it-GGUF",
       "revision": "bfc15c382204943c3a8fff0c750b94ae2364d7a3",
       "counted_in_2026_07_21_download_budget": true,
-      "download_bytes": 10103478528,
+      "download_bytes": 10103507031,
       "files": [
+        {"filename": "README.md", "path": "/home/homelab1/datapool/ai_models/gguf/unsloth/gemma-4-E4B-it-GGUF/README.md", "size_bytes": 28503, "file_sha256": "d741f0752fcf433cc3960ae20c609dbb159c25ce269da3b004246e8fd34245a3", "lfs_sha256": null},
         {"filename": "gemma-4-E4B-it-UD-Q4_K_XL.gguf", "path": "/home/homelab1/datapool/ai_models/gguf/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-UD-Q4_K_XL.gguf", "size_bytes": 5126306944, "file_sha256": "3cf61de12daa015ee0f7b68e7b7c541405bf220e1e942bad8b47cab827d7df80", "lfs_sha256": "3cf61de12daa015ee0f7b68e7b7c541405bf220e1e942bad8b47cab827d7df80"},
         {"filename": "gemma-4-E4B-it-Q4_K_M.gguf", "path": "/home/homelab1/datapool/ai_models/gguf/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf", "size_bytes": 4977171584, "file_sha256": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87", "lfs_sha256": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"}
       ]
