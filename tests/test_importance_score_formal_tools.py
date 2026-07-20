@@ -425,3 +425,36 @@ def test_two_model_comparison_pairs_worst_model_bootstrap_draws() -> None:
 
     assert result["replicates"] == 3
     assert result["left_strictly_better"] is True
+
+
+def test_kl_audit_cap_preserves_score_extremes_without_label_fields() -> None:
+    tool = load_tool("freeze-importance-kl-audit-subset.py", "test_kl_audit_subset")
+    scores = [
+        {
+            "model_id": "m",
+            "hf_name": f"model.layers.{index}.mlp.up_proj.weight",
+            "canonical_family": "mlp_up",
+            "layer_id": index,
+            "shape": [8, 8],
+            **{score: float(index) for score in tool.DEFAULT_SCORES},
+        }
+        for index in range(6)
+    ]
+    disagreements = [
+        {
+            "hf_name": "model.layers.3.mlp.up_proj.weight",
+            "score_id": "C0_I",
+            "notes": "score_high_not_promoted",
+            "qtype_ud": "Q4_K",
+        }
+    ]
+
+    selected, audit = tool.select_audit_rows(
+        scores, disagreements, list(tool.DEFAULT_SCORES), 2, 3
+    )
+
+    names = {row["hf_name"] for row in selected}
+    assert "model.layers.0.mlp.up_proj.weight" in names
+    assert "model.layers.5.mlp.up_proj.weight" in names
+    assert audit["selected_tensor_count"] == 3
+    assert all("qtype_ud" not in row for row in selected)

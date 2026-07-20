@@ -134,6 +134,7 @@ def main() -> int:
             name: sha256_file(Path(__file__).resolve().parent / name)
             for name in (
                 "build-importance-score-prejoin.py",
+                "freeze-importance-kl-audit-subset.py",
                 "report-importance-score-formal.py",
                 "report-importance-score-two-model.py",
                 "run-aq-tensor-sample.py",
