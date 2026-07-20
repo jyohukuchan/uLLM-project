@@ -75,10 +75,17 @@ def write_tsv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
 
 def load_safetensor_headers(model_dir: Path) -> dict[str, dict[str, Any]]:
     index_path = model_dir / "model.safetensors.index.json"
-    index = json.loads(index_path.read_text(encoding="utf-8"))
     by_file: dict[str, list[str]] = {}
-    for name, filename in index["weight_map"].items():
-        by_file.setdefault(filename, []).append(name)
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        for name, filename in index["weight_map"].items():
+            by_file.setdefault(filename, []).append(name)
+    else:
+        for path in sorted(model_dir.glob("*.safetensors")):
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                by_file[path.name] = list(handle.keys())
+        if not by_file:
+            raise FileNotFoundError(f"no safetensors weights under {model_dir}")
     headers: dict[str, dict[str, Any]] = {}
     for filename, names in sorted(by_file.items()):
         with safe_open(model_dir / filename, framework="pt", device="cpu") as handle:
