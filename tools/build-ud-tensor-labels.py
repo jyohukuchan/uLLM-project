@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit Qwen3.5-9B Unsloth Dynamic tensor labels read-only.
+"""Build and audit Qwen/Gemma Unsloth Dynamic tensor labels read-only.
 
 The script consumes ``gguf-dump --json`` and safetensors headers only.  It
 never dequantizes GGUF payloads or modifies model files.  When an explicit
@@ -7,12 +7,17 @@ same-cohort Q4_K_M is supplied, tensor names and shapes are paired exactly and
 the ordinal/bpp promotion deltas are emitted.  A missing or mismatched baseline
 is recorded as an explicit pairing failure rather than silently replaced by a
 fallback label.
+
+For a Gemma lockbox model, the tool refuses to invoke ``gguf-dump`` until it
+has verified both the sealed Qwen candidate freeze and the source-only score
+receipt, including their common implementation hashes and execution order.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import subprocess
@@ -190,6 +195,64 @@ def static_candidates(root: Path) -> list[str]:
     return sorted(candidates)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_lockbox_order(
+    model_id: str, candidate_freeze_path: Path, score_receipt_path: Path
+) -> dict[str, Any]:
+    freeze = json.loads(candidate_freeze_path.read_text(encoding="utf-8"))
+    receipt = json.loads(score_receipt_path.read_text(encoding="utf-8"))
+    if freeze.get("status") != "sealed before any Gemma tensor-level score/label join":
+        raise ValueError("Qwen candidate freeze has an unexpected status")
+    if freeze.get("lockbox_model") != model_id:
+        raise ValueError(
+            f"Qwen candidate freeze names {freeze.get('lockbox_model')}, not {model_id}"
+        )
+    if receipt.get("status") != (
+        "sealed score table generated without accepting or opening a GGUF label manifest"
+    ):
+        raise ValueError("prejoin score receipt has an unexpected status")
+    if receipt.get("model_id") != model_id:
+        raise ValueError(f"prejoin score receipt names {receipt.get('model_id')}, not {model_id}")
+    score_path = Path(str(receipt.get("score_table_path", ""))).expanduser().resolve()
+    if not score_path.is_file() or sha256_file(score_path) != receipt.get("score_table_sha256"):
+        raise ValueError("sealed prejoin score table is missing or differs from its receipt")
+    freeze_hashes = freeze.get("implementation_hashes", {})
+    receipt_hashes = receipt.get("implementation_hashes", {})
+    compared = {}
+    for name in (
+        "build-importance-score-prejoin.py",
+        "report-importance-score-formal.py",
+        "run-aq-tensor-sample.py",
+    ):
+        compared[name] = {
+            "candidate_freeze": freeze_hashes.get(name),
+            "prejoin_receipt": receipt_hashes.get(name),
+        }
+        if not compared[name]["candidate_freeze"] or (
+            compared[name]["candidate_freeze"] != compared[name]["prejoin_receipt"]
+        ):
+            raise ValueError(f"lockbox implementation hash mismatch for {name}")
+    if str(freeze.get("created_at_utc", "")) >= str(receipt.get("created_at_utc", "")):
+        raise ValueError("prejoin score receipt is not later than the Qwen candidate freeze")
+    return {
+        "status": "order verified before invoking gguf-dump",
+        "qwen_candidate_freeze_path": str(candidate_freeze_path),
+        "qwen_candidate_freeze_sha256": sha256_file(candidate_freeze_path),
+        "prejoin_score_receipt_path": str(score_receipt_path),
+        "prejoin_score_receipt_sha256": sha256_file(score_receipt_path),
+        "sealed_score_table_path": str(score_path),
+        "sealed_score_table_sha256": receipt["score_table_sha256"],
+        "implementation_hash_comparison": compared,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gguf-path", type=Path, required=True)
@@ -203,6 +266,8 @@ def parse_args() -> argparse.Namespace:
         help="Explicit same-repository/revision Q4_K_M baseline; no heuristic candidate is auto-selected.",
     )
     parser.add_argument("--static-search-root", type=Path, default=Path("/home/homelab1/datapool/ai_models"))
+    parser.add_argument("--qwen-candidate-freeze", type=Path)
+    parser.add_argument("--prejoin-score-receipt", type=Path)
     return parser.parse_args()
 
 
@@ -213,10 +278,38 @@ def main() -> int:
     output_dir = args.output_dir.expanduser().resolve()
     gguf_dump = args.gguf_dump.expanduser().resolve()
     static_root = args.static_search_root.expanduser().resolve()
+    is_gemma_lockbox = args.model_id.lower().startswith("gemma")
+    if is_gemma_lockbox and (
+        args.qwen_candidate_freeze is None or args.prejoin_score_receipt is None
+    ):
+        raise SystemExit(
+            "Gemma label extraction requires both --qwen-candidate-freeze and "
+            "--prejoin-score-receipt"
+        )
+    lockbox_order_audit = None
+    if is_gemma_lockbox:
+        lockbox_order_audit = verify_lockbox_order(
+            args.model_id,
+            args.qwen_candidate_freeze.expanduser().resolve(),
+            args.prejoin_score_receipt.expanduser().resolve(),
+        )
     for path, label in ((gguf_path, "GGUF"), (model_dir, "model directory"), (gguf_dump, "gguf-dump")):
         if not path.exists():
             raise SystemExit(f"missing {label}: {path}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    if is_gemma_lockbox:
+        existing = [
+            output_dir / name
+            for name in (
+                "ud-tensor-labels.tsv",
+                "tensor-name-map.tsv",
+                "eligibility-audit.tsv",
+                "ud-label-audit-summary.json",
+            )
+            if (output_dir / name).exists()
+        ]
+        if existing:
+            raise SystemExit(f"refusing to overwrite Gemma lockbox label artifacts: {existing}")
 
     dumped = subprocess.run(
         [str(gguf_dump), "--json", str(gguf_path)], check=True, text=True, capture_output=True
@@ -430,6 +523,7 @@ def main() -> int:
         "schema_version": "ud-label-audit-summary-v0.1",
         "model_id": args.model_id,
         "architecture": architecture,
+        "lockbox_order_audit": lockbox_order_audit,
         "gguf_tensor_count": len(labels),
         "hf_tensor_count": len(hf_headers),
         "text_only_cohort_mapped": len(mapped_hf),

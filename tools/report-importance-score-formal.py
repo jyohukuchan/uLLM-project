@@ -477,6 +477,7 @@ def paired_cohort_audit(path: Path, eligible_count: int) -> dict[str, Any]:
     paired_count = int(pair.get("eligible_paired_count", 0))
     exact = bool(pair.get("cohort_metadata_exact_match", False))
     result = {
+        "model_id": raw.get("model_id"),
         "audit_path": str(path),
         "audit_sha256": sha256_file(path),
         "status": pair.get("status"),
@@ -486,13 +487,23 @@ def paired_cohort_audit(path: Path, eligible_count: int) -> dict[str, Any]:
         "expected_eligible_count": eligible_count,
         "cohort_metadata_exact_match": exact,
         "pairing_errors": errors,
+        "lockbox_order_audit": raw.get("lockbox_order_audit"),
     }
+    lockbox_order_pass = True
+    if str(raw.get("model_id", "")).lower().startswith("gemma"):
+        lockbox_order_pass = (
+            isinstance(raw.get("lockbox_order_audit"), dict)
+            and raw["lockbox_order_audit"].get("status")
+            == "order verified before invoking gguf-dump"
+        )
+    result["lockbox_order_pass"] = lockbox_order_pass
     result["pass"] = (
         coverage == 1.0
         and paired_count == eligible_count
         and exact
         and not errors
         and pair.get("admission_use") == "eligible"
+        and lockbox_order_pass
     )
     return result
 
@@ -865,6 +876,12 @@ def main() -> int:
             args.prejoin_shard_scores.expanduser().resolve(),
             labels,
         )
+        if str(rows[0]["model_id"]).lower().startswith("gemma"):
+            order = cohort.get("lockbox_order_audit") or {}
+            if order.get("sealed_score_table_sha256") != prejoin_audit["score_table_sha256"]:
+                raise ValueError(
+                    "Gemma label audit was authorized for a different sealed prejoin score table"
+                )
     else:
         model_dir = args.model_dir.expanduser().resolve()
         combined = SCREEN.load_stats(args.combined_stats.expanduser().resolve())

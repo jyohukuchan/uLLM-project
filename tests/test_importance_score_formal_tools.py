@@ -296,3 +296,49 @@ def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
     assert rows[0]["C0_G"] == 1.0
     assert "qtype_ud" not in rows[0]
     assert all(name in shard for shard in per_shard)
+
+
+def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) -> None:
+    tool = load_tool("build-ud-tensor-labels.py", "test_lockbox_label_order")
+    score_path = tmp_path / "scores-prejoin.jsonl"
+    score_path.write_text("{}\n", encoding="utf-8")
+    hashes = {
+        "build-importance-score-prejoin.py": "a",
+        "report-importance-score-formal.py": "b",
+        "run-aq-tensor-sample.py": "c",
+    }
+    freeze_path = tmp_path / "qwen-candidate-freeze.json"
+    freeze_path.write_text(
+        json.dumps(
+            {
+                "status": "sealed before any Gemma tensor-level score/label join",
+                "lockbox_model": "gemma-4-E4B-it",
+                "created_at_utc": "2026-07-21T00:00:00+00:00",
+                "implementation_hashes": hashes,
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt_path = tmp_path / "scores-prejoin.receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "status": (
+                    "sealed score table generated without accepting or opening a GGUF label manifest"
+                ),
+                "model_id": "gemma-4-E4B-it",
+                "created_at_utc": "2026-07-21T01:00:00+00:00",
+                "score_table_path": str(score_path),
+                "score_table_sha256": tool.sha256_file(score_path),
+                "implementation_hashes": hashes,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    audit = tool.verify_lockbox_order(
+        "gemma-4-E4B-it", freeze_path, receipt_path
+    )
+
+    assert audit["status"] == "order verified before invoking gguf-dump"
+    assert audit["sealed_score_table_sha256"] == tool.sha256_file(score_path)
