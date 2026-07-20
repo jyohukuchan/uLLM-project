@@ -433,14 +433,26 @@ def metrics_from_recon(
     denom = float(groups.square().mean().clamp_min(1e-30))
     weighted_mse = None
     weighted_relative_mse = None
+    weighted_sse_value = None
+    weighted_reference_sse_value = None
+    weighted_weight_sum = None
     if group_weights is not None:
-        weights = group_weights.to(torch.float32).clamp_min(0)
+        # Keep the C0 numerator and reference-energy denominator in FP64.  The
+        # candidate reconstruction remains this tool's existing sampled FP32
+        # evaluator; this change only preserves the reported reduction.
+        weights = group_weights.to(torch.float64).clamp_min(0)
         mean_weight = weights.mean().clamp_min(1e-30)
         weights = weights / mean_weight
-        weighted_sse = (diff.square() * weights).sum()
-        weighted_denom = (groups.square() * weights).sum().clamp_min(1e-30)
+        diff64 = diff.to(torch.float64)
+        groups64 = groups.to(torch.float64)
+        weighted_sse = (diff64.square() * weights).sum()
+        weighted_denom_raw = (groups64.square() * weights).sum()
+        weighted_denom = weighted_denom_raw.clamp_min(1e-30)
         weighted_mse = float(weighted_sse / weights.sum().clamp_min(1e-30))
         weighted_relative_mse = float(weighted_sse / weighted_denom)
+        weighted_sse_value = float(weighted_sse)
+        weighted_reference_sse_value = float(weighted_denom_raw)
+        weighted_weight_sum = float(weights.sum())
     dot = float((groups * recon).sum())
     norm = float(groups.square().sum().sqrt() * recon.square().sum().sqrt())
     zero_mask = groups == 0
@@ -458,6 +470,9 @@ def metrics_from_recon(
         "relative_mse": mse / denom,
         "weighted_mse": weighted_mse,
         "weighted_relative_mse": weighted_relative_mse,
+        "weighted_sse": weighted_sse_value,
+        "weighted_reference_sse": weighted_reference_sse_value,
+        "weighted_weight_sum": weighted_weight_sum,
         "max_abs_error": float(diff.abs().max()),
         "cosine_similarity": dot / norm if norm > 0 else 1.0,
         "saturation_rate": float(saturation),
@@ -712,7 +727,11 @@ def load_activation_stats(path: Path | None) -> dict[str, torch.Tensor]:
     stats: dict[str, torch.Tensor] = {}
     with safe_open(path, framework="pt", device="cpu") as handle:
         for key in handle.keys():
-            stats[key] = handle.get_tensor(key).to(torch.float32).flatten().contiguous()
+            # Preserve FP64 second moments emitted by the collector.  The
+            # quantizer's assignment path may still use FP32 internally, but
+            # the reported C0 numerator/denominator can then accumulate from
+            # the unrounded activation statistic.
+            stats[key] = handle.get_tensor(key).flatten().contiguous()
     return stats
 
 

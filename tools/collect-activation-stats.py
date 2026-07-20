@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -42,26 +44,61 @@ class ActivationAccumulator:
             max_abs=torch.zeros(features, dtype=torch.float32),
         )
 
-    def add(self, values: torch.Tensor) -> None:
-        flat = values.detach().reshape(-1, values.shape[-1]).to(torch.float32)
-        self.sum_sq += flat.square().sum(dim=0).to(torch.float64).cpu()
-        self.sum_abs += flat.abs().sum(dim=0).to(torch.float64).cpu()
-        self.max_abs = torch.maximum(self.max_abs, flat.abs().amax(dim=0).cpu())
+    def add(self, values: torch.Tensor, valid_token_mask: torch.Tensor | None = None) -> None:
+        if values.ndim < 2:
+            raise ValueError(f"activation must have at least 2 dimensions, got {tuple(values.shape)}")
+        flat = values.detach().reshape(-1, values.shape[-1])
+        if valid_token_mask is not None and values.ndim >= 3:
+            expected = values.shape[:-1]
+            if tuple(valid_token_mask.shape) != tuple(expected):
+                raise ValueError(
+                    f"attention mask shape {tuple(valid_token_mask.shape)} does not match activation prefix {tuple(expected)}"
+                )
+            flat = flat[valid_token_mask.detach().reshape(-1).to(dtype=torch.bool, device=flat.device)]
+        if flat.numel() == 0:
+            return
+        if not bool(torch.isfinite(flat).all()):
+            raise ValueError("non-finite activation encountered")
+        # Keep the reductions in FP64.  The stored moments retain that dtype so
+        # downstream quadratic forms need not start from a rounded accumulator.
+        flat64 = flat.to(torch.float64)
+        self.sum_sq += flat64.square().sum(dim=0).cpu()
+        self.sum_abs += flat64.abs().sum(dim=0).cpu()
+        self.max_abs = torch.maximum(self.max_abs, flat.abs().amax(dim=0).to(torch.float32).cpu())
         self.count += int(flat.shape[0])
 
     def second_moment(self) -> torch.Tensor:
         if self.count == 0:
             return torch.zeros_like(self.max_abs)
-        return (self.sum_sq / float(self.count)).to(torch.float32)
+        return self.sum_sq / float(self.count)
 
     def mean_abs(self) -> torch.Tensor:
         if self.count == 0:
             return torch.zeros_like(self.max_abs)
-        return (self.sum_abs / float(self.count)).to(torch.float32)
+        return self.sum_abs / float(self.count)
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def sha256_file(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_revision() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def iter_prompts(path: Path | None) -> Iterable[str]:
@@ -126,6 +163,7 @@ def register_hooks(
     model: torch.nn.Module,
     module_pattern: re.Pattern[str],
     max_modules: int | None,
+    active_attention_mask: dict[str, torch.Tensor | None],
 ) -> tuple[dict[str, ActivationAccumulator], list[torch.utils.hooks.RemovableHandle]]:
     accumulators: dict[str, ActivationAccumulator] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
@@ -139,7 +177,7 @@ def register_hooks(
                 return
             if int(values.shape[-1]) != in_features:
                 return
-            accumulators[name].add(values)
+            accumulators[name].add(values, active_attention_mask["value"])
 
         return hook
 
@@ -184,6 +222,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, default=None)
+    parser.add_argument("--corpus-manifest", type=Path, default=None)
+    parser.add_argument("--corpus-id", default=None)
+    parser.add_argument("--shard-id", default=None)
     parser.add_argument("--max-samples", type=int, default=4)
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--repeat-to-length", action="store_true")
@@ -199,6 +240,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-class", choices=("auto_model", "causal_lm"), default="auto_model")
     parser.add_argument("--dtype", choices=("auto", "float32", "bfloat16", "float16"), default="auto")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--require-cpu",
+        action="store_true",
+        help="Fail unless --device is exactly cpu; use for offline CPU-only measurement.",
+    )
+    parser.add_argument("--torch-threads", type=int, default=16)
+    parser.add_argument("--torch-interop-threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-id", default="activation-stats")
     parser.add_argument("--note", action="append", default=[])
@@ -213,13 +262,26 @@ def main() -> int:
         raise SystemExit("--sequence-length must be >= 1")
     if args.max_modules is not None and args.max_modules < 1:
         raise SystemExit("--max-modules must be >= 1")
+    if args.torch_threads < 1 or args.torch_interop_threads < 1:
+        raise SystemExit("--torch-threads and --torch-interop-threads must be >= 1")
+    if args.require_cpu and args.device != "cpu":
+        raise SystemExit("--require-cpu requires --device cpu")
 
     args.model_dir = args.model_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    args.prompt_file = args.prompt_file.expanduser().resolve() if args.prompt_file else None
+    args.corpus_manifest = args.corpus_manifest.expanduser().resolve() if args.corpus_manifest else None
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    torch.set_num_threads(args.torch_threads)
+    torch.set_num_interop_threads(args.torch_interop_threads)
+    torch.manual_seed(args.seed)
+
     tokenizer, model = load_transformers_model(args)
-    accumulators, handles = register_hooks(model, re.compile(args.module_pattern), args.max_modules)
+    active_attention_mask: dict[str, torch.Tensor | None] = {"value": None}
+    accumulators, handles = register_hooks(
+        model, re.compile(args.module_pattern), args.max_modules, active_attention_mask
+    )
     device = next(model.parameters()).device
     samples_seen = 0
     tokens_seen = 0
@@ -231,8 +293,12 @@ def main() -> int:
                     break
                 batch = encode_prompt(tokenizer, prompt, args.sequence_length, args.repeat_to_length)
                 batch = {key: value.to(device) for key, value in batch.items()}
-                if "input_ids" in batch:
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    tokens_seen += int(attention_mask.sum().item())
+                elif "input_ids" in batch:
                     tokens_seen += int(batch["input_ids"].numel())
+                active_attention_mask["value"] = attention_mask
                 try:
                     model(**batch, use_cache=False)
                 except TypeError as exc:
@@ -240,17 +306,23 @@ def main() -> int:
                         raise
                     model(**batch)
                 samples_seen += 1
+                active_attention_mask["value"] = None
     finally:
         for handle in handles:
             handle.remove()
 
     save_file(tensor_dict_for_output(accumulators), str(args.output_dir / "activation_second_moments.safetensors"))
     metadata = {
-        "schema_version": "aq-activation-stats-v0.1",
+        "schema_version": "aq-activation-stats-v0.2",
         "run_id": args.run_id,
         "timestamp_utc": utc_now(),
         "model_dir": str(args.model_dir),
-        "prompt_file": str(args.prompt_file.expanduser().resolve()) if args.prompt_file else None,
+        "prompt_file": str(args.prompt_file) if args.prompt_file else None,
+        "prompt_file_sha256": sha256_file(args.prompt_file),
+        "corpus_manifest": str(args.corpus_manifest) if args.corpus_manifest else None,
+        "corpus_manifest_sha256": sha256_file(args.corpus_manifest),
+        "corpus_id": args.corpus_id,
+        "shard_id": args.shard_id,
         "max_samples": args.max_samples,
         "samples_seen": samples_seen,
         "tokens_seen": tokens_seen,
@@ -261,6 +333,18 @@ def main() -> int:
         "model_class": args.model_class,
         "dtype": args.dtype,
         "device": str(device),
+        "require_cpu": args.require_cpu,
+        "torch_threads": args.torch_threads,
+        "torch_interop_threads": args.torch_interop_threads,
+        "seed": args.seed,
+        "git_revision": git_revision(),
+        "model_config_sha256": sha256_file(args.model_dir / "config.json"),
+        "model_weight_index_sha256": sha256_file(args.model_dir / "model.safetensors.index.json"),
+        "tokenizer_config_sha256": sha256_file(args.model_dir / "tokenizer_config.json"),
+        "chat_template_sha256": sha256_file(args.model_dir / "chat_template.jinja"),
+        "padding_mask_policy": "attention_mask filters [batch, sequence, hidden] pre-hook activations; this run uses one unpadded prompt per forward.",
+        "reduction_dtype": "float64",
+        "stored_second_moment_dtype": "float64",
         "notes": args.note,
         "modules": {
             name: {
