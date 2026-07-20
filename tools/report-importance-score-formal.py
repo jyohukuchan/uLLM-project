@@ -547,10 +547,9 @@ def load_and_join_prejoin_scores(
     rows_by_name = {str(row["hf_name"]): row for row in rows}
     if len(labels_by_name) != len(labels) or len(rows_by_name) != len(rows):
         raise ValueError("duplicate tensor name in prejoin score table or paired labels")
-    if set(labels_by_name) != set(rows_by_name):
+    if not set(labels_by_name).issubset(rows_by_name):
         missing = sorted(set(labels_by_name) - set(rows_by_name))
-        extra = sorted(set(rows_by_name) - set(labels_by_name))
-        raise ValueError(f"prejoin/label tensor set mismatch: missing={missing}, extra={extra}")
+        raise ValueError(f"eligible paired labels missing from prejoin score table: {missing}")
     expected_tensor_digest = hashlib.sha256(
         ("\n".join(sorted(rows_by_name)) + "\n").encode("utf-8")
     ).hexdigest()
@@ -558,8 +557,12 @@ def load_and_join_prejoin_scores(
         raise ValueError("prejoin tensor-name set hash differs from its receipt")
     if int(receipt.get("tensor_count", -1)) != len(rows):
         raise ValueError("prejoin tensor count differs from its receipt")
-    for name, row in rows_by_name.items():
-        label = labels_by_name[name]
+    joined_rows = []
+    for row in rows:
+        name = str(row["hf_name"])
+        label = labels_by_name.get(name)
+        if label is None:
+            continue
         label_shape = json.loads(label["shape"])
         if [int(value) for value in row["shape"]] != [int(value) for value in label_shape]:
             raise ValueError(f"prejoin/label shape mismatch for {name}")
@@ -589,9 +592,14 @@ def load_and_join_prejoin_scores(
                 "promoted": label["promoted"] == "true",
             }
         )
+        joined_rows.append(row)
     per_shard = json.loads(shard_scores_path.read_text(encoding="utf-8"))
     if not isinstance(per_shard, list) or len(per_shard) != 4:
         raise ValueError("prejoin shard-score table must contain exactly four shards")
+    per_shard = [
+        {name: value for name, value in shard.items() if name in labels_by_name}
+        for shard in per_shard
+    ]
     prejoin_audit = {
         "score_table_path": str(scores_path),
         "score_table_sha256": sha256_file(scores_path),
@@ -599,12 +607,15 @@ def load_and_join_prejoin_scores(
         "receipt_sha256": sha256_file(receipt_path),
         "shard_scores_path": str(shard_scores_path),
         "shard_scores_sha256": sha256_file(shard_scores_path),
-        "tensor_count": len(rows),
+        "source_score_tensor_count": len(rows),
+        "joined_eligible_tensor_count": len(joined_rows),
+        "unjoined_source_score_tensor_count": len(rows) - len(joined_rows),
+        "unjoined_source_score_tensor_names": sorted(set(rows_by_name) - set(labels_by_name)),
         "label_join_performed_after_receipt": True,
         "receipt_workspace_git_head": receipt.get("workspace_git_head"),
         "receipt_implementation_hashes": receipt.get("implementation_hashes"),
     }
-    return rows, per_shard, prejoin_audit
+    return joined_rows, per_shard, prejoin_audit
 
 
 def cluster_bootstrap(rows, score_columns, replicates, seed):

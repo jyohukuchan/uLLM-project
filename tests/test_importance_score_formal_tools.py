@@ -225,9 +225,22 @@ def test_prejoin_score_receipt_is_verified_before_label_join(tmp_path: Path) -> 
         "n_params": 4,
         "C0_I": 0.1,
     }
-    score_path.write_text(json.dumps(score_row, sort_keys=True) + "\n", encoding="utf-8")
+    extra_score_row = {
+        **score_row,
+        "hf_name": "model.layers.1.mlp.up_proj.weight",
+        "layer_id": 1,
+    }
+    score_path.write_text(
+        json.dumps(score_row, sort_keys=True)
+        + "\n"
+        + json.dumps(extra_score_row, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
     shard_path.write_text(json.dumps([{}, {}, {}, {}]), encoding="utf-8")
-    name_digest = hashlib.sha256((score_row["hf_name"] + "\n").encode()).hexdigest()
+    name_digest = hashlib.sha256(
+        ("\n".join(sorted((score_row["hf_name"], extra_score_row["hf_name"]))) + "\n").encode()
+    ).hexdigest()
     receipt_path.write_text(
         json.dumps(
             {
@@ -237,7 +250,7 @@ def test_prejoin_score_receipt_is_verified_before_label_join(tmp_path: Path) -> 
                 "score_table_sha256": tool.sha256_file(score_path),
                 "shard_scores_sha256": tool.sha256_file(shard_path),
                 "tensor_name_set_sha256": name_digest,
-                "tensor_count": 1,
+                "tensor_count": 2,
                 "workspace_git_head": "test",
                 "implementation_hashes": {},
             }
@@ -274,6 +287,7 @@ def test_prejoin_score_receipt_is_verified_before_label_join(tmp_path: Path) -> 
     assert rows[0]["promoted"] is True
     assert len(shards) == 4
     assert audit["label_join_performed_after_receipt"] is True
+    assert audit["unjoined_source_score_tensor_count"] == 1
 
 
 def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
