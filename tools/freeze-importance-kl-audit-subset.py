@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SCORES = ("C0_I", "C1_I", "S_AWQ_level", "S_AWQ_tail", "S_range")
+DEFAULT_SCORES = (
+    "C0_I",
+    "C1_I",
+    "C4_I",
+    "S_AWQ_level",
+    "S_AWQ_tail",
+    "S_range",
+)
 
 
 def canonical_json(value: Any) -> str:
