@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -342,3 +343,28 @@ def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) 
 
     assert audit["status"] == "order verified before invoking gguf-dump"
     assert audit["sealed_score_table_sha256"] == tool.sha256_file(score_path)
+
+
+def test_c1_accepts_single_file_source_roster_without_labels(tmp_path: Path) -> None:
+    tool = load_tool("score-block-covariance-c1.py", "test_c1_source_roster")
+    name = "model.language_model.layers.0.mlp.up_proj.weight"
+    save_file({name: torch.zeros((2, 2))}, str(tmp_path / "model.safetensors"))
+    roster_path = tmp_path / "roster.jsonl"
+    row = {
+        "model_id": "m",
+        "architecture": "a",
+        "layer_id": 0,
+        "canonical_family": "mlp_up",
+        "hf_name": name,
+        "shape": [2, 2],
+        "n_params": 4,
+    }
+    roster_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    assert tool.read_source_roster(roster_path) == [row]
+    assert tool.tensor_file_map(tmp_path)[name] == tmp_path / "model.safetensors"
+
+    row["qtype_ud"] = "Q5_K"
+    roster_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="forbidden label keys"):
+        tool.read_source_roster(roster_path)

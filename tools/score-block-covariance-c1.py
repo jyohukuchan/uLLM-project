@@ -38,6 +38,27 @@ def read_labels(path: Path) -> list[dict[str, str]]:
         return [row for row in csv.DictReader(handle, delimiter="\t") if row["eligible"] == "true"]
 
 
+def read_source_roster(path: Path) -> list[dict[str, Any]]:
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    forbidden = {
+        "gguf_name",
+        "qtype_ud",
+        "qtype_static",
+        "ordinal_ud",
+        "promotion_delta_ordinal",
+        "promotion_delta_bpp",
+        "promoted",
+    }
+    leaked = sorted({key for row in rows for key in forbidden if key in row})
+    if leaked:
+        raise ValueError(f"source roster contains forbidden label keys: {leaked}")
+    return rows
+
+
 def load_codebooks(path: Path) -> dict[tuple[str, str], torch.Tensor]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     result = {}
@@ -48,8 +69,20 @@ def load_codebooks(path: Path) -> dict[tuple[str, str], torch.Tensor]:
 
 
 def tensor_file_map(model_dir: Path) -> dict[str, Path]:
-    index = json.loads((model_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
-    return {name: model_dir / filename for name, filename in index["weight_map"].items()}
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        return {name: model_dir / filename for name, filename in index["weight_map"].items()}
+    result = {}
+    for path in sorted(model_dir.glob("*.safetensors")):
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                if name in result:
+                    raise ValueError(f"duplicate safetensor key: {name}")
+                result[name] = path
+    if not result:
+        raise FileNotFoundError(f"no safetensors weights under {model_dir}")
+    return result
 
 
 def load_merged_covariance(
@@ -166,7 +199,9 @@ def reconstruct_from_state(groups: torch.Tensor, state) -> torch.Tensor:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--labels", type=Path, required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--labels", type=Path)
+    selection.add_argument("--source-roster", type=Path)
     parser.add_argument("--activation-stats", type=Path, required=True)
     parser.add_argument("--family-codebooks", type=Path, required=True)
     parser.add_argument("--covariance-dir", action="append", type=Path, required=True)
@@ -190,7 +225,11 @@ def main() -> int:
     torch.set_num_threads(args.torch_threads)
     torch.set_num_interop_threads(args.torch_interop_threads)
     model_dir = args.model_dir.expanduser().resolve()
-    labels = read_labels(args.labels.expanduser().resolve())
+    labels = (
+        read_labels(args.labels.expanduser().resolve())
+        if args.labels
+        else read_source_roster(args.source_roster.expanduser().resolve())
+    )
     activation_stats = SAMPLER.load_activation_stats(args.activation_stats.expanduser().resolve())
     codebooks = load_codebooks(args.family_codebooks.expanduser().resolve())
     covariance_dirs = [path.expanduser().resolve() for path in args.covariance_dir]
@@ -284,7 +323,7 @@ def main() -> int:
                     "run_id": args.run_id,
                     "model_id": label["model_id"],
                     "hf_name": tensor_name,
-                    "gguf_name": label["gguf_name"],
+                    "gguf_name": label.get("gguf_name"),
                     "layer_id": int(label["layer_id"]),
                     "canonical_family": family,
                     "candidate_id": candidate.candidate_id,
