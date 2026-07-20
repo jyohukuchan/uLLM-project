@@ -263,6 +263,15 @@ def binary_metrics(rows: list[dict[str, Any]], score: str) -> dict[str, Any]:
         y = np.asarray([int(row["promoted"]) for row in members])
         values = np.asarray([float(row[score]) for row in members])
         if len(set(y.tolist())) == 2:
+            family_k = int(y.sum())
+            family_order = sorted(
+                range(len(members)),
+                key=lambda i: (
+                    -float(members[i][score]),
+                    hashlib.sha256(str(members[i]["hf_name"]).encode()).digest(),
+                ),
+            )
+            family_selected = family_order[:family_k]
             mixed.append(
                 {
                     "family": family,
@@ -270,6 +279,8 @@ def binary_metrics(rows: list[dict[str, Any]], score: str) -> dict[str, Any]:
                     "positives": int(y.sum()),
                     "roc_auc": float(roc_auc_score(y, values)),
                     "pr_auc": float(average_precision_score(y, values)),
+                    "Precision_at_K": float(y[family_selected].mean()),
+                    "Recall_at_K": float(y[family_selected].sum() / family_k),
                 }
             )
     y = np.asarray([int(row["promoted"]) for row in rows])
@@ -284,6 +295,13 @@ def binary_metrics(rows: list[dict[str, Any]], score: str) -> dict[str, Any]:
     )
     selected = order[:k]
     precision = float(y[selected].mean()) if selected else None
+    selected_parameter_count = sum(int(rows[index]["n_params"]) for index in selected)
+    selected_positive_parameter_count = sum(
+        int(rows[index]["n_params"]) for index in selected if bool(rows[index]["promoted"])
+    )
+    positive_parameter_count = sum(
+        int(row["n_params"]) for row in rows if bool(row["promoted"])
+    )
     prevalence = float(y.mean())
     threshold = prevalence + 0.25 * (1.0 - prevalence)
     global_mixed = len(set(y.tolist())) == 2
@@ -293,12 +311,33 @@ def binary_metrics(rows: list[dict[str, Any]], score: str) -> dict[str, Any]:
         "families": mixed,
         "AUC_within": float(np.mean([item["roc_auc"] for item in mixed])) if mixed else None,
         "PR_AUC_within": float(np.mean([item["pr_auc"] for item in mixed])) if mixed else None,
+        "Precision_at_family_K_macro": (
+            float(np.mean([item["Precision_at_K"] for item in mixed])) if mixed else None
+        ),
+        "Recall_at_family_K_macro": (
+            float(np.mean([item["Recall_at_K"] for item in mixed])) if mixed else None
+        ),
         "AUC_global_descriptive": float(roc_auc_score(y, values)) if global_mixed else None,
         "PR_AUC_global_descriptive": float(average_precision_score(y, values)) if global_mixed else None,
         "positive_count_K": k,
         "prevalence": prevalence,
         "Precision_at_K": precision,
         "Recall_at_K": float(y[selected].sum() / max(k, 1)),
+        "parameter_weighted_at_tensor_K": {
+            "selected_parameters": selected_parameter_count,
+            "selected_positive_parameters": selected_positive_parameter_count,
+            "all_positive_parameters": positive_parameter_count,
+            "Precision": (
+                selected_positive_parameter_count / selected_parameter_count
+                if selected_parameter_count
+                else None
+            ),
+            "Recall": (
+                selected_positive_parameter_count / positive_parameter_count
+                if positive_parameter_count
+                else None
+            ),
+        },
         "NDCG_at_K": (
             float(ndcg_score(y.reshape(1, -1), values.reshape(1, -1), k=k)) if k > 0 else None
         ),
@@ -316,22 +355,39 @@ def byte_matched_metrics(rows: list[dict[str, Any]], gain_column: str) -> dict[s
     candidates = []
     for row in rows:
         n = int(row["n_params"])
-        delta = math.ceil(5 * n / 8) - math.ceil(4 * n / 8)
+        payload_delta = math.ceil(5 * n / 8) - math.ceil(4 * n / 8)
         gain = float(row[gain_column])
-        candidates.append((gain / max(delta, 1), row, delta))
-    candidates.sort(
-        key=lambda item: (
-            -item[0],
-            hashlib.sha256(str(item[1]["hf_name"]).encode()).digest(),
-        )
-    )
+        if gain > 0:
+            candidates.append((row, payload_delta, gain))
     selected = []
     used = 0
-    for utility, row, delta in candidates:
-        if used + delta > budget:
-            continue
-        selected.append(row)
-        used += delta
+    activated_families: set[str] = set()
+    while candidates:
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                -item[2]
+                / (
+                    item[1]
+                    + (0 if item[0]["canonical_family"] in activated_families else 32)
+                ),
+                hashlib.sha256(str(item[0]["hf_name"]).encode()).digest(),
+            ),
+        )
+        chosen_index = None
+        for row, payload_delta, _gain in ranked:
+            charge = payload_delta + (
+                0 if row["canonical_family"] in activated_families else 32
+            )
+            if used + charge <= budget:
+                chosen_index = candidates.index((row, payload_delta, _gain))
+                selected.append(row)
+                used += charge
+                activated_families.add(str(row["canonical_family"]))
+                break
+        if chosen_index is None:
+            break
+        candidates.pop(chosen_index)
     positive_count = sum(bool(row["promoted"]) for row in rows)
     true_positive = sum(bool(row["promoted"]) for row in selected)
     return {
@@ -341,18 +397,27 @@ def byte_matched_metrics(rows: list[dict[str, Any]], gain_column: str) -> dict[s
         "selected_tensor_count": len(selected),
         "Precision": true_positive / len(selected) if selected else None,
         "Recall": true_positive / max(positive_count, 1),
-        "family_codebook_fixed_charge_note": (
-            "The 32-byte AQ5-vs-AQ4 codebook delta per activated family is omitted from U_t ordering; "
-            "it is negligible here but the final integer policy must include it exactly."
+        "activated_family_count": len(activated_families),
+        "family_codebook_increment_bytes_each": 32,
+        "zero_or_negative_gain_tensors_excluded": True,
+        "selection_method": (
+            "deterministic greedy gain/incremental-byte utility; incremental cost includes the 32-byte "
+            "AQ5-vs-AQ4 codebook charge when a family is first activated"
         ),
         "budget_definition": "sum_t promotion_delta_bpp*n_params/8, clipped at zero",
     }
 
 
 def direction_gate(family_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    defined = [row for row in family_rows if row["defined"]]
+    eligible = [
+        row
+        for row in family_rows
+        if int(row["n"]) >= 4 and bool(row["label_nonconstant"])
+    ]
+    defined = [row for row in eligible if row["defined"]]
+    positive_count = sum(float(row["tau_b"]) > 0 for row in defined)
     fraction = (
-        sum(float(row["tau_b"]) > 0 for row in defined) / len(defined) if defined else None
+        positive_count / len(eligible) if eligible else None
     )
     negatives = [
         row["family"]
@@ -360,11 +425,61 @@ def direction_gate(family_rows: list[dict[str, Any]]) -> dict[str, Any]:
         if int(row["n"]) >= 16 and float(row["tau_b"]) < -0.20
     ]
     return {
+        "label_nonconstant_family_count": len(eligible),
         "defined_family_count": len(defined),
+        "undefined_score_family_count": len(eligible) - len(defined),
+        "positive_tau_family_count": positive_count,
         "positive_tau_fraction": fraction,
         "major_family_tau_b_below_minus_0_20": negatives,
         "pass": fraction is not None and fraction >= 0.70 and not negatives,
     }
+
+
+def rank_metrics_against_target(
+    rows: list[dict[str, Any]], score: str, target: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    projected = []
+    for row in rows:
+        item = dict(row)
+        item["ordinal_ud"] = float(row[target])
+        projected.append(item)
+    families, summary = SCREEN.all_rank_metrics(projected, score)
+    score_id = f"{score}__vs__{target}"
+    for family in families:
+        family["score_id"] = score_id
+        family["target_id"] = target
+    summary["score_id"] = score
+    summary["target_id"] = target
+    summary["admission_use"] = "secondary descriptive only"
+    return families, summary
+
+
+def paired_cohort_audit(path: Path, eligible_count: int) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    pair = raw.get("paired_static_q4_k_m", {})
+    errors = list(pair.get("pairing_errors", []))
+    coverage = float(pair.get("eligible_coverage", 0.0))
+    paired_count = int(pair.get("eligible_paired_count", 0))
+    exact = bool(pair.get("cohort_metadata_exact_match", False))
+    result = {
+        "audit_path": str(path),
+        "audit_sha256": sha256_file(path),
+        "status": pair.get("status"),
+        "admission_use": pair.get("admission_use"),
+        "eligible_coverage": coverage,
+        "eligible_paired_count": paired_count,
+        "expected_eligible_count": eligible_count,
+        "cohort_metadata_exact_match": exact,
+        "pairing_errors": errors,
+    }
+    result["pass"] = (
+        coverage == 1.0
+        and paired_count == eligible_count
+        and exact
+        and not errors
+        and pair.get("admission_use") == "eligible"
+    )
+    return result
 
 
 def cluster_bootstrap(rows, score_columns, replicates, seed):
@@ -587,6 +702,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--labels", type=Path, required=True)
+    parser.add_argument("--label-audit-summary", type=Path, required=True)
     parser.add_argument("--combined-stats", type=Path, required=True)
     parser.add_argument("--shard-stats", type=Path, action="append", required=True)
     parser.add_argument("--c0-jsonl", type=Path, required=True)
@@ -609,6 +725,9 @@ def main() -> int:
     model_dir = args.model_dir.expanduser().resolve()
     labels_path = args.labels.expanduser().resolve()
     labels = read_labels(labels_path)
+    cohort = paired_cohort_audit(
+        args.label_audit_summary.expanduser().resolve(), len(labels)
+    )
     combined = SCREEN.load_stats(args.combined_stats.expanduser().resolve())
     shards = [SCREEN.load_stats(path.expanduser().resolve()) for path in args.shard_stats]
     c0 = parse_quantizer_rows(args.c0_jsonl.expanduser().resolve())
@@ -636,12 +755,24 @@ def main() -> int:
         "model_id": rows[0]["model_id"],
         "eligible_tensor_count": len(rows),
         "paired_labels_sha256": sha256_file(labels_path),
+        "paired_cohort_audit": cohort,
         "teacher_coverage": teacher_coverage(rows),
         "scores": {},
     }
     for score in full_scores:
         families, rank = SCREEN.all_rank_metrics(rows, score)
         family_rows.extend(families)
+        rank["secondary_targets"] = {}
+        for target in (
+            "packed_bpp_ud",
+            "promotion_delta_ordinal",
+            "promotion_delta_bpp",
+        ):
+            secondary_families, secondary = rank_metrics_against_target(
+                rows, score, target
+            )
+            family_rows.extend(secondary_families)
+            rank["secondary_targets"][target] = secondary
         rank["direction_gate"] = direction_gate(families)
         rank["binary"] = binary_metrics(rows, binary_score[score])
         if score in {"C0_I", "C1_I"}:
@@ -700,6 +831,7 @@ def main() -> int:
         binary = metrics["scores"][score]["binary"]
         ci = bootstrap[score]["rho_ci95_percentile"]
         qwen_side = {
+            "paired_same_cohort_coverage": cohort["pass"],
             "rho": primary["rho"] is not None and primary["rho"] >= 0.30,
             "tau_b": primary["tau_b"] is not None and primary["tau_b"] >= 0.20,
             "rho_ci_lower_positive": ci is not None and ci[0] > 0,

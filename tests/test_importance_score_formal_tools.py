@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -114,3 +115,46 @@ def test_single_safetensors_header_audit_without_index(tmp_path: Path) -> None:
 
     assert headers["model.layers.0.mlp.up_proj.weight"]["shape"] == [3, 4]
     assert headers["model.layers.0.mlp.up_proj.weight"]["dtype"] == "BF16"
+
+
+def test_direction_gate_counts_constant_score_as_not_positive() -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_formal_direction_gate")
+    families = [
+        {
+            "family": f"f{index}",
+            "n": 8,
+            "label_nonconstant": True,
+            "defined": index < 3,
+            "tau_b": 0.5 if index < 3 else None,
+        }
+        for index in range(5)
+    ]
+
+    result = tool.direction_gate(families)
+
+    assert result["defined_family_count"] == 3
+    assert result["positive_tau_fraction"] == 0.6
+    assert result["pass"] is False
+
+
+def test_paired_cohort_gate_requires_exact_full_pairing(tmp_path: Path) -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_formal_pair_audit")
+    path = tmp_path / "audit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "paired_static_q4_k_m": {
+                    "status": "paired_exact_tensor_name_and_shape",
+                    "admission_use": "eligible",
+                    "eligible_coverage": 1.0,
+                    "eligible_paired_count": 8,
+                    "cohort_metadata_exact_match": True,
+                    "pairing_errors": [],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert tool.paired_cohort_audit(path, 8)["pass"] is True
+    assert tool.paired_cohort_audit(path, 9)["pass"] is False
