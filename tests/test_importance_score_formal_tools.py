@@ -71,6 +71,53 @@ def test_perturbation_selection_rejects_label_or_score_columns(tmp_path: Path) -
         tool.load_selection(path)
 
 
+def test_perturbation_selection_accepts_source_roster_jsonl(tmp_path: Path) -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_perturbation_roster_selection"
+    )
+    path = tmp_path / "source-roster.jsonl"
+    rows = [
+        {
+            "model_id": "m",
+            "hf_name": f"model.layers.{index}.mlp.up_proj.weight",
+            "canonical_family": "mlp_up",
+            "layer_id": index,
+            "shape": [8, 8],
+        }
+        for index in range(2)
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    assert tool.load_selection(path) == rows
+
+
+def test_cached_c4_block_call_matches_reference_and_detects_perturbation() -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_cached_c4_block_call"
+    )
+    layer = torch.nn.Linear(2, 2, bias=False).eval()
+    with torch.no_grad():
+        layer.weight.copy_(torch.eye(2))
+    hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], dtype=torch.float32)
+    expected = layer(hidden).to(torch.bfloat16)
+    reference = {
+        "calls": {"layer": [((hidden.clone(),), {})]},
+        "outputs": {"layer": [expected.clone()]},
+    }
+    batches = [{"tensors": {"attention_mask": torch.tensor([[1, 1]])}}]
+
+    audit = tool.validate_c4_call_cache({"layer": layer}, reference, torch.device("cpu"))
+    assert audit["layer"]["relative_l2"] == 0.0
+
+    with torch.no_grad():
+        layer.weight[0, 0] += 1.0
+    metrics = tool.candidate_c4(
+        batches, "layer", layer, reference, torch.device("cpu")
+    )
+    assert metrics["C4_A"] > 0
+    assert metrics["valid_tokens"] == 2
+
+
 def test_kl_core_selection_does_not_depend_on_type_or_promotion_columns(tmp_path: Path) -> None:
     tool = load_tool("freeze-importance-score-cpu-subsets.py", "test_cpu_subset_freezer")
     fields = [
@@ -315,6 +362,12 @@ def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
             }
         },
     }
+    c4 = {
+        name: {
+            tool.LOW: {"metrics": {"C4_L": 0.2, "C4_A": 4.0}},
+            tool.HIGH: {"metrics": {"C4_L": 0.1, "C4_A": 2.0}},
+        }
+    }
     roster = [
         {
             "model_id": "m",
@@ -328,11 +381,14 @@ def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
     ]
 
     rows, per_shard = tool.score_features(
-        roster, tmp_path, stats, [stats] * 4, {name: candidates}, {}, {}, 4, 0
+        roster, tmp_path, stats, [stats] * 4, {name: candidates}, {}, c4, 4, 0
     )
 
     assert rows[0]["C0_I"] == 0.1
     assert rows[0]["C0_G"] == 1.0
+    assert rows[0]["C4_I"] == 0.2
+    assert rows[0]["C4_G"] == 2.0
+    assert "C4_I_subset" not in rows[0]
     assert "qtype_ud" not in rows[0]
     assert all(name in shard for shard in per_shard)
 
@@ -345,6 +401,8 @@ def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) 
         "build-importance-score-prejoin.py": "a",
         "report-importance-score-formal.py": "b",
         "run-aq-tensor-sample.py": "c",
+        "score-block-covariance-c1.py": "d",
+        "run-importance-single-tensor-perturbation.py": "e",
     }
     freeze_path = tmp_path / "qwen-candidate-freeze.json"
     freeze_path.write_text(

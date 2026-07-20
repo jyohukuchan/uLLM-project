@@ -22,6 +22,11 @@ FORMULAS = {
         "binary_ranking": "C1_G=max(0,A_C1(aq4)-A_C1(aq5))",
         "format_dependent": True,
     },
+    "C4_I": {
+        "definition": "L_C4(t, aq4_e4m3_g16_ts_flloyd16) on frozen D_block",
+        "binary_ranking": "C4_G=max(0,A_C4(aq4)-A_C4(aq5))",
+        "format_dependent": True,
+    },
     "S_AWQ_level": {
         "definition": "log(mean_j(E|x_j|)+1e-30)",
         "binary_ranking": "S_AWQ_level",

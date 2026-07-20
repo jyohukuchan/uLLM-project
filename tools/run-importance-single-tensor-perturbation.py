@@ -34,10 +34,6 @@ SAMPLER = load_tool("run-aq-tensor-sample.py", "importance_perturb_sampler")
 COLLECTOR = load_tool("collect-activation-stats.py", "importance_perturb_collector")
 
 
-class StopAfterTargetBlock(RuntimeError):
-    pass
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -63,8 +59,19 @@ def load_codebooks(path: Path) -> tuple[dict[tuple[str, str], torch.Tensor], str
 
 
 def load_selection(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list) or not payload:
+    if path.suffix == ".jsonl":
+        payload = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, list)
+        or not payload
+        or any(not isinstance(row, dict) for row in payload)
+    ):
         raise SystemExit("tensor selection must be a nonempty JSON list")
     forbidden = {
         "qtype_ud",
@@ -311,70 +318,141 @@ def run_model(model, tensors: dict[str, torch.Tensor]):
         return model(**tensors)
 
 
+def clone_call_value(value: Any) -> Any:
+    """Detach one captured block-call value from the full-model forward."""
+
+    if torch.is_tensor(value):
+        return value.detach().to("cpu").clone()
+    if isinstance(value, tuple):
+        return tuple(clone_call_value(item) for item in value)
+    if isinstance(value, list):
+        return [clone_call_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clone_call_value(item) for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"unsupported captured block-call value: {type(value).__name__}")
+
+
+def move_call_value(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(move_call_value(item, device) for item in value)
+    if isinstance(value, list):
+        return [move_call_value(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: move_call_value(item, device) for key, item in value.items()}
+    return value
+
+
 def reference_c4(model, batches, layer_modules: dict[str, torch.nn.Module], device: torch.device):
-    captured: dict[str, torch.Tensor] = {}
+    captured_outputs: dict[str, torch.Tensor] = {}
+    captured_calls: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
     references: dict[str, list[torch.Tensor]] = {name: [] for name in layer_modules}
+    calls: dict[str, list[tuple[tuple[Any, ...], dict[str, Any]]]] = {
+        name: [] for name in layer_modules
+    }
     handles = []
     for name, module in layer_modules.items():
+        def pre_hook(_module, args, kwargs, *, _name=name):
+            captured_calls[_name] = (
+                clone_call_value(args),
+                clone_call_value(kwargs),
+            )
+
         def hook(_module, _inputs, output, *, _name=name):
-            captured[_name] = hidden_from_output(output).detach().to("cpu", dtype=torch.bfloat16)
+            captured_outputs[_name] = (
+                hidden_from_output(output).detach().to("cpu", dtype=torch.bfloat16).clone()
+            )
+
+        handles.append(module.register_forward_pre_hook(pre_hook, with_kwargs=True))
         handles.append(module.register_forward_hook(hook))
     try:
         with torch.inference_mode():
             for batch in batches:
-                captured.clear()
+                captured_outputs.clear()
+                captured_calls.clear()
                 run_model(model, move_batch(batch, device))
-                if set(captured) != set(layer_modules):
-                    raise RuntimeError("reference block hook coverage is incomplete")
+                if set(captured_outputs) != set(layer_modules):
+                    raise RuntimeError("reference block output hook coverage is incomplete")
+                if set(captured_calls) != set(layer_modules):
+                    raise RuntimeError("reference block input hook coverage is incomplete")
                 for name in layer_modules:
-                    references[name].append(captured[name])
+                    references[name].append(captured_outputs[name])
+                    calls[name].append(captured_calls[name])
     finally:
         for handle in handles:
             handle.remove()
-    return references
+    return {"outputs": references, "calls": calls}
 
 
-def candidate_c4(model, batches, layer_name: str, layer_module, references, device: torch.device):
+def validate_c4_call_cache(layer_modules, reference, device: torch.device) -> dict[str, Any]:
+    """Prove that isolated blocks reproduce their captured reference outputs."""
+
+    result = {}
+    with torch.inference_mode():
+        for layer_name, layer_module in layer_modules.items():
+            numerator = 0.0
+            denominator = 0.0
+            max_abs = 0.0
+            calls = reference["calls"][layer_name]
+            outputs = reference["outputs"][layer_name]
+            for (args, kwargs), expected in zip(calls, outputs, strict=True):
+                actual = hidden_from_output(
+                    layer_module(
+                        *move_call_value(args, device),
+                        **move_call_value(kwargs, device),
+                    )
+                ).detach().to("cpu", dtype=torch.bfloat16)
+                diff = actual.to(torch.float64) - expected.to(torch.float64)
+                numerator += float(diff.square().sum())
+                denominator += float(expected.to(torch.float64).square().sum())
+                max_abs = max(max_abs, float(diff.abs().max()))
+            relative_l2 = math.sqrt(numerator / max(denominator, 1e-30))
+            if relative_l2 > 1e-7 or max_abs > 1e-6:
+                raise RuntimeError(
+                    f"cached C4 block call does not reproduce {layer_name}: "
+                    f"relative_l2={relative_l2}, max_abs={max_abs}"
+                )
+            result[layer_name] = {
+                "batch_count": len(calls),
+                "relative_l2": relative_l2,
+                "max_abs_error": max_abs,
+            }
+    return result
+
+
+def candidate_c4(batches, layer_name: str, layer_module, reference, device: torch.device):
     numerator = 0.0
     denominator = 0.0
     tokens = 0
-    captured: dict[str, torch.Tensor] = {}
-
-    def hook(_module, _inputs, output):
-        captured["value"] = hidden_from_output(output).detach().to("cpu", dtype=torch.bfloat16)
-        raise StopAfterTargetBlock()
-
-    handle = layer_module.register_forward_hook(hook)
-    try:
-        with torch.inference_mode():
-            for index, batch in enumerate(batches):
-                captured.clear()
-                tensors = move_batch(batch, device)
-                try:
-                    run_model(model, tensors)
-                except StopAfterTargetBlock:
-                    pass
-                candidate = captured.get("value")
-                if candidate is None:
-                    raise RuntimeError(f"candidate block hook did not run: {layer_name}")
-                reference = references[index]
-                mask = tensors.get("attention_mask")
-                if mask is None:
-                    valid = torch.ones(reference.shape[:-1], dtype=torch.bool)
-                else:
-                    valid = mask.to("cpu", dtype=torch.bool)
-                diff = candidate.to(torch.float64) - reference.to(torch.float64)
-                ref64 = reference.to(torch.float64)
-                numerator += float(diff.square().sum(dim=-1)[valid].sum())
-                denominator += float(ref64.square().sum(dim=-1)[valid].sum())
-                tokens += int(valid.sum())
-    finally:
-        handle.remove()
+    calls = reference["calls"][layer_name]
+    outputs = reference["outputs"][layer_name]
+    with torch.inference_mode():
+        for batch, (args, kwargs), expected in zip(batches, calls, outputs, strict=True):
+            candidate = hidden_from_output(
+                layer_module(
+                    *move_call_value(args, device),
+                    **move_call_value(kwargs, device),
+                )
+            ).detach().to("cpu", dtype=torch.bfloat16)
+            mask = batch["tensors"].get("attention_mask")
+            if mask is None:
+                valid = torch.ones(expected.shape[:-1], dtype=torch.bool)
+            else:
+                valid = mask.to("cpu", dtype=torch.bool)
+            diff = candidate.to(torch.float64) - expected.to(torch.float64)
+            ref64 = expected.to(torch.float64)
+            numerator += float(diff.square().sum(dim=-1)[valid].sum())
+            denominator += float(ref64.square().sum(dim=-1)[valid].sum())
+            tokens += int(valid.sum())
     return {
         "C4_A": numerator / max(tokens, 1),
         "C4_reference_energy": denominator / max(tokens, 1),
         "C4_L": numerator / max(denominator, 1e-30),
         "valid_tokens": tokens,
+        "execution": "isolated target block on cached BF16 reference block inputs",
     }
 
 
@@ -533,8 +611,10 @@ def main() -> int:
 
     if args.mode == "c4":
         reference = reference_c4(model, batches, layer_modules, device)
+        c4_cache_audit = validate_c4_call_cache(layer_modules, reference, device)
     else:
         reference = reference_c6(model, batches, device)
+        c4_cache_audit = {}
 
     completed = set()
     if args.output.is_file():
@@ -584,11 +664,10 @@ def main() -> int:
                 try:
                     metrics = (
                         candidate_c4(
-                            model,
                             batches,
                             layer_name,
                             layer_modules[layer_name],
-                            reference[layer_name],
+                            reference,
                             device,
                         )
                         if args.mode == "c4"
@@ -624,6 +703,7 @@ def main() -> int:
                     "reference_dtype": args.dtype,
                     "codebook_file_sha256": codebook_file_sha,
                     "activation_stats_sha256": stats_sha,
+                    "c4_reference_cache_audit": c4_cache_audit.get(layer_name),
                     "notes": args.note,
                 }
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")

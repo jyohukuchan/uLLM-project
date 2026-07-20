@@ -247,11 +247,11 @@ def score_features(
             raw_gain = float(low["C4_A"]) - float(high["C4_A"])
             row.update(
                 {
-                    "C4_I_subset": float(low["C4_L"]),
-                    "C4_A_low_subset": float(low["C4_A"]),
-                    "C4_A_high_subset": float(high["C4_A"]),
-                    "C4_raw_gain_subset": raw_gain,
-                    "C4_G_subset": max(0.0, raw_gain),
+                    "C4_I": float(low["C4_L"]),
+                    "C4_A_low": float(low["C4_A"]),
+                    "C4_A_high": float(high["C4_A"]),
+                    "C4_raw_gain": raw_gain,
+                    "C4_G": max(0.0, raw_gain),
                 }
             )
         rows.append(row)
@@ -833,7 +833,7 @@ def disagreement_rows(
                 "range_score": row["S_range"],
                 "diag_mse": row["C0_I"],
                 "block_cov_mse": row.get("C1_I"),
-                "block_output_mse": row.get("C4_I_subset"),
+                "block_output_mse": row.get("C4_I"),
                 "fisher": None,
                 "kl": kl.get("C6_L"),
                 "flip_rate": kl.get("top1_flip_rate"),
@@ -921,9 +921,12 @@ def main() -> int:
     full_scores = ["C0_I", "S_AWQ_level", "S_AWQ_tail", "S_range"]
     if all("C1_I" in row for row in rows):
         full_scores.append("C1_I")
+    if all("C4_I" in row for row in rows):
+        full_scores.append("C4_I")
     binary_score = {
         "C0_I": "C0_G",
         "C1_I": "C1_G",
+        "C4_I": "C4_G",
         "S_AWQ_level": "S_AWQ_level",
         "S_AWQ_tail": "S_AWQ_tail",
         "S_range": "S_range",
@@ -975,7 +978,7 @@ def main() -> int:
             rank["secondary_targets"][target] = secondary
         rank["direction_gate"] = direction_gate(families)
         rank["binary"] = binary_metrics(rows, binary_score[score])
-        if score in {"C0_I", "C1_I"}:
+        if score in {"C0_I", "C1_I", "C4_I"}:
             rank["binary"]["byte_matched"] = byte_matched_metrics(
                 rows, binary_score[score]
             )
@@ -1011,15 +1014,15 @@ def main() -> int:
     metrics["permutation"] = permutation
     metrics["KL_core"] = kl
 
-    c4_subset_rows = [row for row in rows if "C4_I_subset" in row]
-    if c4_subset_rows:
-        c4_families, c4_rank = SCREEN.all_rank_metrics(c4_subset_rows, "C4_I_subset")
+    c4_subset_rows = [row for row in rows if "C4_I" in row]
+    if c4_subset_rows and "C4_I" not in full_scores:
+        c4_families, c4_rank = SCREEN.all_rank_metrics(c4_subset_rows, "C4_I")
         c4_rank["coverage"] = {
             "tensor_count": len(c4_subset_rows),
             "eligible_tensor_fraction": len(c4_subset_rows) / len(rows),
             "admission_use": "descriptive subset only; not a full-coverage finalist",
         }
-        c4_rank["binary"] = binary_metrics(c4_subset_rows, "C4_G_subset")
+        c4_rank["binary"] = binary_metrics(c4_subset_rows, "C4_G")
         metrics["C4_subset"] = c4_rank
         family_rows.extend(c4_families)
 

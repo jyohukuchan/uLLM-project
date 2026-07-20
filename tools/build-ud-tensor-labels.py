@@ -230,6 +230,8 @@ def verify_lockbox_order(
         "build-importance-score-prejoin.py",
         "report-importance-score-formal.py",
         "run-aq-tensor-sample.py",
+        "score-block-covariance-c1.py",
+        "run-importance-single-tensor-perturbation.py",
     ):
         compared[name] = {
             "candidate_freeze": freeze_hashes.get(name),

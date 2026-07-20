@@ -221,6 +221,8 @@ def main() -> int:
                 "report-importance-score-formal.py",
                 "summarize-importance-score-screen.py",
                 "run-aq-tensor-sample.py",
+                "score-block-covariance-c1.py",
+                "run-importance-single-tensor-perturbation.py",
             )
         },
         "workspace_git_head": git_revision(),
