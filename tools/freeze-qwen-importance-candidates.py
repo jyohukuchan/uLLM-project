@@ -135,6 +135,7 @@ def main() -> int:
             for name in (
                 "build-importance-score-prejoin.py",
                 "report-importance-score-formal.py",
+                "report-importance-score-two-model.py",
                 "run-aq-tensor-sample.py",
                 "score-block-covariance-c1.py",
                 "run-importance-single-tensor-perturbation.py",

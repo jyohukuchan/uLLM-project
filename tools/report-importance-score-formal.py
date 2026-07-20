@@ -931,6 +931,12 @@ def main() -> int:
     family_rows = []
     metrics: dict[str, Any] = {
         "schema_version": "importance-score-formal-statistics-v0.1",
+        "implementation_hashes": {
+            "report-importance-score-formal.py": sha256_file(Path(__file__).resolve()),
+            "summarize-importance-score-screen.py": sha256_file(
+                Path(__file__).resolve().parent / "summarize-importance-score-screen.py"
+            ),
+        },
         "model_id": rows[0]["model_id"],
         "eligible_tensor_count": len(rows),
         "paired_labels_sha256": sha256_file(labels_path),

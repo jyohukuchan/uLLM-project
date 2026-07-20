@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -405,3 +406,22 @@ def test_c1_accepts_single_file_source_roster_without_labels(tmp_path: Path) -> 
     roster_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="forbidden label keys"):
         tool.read_source_roster(roster_path)
+
+
+def test_two_model_comparison_pairs_worst_model_bootstrap_draws() -> None:
+    tool = load_tool("report-importance-score-two-model.py", "test_two_model_report")
+    qwen = {
+        "left": {"rho": np.array([0.5, 0.6, 0.7])},
+        "right": {"rho": np.array([0.1, 0.2, 0.3])},
+    }
+    gemma = {
+        "left": {"rho": np.array([0.4, 0.5, 0.6])},
+        "right": {"rho": np.array([0.0, 0.1, 0.2])},
+    }
+
+    result = tool.paired_worst_model_difference(
+        qwen, gemma, "left", "right", "rho"
+    )
+
+    assert result["replicates"] == 3
+    assert result["left_strictly_better"] is True
