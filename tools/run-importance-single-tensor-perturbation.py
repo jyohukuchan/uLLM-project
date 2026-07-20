@@ -66,6 +66,19 @@ def load_selection(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list) or not payload:
         raise SystemExit("tensor selection must be a nonempty JSON list")
+    forbidden = {
+        "qtype_ud",
+        "qtype_static",
+        "ordinal_ud",
+        "ordinal_static",
+        "promotion_delta_ordinal",
+        "promotion_delta_bpp",
+        "promoted",
+        "candidate_score",
+    }
+    leaked = sorted({key for row in payload for key in forbidden if key in row})
+    if leaked:
+        raise SystemExit(f"tensor selection contains forbidden label/score keys: {leaked}")
     return payload
 
 
@@ -600,6 +613,8 @@ def main() -> int:
                     "quantized_cache": str(cache_path),
                     "prompt_file": str(args.prompt_file),
                     "prompt_file_sha256": sha256_file(args.prompt_file),
+                    "tensor_selection": str(args.tensor_selection),
+                    "tensor_selection_sha256": sha256_file(args.tensor_selection),
                     "record_count": len(examples),
                     "record_ids": [str(item["record_id"]) for item in examples],
                     "sequence_length": args.sequence_length,

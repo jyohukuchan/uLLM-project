@@ -47,6 +47,29 @@ def test_optimized_codebook_lookup_matches_lowest_index_argmin() -> None:
     assert torch.equal(tool.nearest_sorted_codebook(values, codebook), expected)
 
 
+def test_perturbation_selection_rejects_label_or_score_columns(tmp_path: Path) -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_perturbation_selection"
+    )
+    path = tmp_path / "selection.json"
+    source_only = [
+        {
+            "model_id": "m",
+            "hf_name": "model.layers.0.mlp.up_proj.weight",
+            "canonical_family": "mlp_up",
+            "layer_id": 0,
+            "shape": [8, 8],
+        }
+    ]
+    path.write_text(json.dumps(source_only), encoding="utf-8")
+    assert tool.load_selection(path) == source_only
+
+    source_only[0]["promotion_delta_ordinal"] = 1
+    path.write_text(json.dumps(source_only), encoding="utf-8")
+    with pytest.raises(SystemExit, match="forbidden label/score keys"):
+        tool.load_selection(path)
+
+
 def test_kl_core_selection_does_not_depend_on_type_or_promotion_columns(tmp_path: Path) -> None:
     tool = load_tool("freeze-importance-score-cpu-subsets.py", "test_cpu_subset_freezer")
     fields = [
