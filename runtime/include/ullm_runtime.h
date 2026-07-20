@@ -245,6 +245,27 @@ ullm_status ullm_runtime_aq4_matvec_wide_load_prototype_f32(
     ullm_runtime_buffer *output_buffer,
     ullm_runtime_stream *stream);
 
+/*
+ * Direct-only gfx1201 M=1 AQ4 experiment. It preserves the promoted uint4 packed-index loads,
+ * but fixes RPB=32 and reduces each row with a width-8 sub-wave shuffle. It has no CPU path or
+ * production-dispatch admission.
+ */
+ullm_status ullm_runtime_aq4_matvec_shuffle_prototype_f32(
+    const ullm_runtime_buffer *index_buffer,
+    const ullm_runtime_buffer *scale_buffer,
+    const ullm_runtime_buffer *codebook_buffer,
+    const ullm_runtime_buffer *scale_values_buffer,
+    const ullm_runtime_buffer *input_buffer,
+    const ullm_runtime_buffer *row_scale_buffer,
+    size_t scale_count,
+    size_t group_size,
+    float tensor_scale,
+    size_t row_scale_count,
+    size_t rows,
+    size_t cols,
+    ullm_runtime_buffer *output_buffer,
+    ullm_runtime_stream *stream);
+
 ullm_status ullm_runtime_aq4_matvec_batch_f32(
     const ullm_runtime_buffer *index_buffer,
     const ullm_runtime_buffer *scale_buffer,

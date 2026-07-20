@@ -639,16 +639,31 @@ extern "C" __global__ void ullm_aq4_row_f32_kernel(
     }
 
     static std::string aq4_matvec_kernel_source_for_arch(const std::string &arch) {
-        return aq4_rows_per_block_preamble(arch, "ULLM_AQ4_MATVEC_RPB") +
-               aq4_matvec_kernel_source();
+        const unsigned int rows_per_block =
+            aq4_rows_per_block_for_arch(arch, "ULLM_AQ4_MATVEC_RPB");
+        const std::string preamble = aq4_rows_per_block_preamble_for_rows(rows_per_block);
+        if (arch == "gfx1201" && rows_per_block == 32u) {
+            return preamble + aq4_matvec_kernel_source();
+        }
+        return preamble + aq4_matvec_wide_load_reference_kernel_source();
     }
 
-    // Isolated M=1 experiment. Unlike the scalar production kernel, each lane owns one
-    // 32-element chunk and obtains its sixteen packed AQ4 bytes with one uint4 load.
+    // Direct-only M=1 comparison. It compiles the retained wide-load rollback body under an
+    // isolated entry-point name.
     static std::string aq4_matvec_wide_load_prototype_kernel_source_for_arch(
         const std::string &arch) {
         return aq4_rows_per_block_preamble(arch, "ULLM_AQ4_MATVEC_RPB") +
                aq4_matvec_wide_load_prototype_kernel_source();
+    }
+
+    // Direct-only gfx1201 experiment. The production M=1 body uses RPB=32, so one wave32
+    // contains four independent 8-thread rows. Fix this candidate to that geometry and use
+    // width=8 shuffles so a row's reduction never reads a neighbouring row's partials.
+    static std::string aq4_matvec_shuffle_prototype_kernel_source_for_arch(
+        const std::string &arch) {
+        (void)arch;
+        return aq4_rows_per_block_preamble_for_rows(32u) +
+               aq4_matvec_shuffle_prototype_kernel_source();
     }
 
     static std::string aq4_matvec_batch_kernel_source_for_arch(const std::string &arch) {
@@ -941,9 +956,10 @@ extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
 )";
     }
 
-    // Production M=1 AQ4 matvec body. The host ABI and HIPRTC entry-point name remain unchanged,
-    // so resident decode continues through its existing direct aq4_matvec_f32 dispatch.
-    static const char *aq4_matvec_kernel_source() {
+    // Superseded LDS-reduction AQ4 matvec wide-load reference. It remains the rollback body and
+    // is used for every architecture or RPB outside the validated gfx1201 RPB=32 geometry.
+    // Retain this source for controlled rollback comparisons.
+    [[maybe_unused]] static const char *aq4_matvec_wide_load_reference_kernel_source() {
         return R"(
 // Validated Qwen3.5 AQ4 M=1 geometries have group8/group16 and complete 32-element chunks.
 // `uint4` is the same explicit 128-bit packed-AQ4 load type used by the Wide-K WMMA kernels.
@@ -1043,10 +1059,50 @@ extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
 )";
     }
 
+    // Production M=1 AQ4 matvec body. The host ABI and HIPRTC entry-point name remain unchanged,
+    // so resident decode continues through its existing direct aq4_matvec_f32 dispatch. It
+    // retains the wide-load traversal and changes only the RPB=32 per-row LDS tree to the
+    // validated gfx1201 width-8 sub-wave shuffle reduction.
+    static std::string aq4_matvec_kernel_source() {
+        std::string production = aq4_matvec_wide_load_reference_kernel_source();
+        const std::string lds_setup = R"(    const unsigned int partial_offset = row_in_block * threads_per_row;
+    __shared__ float partial[256];
+    float sum = 0.0f;)";
+        const std::string shuffle_setup = R"(    float sum = 0.0f;)";
+        const size_t setup_offset = production.find(lds_setup);
+        if (setup_offset == std::string::npos) {
+            return "";
+        }
+        production.replace(setup_offset, lds_setup.size(), shuffle_setup);
+
+        const std::string lds_tree = R"(    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            partial[partial_offset + lane] += partial[partial_offset + lane + offset];
+        }
+        __syncthreads();
+    }
+    if (lane == 0 && row < rows) {
+        float value = partial[partial_offset];)";
+        const std::string shuffle_reduction = R"(    // RPB=32 gives four rows per wave32. width=8 keeps each row's lanes isolated.
+    for (unsigned int offset = 4u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down(sum, offset, 8u);
+    }
+    if (lane == 0 && row < rows) {
+        float value = sum;)";
+        const size_t tree_offset = production.find(lds_tree);
+        if (tree_offset == std::string::npos) {
+            return "";
+        }
+        production.replace(tree_offset, lds_tree.size(), shuffle_reduction);
+        return production;
+    }
+
     // Keep the direct-only prototype ABI available for historical differential/timing comparison.
-    // It compiles the same validated body under its original, isolated entry-point name.
+    // It compiles the wide-load rollback body under its original, isolated entry-point name.
     static std::string aq4_matvec_wide_load_prototype_kernel_source() {
-        std::string source = aq4_matvec_kernel_source();
+        std::string source = aq4_matvec_wide_load_reference_kernel_source();
         constexpr const char production_name[] = "ullm_aq4_matvec_f32_kernel";
         const size_t name_offset = source.find(production_name);
         if (name_offset == std::string::npos) {
@@ -1056,6 +1112,22 @@ extern "C" __global__ void ullm_aq4_matvec_f32_kernel(
             name_offset,
             sizeof(production_name) - 1u,
             "ullm_aq4_matvec_wide_load_prototype_f32_kernel");
+        return source;
+    }
+
+    // Keep the direct-only prototype ABI available for historical differential/timing comparison.
+    // It compiles the same validated body under its original, isolated entry-point name.
+    static std::string aq4_matvec_shuffle_prototype_kernel_source() {
+        std::string source = aq4_matvec_kernel_source();
+        constexpr const char production_name[] = "ullm_aq4_matvec_f32_kernel";
+        const size_t name_offset = source.find(production_name);
+        if (name_offset == std::string::npos) {
+            return "";
+        }
+        source.replace(
+            name_offset,
+            sizeof(production_name) - 1u,
+            "ullm_aq4_matvec_shuffle_prototype_f32_kernel");
         return source;
     }
 
