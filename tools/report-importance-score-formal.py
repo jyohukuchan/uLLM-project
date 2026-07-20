@@ -943,6 +943,7 @@ def main() -> int:
         "paired_cohort_audit": cohort,
         "prejoin_audit": prejoin_audit,
         "teacher_coverage": teacher_coverage(rows),
+        "gain_fit_audit": {},
         "scores": {},
     }
     for score in full_scores:
@@ -978,6 +979,25 @@ def main() -> int:
             rank["binary"]["byte_matched"] = byte_matched_metrics(
                 rows, binary_score[score]
             )
+            prefix = score.removesuffix("_I")
+            raw_column = f"{prefix}_raw_gain"
+            negative = [
+                {
+                    "hf_name": row["hf_name"],
+                    "canonical_family": row["canonical_family"],
+                    "layer_id": row["layer_id"],
+                    "raw_gain": row[raw_column],
+                }
+                for row in rows
+                if float(row[raw_column]) < 0
+            ]
+            metrics["gain_fit_audit"][score] = {
+                "raw_gain_column": raw_column,
+                "negative_raw_gain_count": len(negative),
+                "negative_raw_gain_tensors": negative,
+                "clipped_gain_column": binary_score[score],
+                "interpretation": "negative raw gain is retained and treated as an AQ5 fit failure",
+            }
         metrics["scores"][score] = rank
 
     bootstrap_rows, bootstrap = cluster_bootstrap(
