@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -44,6 +45,10 @@ class Candidate:
     family_scale: str
     codebook_mode: str
     codebook_granularity: str = "per_tensor_sample"
+    index_bits: int = 4
+    codebook_entries: int = 16
+    codebook_storage_dtype: str = "bf16"
+    lloyd_iterations: int = 8
 
 
 @dataclass
@@ -72,6 +77,16 @@ ROUND1_CANDIDATES = [
     Candidate("aq4_e4m3_g16_ts_free16", "e4m3", 16, "bf16", "none", "free16"),
     Candidate("aq4_e4m3_g16_ts_zlloyd15", "e4m3", 16, "bf16", "none", "zero_lloyd15"),
     Candidate("aq4_e4m3_g16_ts_flloyd16", "e4m3", 16, "bf16", "none", "free_lloyd16"),
+    Candidate(
+        "aq5_e4m3_g16_ts_flloyd32",
+        "e4m3",
+        16,
+        "bf16",
+        "none",
+        "free_lloyd32",
+        index_bits=5,
+        codebook_entries=32,
+    ),
     Candidate("aq4_e4m3_g32_ts_zlloyd15", "e4m3", 32, "bf16", "none", "zero_lloyd15"),
     Candidate("aq4_e4m3_g32_ts_flloyd16", "e4m3", 32, "bf16", "none", "free_lloyd16"),
     Candidate("aq4_e4m3_g64_ts_flloyd16", "e4m3", 64, "bf16", "none", "free_lloyd16"),
@@ -85,7 +100,8 @@ ROUND1_CANDIDATES = [
 
 def candidate_from_id(candidate_id: str) -> Candidate | None:
     match = re.fullmatch(
-        r"aq4_(?P<scale>e8m0|u?e\d+m\d+)_g(?P<group>\d+)_(?:(?P<tensor_scale>ts)_)?(?P<codebook>zf15|zlloyd15|flloyd16|free16|sym7)",
+        r"aq(?P<index_bits>[45])_(?P<scale>e8m0|u?e\d+m\d+)_g(?P<group>\d+)_"
+        r"(?:(?P<tensor_scale>ts)_)?(?P<codebook>zf15|zlloyd15|flloyd16|flloyd32|free16|free32|sym7)",
         candidate_id,
     )
     if match is None:
@@ -94,16 +110,25 @@ def candidate_from_id(candidate_id: str) -> Candidate | None:
         "zf15": "zero_free15",
         "zlloyd15": "zero_lloyd15",
         "flloyd16": "free_lloyd16",
+        "flloyd32": "free_lloyd32",
         "free16": "free16",
+        "free32": "free32",
         "sym7": "symmetric7",
     }
+    index_bits = int(match.group("index_bits"))
+    codebook_token = match.group("codebook")
+    codebook_entries = 32 if codebook_token.endswith("32") else 16
+    if codebook_entries != 2**index_bits:
+        return None
     return Candidate(
         candidate_id=candidate_id,
         scale_format=match.group("scale"),
         group_size=int(match.group("group")),
         tensor_scale="bf16" if match.group("tensor_scale") else "none",
         family_scale="none",
-        codebook_mode=codebook_mode_by_token[match.group("codebook")],
+        codebook_mode=codebook_mode_by_token[codebook_token],
+        index_bits=index_bits,
+        codebook_entries=codebook_entries,
     )
 
 
@@ -222,8 +247,87 @@ def sample_groups_with_columns(
         ids = torch.arange(grouped.shape[0], dtype=torch.long)
         selected = grouped.contiguous()
     else:
-        ids = torch.randint(grouped.shape[0], (max_groups,), generator=generator)
+        offset = int(torch.randint(grouped.shape[0], (), generator=generator))
+        raw_step = int(torch.randint(1, grouped.shape[0] + 1, (), generator=generator))
+        step = coprime_step(grouped.shape[0], raw_step)
+        ids = affine_group_ids(grouped.shape[0], 0, max_groups, offset, step)
         selected = grouped.index_select(0, ids).contiguous()
+
+    columns = None
+    if tensor.ndim == 2:
+        cols = int(tensor.shape[1])
+        offsets = torch.arange(group_size, dtype=torch.long)
+        columns = (ids[:, None] * group_size + offsets[None, :]) % cols
+    return selected, columns
+
+
+def coprime_step(group_count: int, raw_step: int) -> int:
+    """Return a positive affine-permutation step coprime to ``group_count``."""
+
+    if group_count <= 1:
+        return 1
+    step = raw_step % group_count
+    if step == 0:
+        step = 1
+    while math.gcd(step, group_count) != 1:
+        step += 1
+        if step >= group_count:
+            step = 1
+    return step
+
+
+def affine_group_ids(
+    group_count: int,
+    start: int,
+    count: int,
+    offset: int,
+    step: int,
+) -> torch.Tensor:
+    positions = torch.arange(start, start + count, dtype=torch.long)
+    return (offset + positions * step).remainder(group_count)
+
+
+def deterministic_group_partition_with_columns(
+    tensor: torch.Tensor,
+    group_size: int,
+    max_elements: int,
+    *,
+    seed: int,
+    tensor_name: str,
+    partition: str,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Select disjoint deterministic fit/eval groups without replacement.
+
+    One affine permutation is keyed only by seed, tensor name, and group size,
+    so AQ4 and AQ5 see exactly the same fitting and evaluation groups.  The fit
+    range precedes the eval range in that permutation.  This avoids allocating
+    a full ``randperm`` for multi-million-group tensors.
+    """
+
+    if partition not in {"fit", "eval"}:
+        raise ValueError(f"unknown sample partition: {partition}")
+    flat = tensor.detach().flatten().to(torch.float32)
+    usable = (flat.numel() // group_size) * group_size
+    if usable == 0:
+        raise ValueError("tensor is smaller than one group")
+    grouped = flat[:usable].view(-1, group_size)
+    group_count = int(grouped.shape[0])
+    max_groups = max(1, max_elements // group_size)
+
+    if group_count == 1:
+        fit_count = eval_count = 1
+    else:
+        fit_count = min(max_groups, group_count // 2)
+        eval_count = min(max_groups, group_count - fit_count)
+    start = 0 if partition == "fit" else fit_count
+    count = fit_count if partition == "fit" else eval_count
+
+    key = f"aq-fit-eval-v1\0{seed}\0{tensor_name}\0{group_size}".encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    offset = int.from_bytes(digest[:8], "little") % group_count
+    step = coprime_step(group_count, int.from_bytes(digest[8:16], "little"))
+    ids = affine_group_ids(group_count, start, count, offset, step)
+    selected = grouped.index_select(0, ids).contiguous()
 
     columns = None
     if tensor.ndim == 2:
@@ -257,6 +361,10 @@ def codebook_from_normalized_values(
     norm: torch.Tensor,
     mode: str,
     weights: torch.Tensor | None = None,
+    *,
+    codebook_entries: int | None = None,
+    iterations: int = 8,
+    storage_dtype: str = "f32",
 ) -> torch.Tensor:
     if mode in {"zero_free15", "zero_lloyd15"}:
         nonzero = norm[norm.abs() > 0]
@@ -278,23 +386,65 @@ def codebook_from_normalized_values(
             pos = torch.quantile(abs_values, q).clamp_min(0)
         codebook = torch.cat([-pos.flip(0), torch.zeros(1), pos, torch.tensor([1.0])])
         codebook = codebook[:16].sort().values
-    elif mode in {"free16", "free_lloyd16"}:
-        q = torch.linspace(0.02, 0.98, 16)
+    elif re.fullmatch(r"free(?:_lloyd)?\d+", mode):
+        encoded_entries = int(re.search(r"\d+$", mode).group())
+        entries = codebook_entries if codebook_entries is not None else encoded_entries
+        if entries != encoded_entries:
+            raise ValueError(
+                f"codebook mode {mode} encodes {encoded_entries} entries, got {entries}"
+            )
+        q = torch.linspace(0.02, 0.98, entries)
         codebook = torch.quantile(norm, q).sort().values
-        if mode == "free_lloyd16":
-            codebook = lloyd_refine_codebook(norm, codebook, fixed_zero=False, weights=weights)
+        if mode.startswith("free_lloyd"):
+            codebook = lloyd_refine_codebook(
+                norm,
+                codebook,
+                fixed_zero=False,
+                weights=weights,
+                iterations=iterations,
+            )
     else:
         raise ValueError(f"unknown codebook mode: {mode}")
-    return codebook.to(torch.float32)
+    if codebook_entries is not None and codebook.numel() != codebook_entries:
+        raise ValueError(
+            f"codebook mode {mode} produced {codebook.numel()} entries, expected {codebook_entries}"
+        )
+    return round_tensor_to_storage(codebook, storage_dtype)
 
 
 def codebook_from_groups(
     groups: torch.Tensor,
     mode: str,
     group_weights: torch.Tensor | None = None,
+    *,
+    codebook_entries: int | None = None,
+    iterations: int = 8,
+    storage_dtype: str = "f32",
 ) -> torch.Tensor:
     values, weights = normalized_values_and_weights(groups, group_weights)
-    return codebook_from_normalized_values(values, mode, weights)
+    return codebook_from_normalized_values(
+        values,
+        mode,
+        weights,
+        codebook_entries=codebook_entries,
+        iterations=iterations,
+        storage_dtype=storage_dtype,
+    )
+
+
+def round_tensor_to_storage(values: torch.Tensor, storage_dtype: str) -> torch.Tensor:
+    values = values.to(torch.float32)
+    if storage_dtype in {"f32", "fp32", "float32"}:
+        return values
+    if storage_dtype in {"bf16", "bfloat16"}:
+        return values.to(torch.bfloat16).to(torch.float32)
+    if storage_dtype in {"f16", "fp16", "float16"}:
+        return values.to(torch.float16).to(torch.float32)
+    raise ValueError(f"unsupported storage dtype: {storage_dtype}")
+
+
+def round_scalar_to_storage(value: float, storage_dtype: str) -> float:
+    return float(round_tensor_to_storage(torch.tensor([value]), storage_dtype)[0])
 
 
 def lloyd_refine_codebook(
@@ -340,9 +490,7 @@ def build_family_codebooks(
     activation_stats: dict[str, torch.Tensor],
 ) -> dict[tuple[str, str], torch.Tensor]:
     result: dict[tuple[str, str], torch.Tensor] = {}
-    for candidate_index, candidate in enumerate(candidates):
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(args.seed + 100_000 + candidate_index)
+    for candidate in candidates:
         family_values: dict[str, list[torch.Tensor]] = defaultdict(list)
         family_weights: dict[str, list[torch.Tensor]] = defaultdict(list)
         for tensor_name, path in tensors:
@@ -352,11 +500,13 @@ def build_family_codebooks(
             if tensor.ndim < 2 or not tensor.is_floating_point():
                 continue
             tensor_shape = tuple(int(dim) for dim in tensor.shape)
-            groups, columns = sample_groups_with_columns(
+            groups, columns = deterministic_group_partition_with_columns(
                 tensor,
                 candidate.group_size,
                 args.max_elements_per_tensor,
-                generator,
+                seed=args.seed,
+                tensor_name=tensor_name,
+                partition="fit",
             )
             group_weights = None
             if args.weighted_codebook:
@@ -379,6 +529,9 @@ def build_family_codebooks(
                 values,
                 candidate.codebook_mode,
                 weights,
+                codebook_entries=candidate.codebook_entries,
+                iterations=candidate.lloyd_iterations,
+                storage_dtype=candidate.codebook_storage_dtype,
             )
     return result
 
@@ -397,7 +550,7 @@ def choose_tensor_scale(groups: torch.Tensor, candidate: Candidate, scales: torc
     tensor_scale = float(target.median()) / scale_median
     if not math.isfinite(tensor_scale) or tensor_scale <= 0:
         return 1.0
-    return tensor_scale
+    return round_scalar_to_storage(tensor_scale, candidate.tensor_scale)
 
 
 def nearest_scale_indices(target: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -462,7 +615,7 @@ def metrics_from_recon(
     max_scale = float(scales[-1])
     min_scale = float(scales[0])
     saturation = ((best_scale == max_scale) | (best_scale == min_scale)).to(torch.float32).mean()
-    effective_bpp = 4.0 + 8.0 / candidate.group_size
+    effective_bpp = float(candidate.index_bits) + 8.0 / candidate.group_size
 
     return {
         "effective_bpp": effective_bpp,
@@ -489,6 +642,7 @@ def evaluate_candidate(
     candidate: Candidate,
     scale_window: int,
     codebook_override: torch.Tensor | None = None,
+    tensor_scale_override: float | None = None,
     group_weights: torch.Tensor | None = None,
     weighted_scale_search: bool = False,
     weighted_codebook: bool = False,
@@ -496,11 +650,27 @@ def evaluate_candidate(
 ) -> dict[str, float | int | str | None]:
     scales = scale_values(candidate.scale_format)
     if codebook_override is not None:
-        codebook = codebook_override
+        codebook = round_tensor_to_storage(codebook_override, candidate.codebook_storage_dtype)
     else:
         codebook_weights = group_weights if weighted_codebook else None
-        codebook = codebook_from_groups(groups, candidate.codebook_mode, codebook_weights)
-    tensor_scale = choose_tensor_scale(groups, candidate, scales, codebook)
+        codebook = codebook_from_groups(
+            groups,
+            candidate.codebook_mode,
+            codebook_weights,
+            codebook_entries=candidate.codebook_entries,
+            iterations=candidate.lloyd_iterations,
+            storage_dtype=candidate.codebook_storage_dtype,
+        )
+    if codebook.numel() != candidate.codebook_entries:
+        raise ValueError(
+            f"candidate {candidate.candidate_id} requires {candidate.codebook_entries} codebook entries, "
+            f"got {codebook.numel()}"
+        )
+    tensor_scale = (
+        choose_tensor_scale(groups, candidate, scales, codebook)
+        if tensor_scale_override is None
+        else round_scalar_to_storage(tensor_scale_override, candidate.tensor_scale)
+    )
     scaled_groups = groups / tensor_scale
     max_code = codebook.abs().max().clamp_min(1e-12)
     target_scale = scaled_groups.abs().amax(dim=1) / max_code
@@ -621,12 +791,12 @@ def row_for_result(
         },
         "candidate": {
             "candidate_id": candidate.candidate_id,
-            "index_bits": 4,
+            "index_bits": candidate.index_bits,
             "codebook": {
                 "mode": candidate.codebook_mode,
-                "storage_dtype": "bf16",
+                "storage_dtype": candidate.codebook_storage_dtype,
                 "granularity": args.codebook_granularity,
-                "entry_count": 16,
+                "entry_count": candidate.codebook_entries,
             },
             "scale": {
                 "format": candidate.scale_format,
@@ -643,6 +813,7 @@ def row_for_result(
                 "weighted_scale_search": args.weighted_scale_search,
                 "weighted_codebook": args.weighted_codebook,
                 "scale_search": f"nearest_plus_minus_{args.scale_window}",
+                "lloyd_iterations": candidate.lloyd_iterations,
                 "codebook_update": (
                     "weighted_lloyd"
                     if args.weighted_codebook and "lloyd" in candidate.codebook_mode
@@ -661,6 +832,7 @@ def row_for_result(
             "torch_interop_threads": args.torch_interop_threads,
             "activation_stats": str(args.activation_stats) if args.activation_stats else None,
             "sampling_policy": "shared_by_block_size",
+            "fit_eval_split": "disjoint_deterministic_affine_group_partition_v1",
             "candidate_order": "scale_dominance_first",
             "monotonic_floor": "enabled_for_dominated_unsigned_em_scale_formats",
         },
@@ -827,8 +999,6 @@ def main() -> int:
         family_codebooks = build_family_codebooks(args, tensors, candidates, activation_stats)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(args.seed)
 
     with args.output.open("a", encoding="utf-8") as output:
         for tensor_name, path in tensors:
@@ -839,7 +1009,7 @@ def main() -> int:
             tensor_dtype = str(tensor.dtype).replace("torch.", "")
             if tensor.ndim < 2 or not tensor.is_floating_point():
                 continue
-            sample_cache: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
+            sample_cache: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor | None]] = {}
             evaluation_states: list[EvaluationState] = []
             activation_second_moment = None
             activation_stats_error: Exception | None = None
@@ -852,30 +1022,69 @@ def main() -> int:
                 try:
                     if activation_stats_error is not None:
                         raise activation_stats_error
-                    cached = sample_cache.get(candidate.group_size)
-                    if cached is None:
-                        cached = sample_groups_with_columns(
+                    fit_key = (candidate.group_size, "fit")
+                    fit_cached = sample_cache.get(fit_key)
+                    if fit_cached is None:
+                        fit_cached = deterministic_group_partition_with_columns(
                             tensor,
                             candidate.group_size,
                             args.max_elements_per_tensor,
-                            generator,
+                            seed=args.seed,
+                            tensor_name=tensor_name,
+                            partition="fit",
                         )
-                        sample_cache[candidate.group_size] = cached
-                    groups, columns = cached
+                        sample_cache[fit_key] = fit_cached
+                    fit_groups, fit_columns = fit_cached
+
+                    eval_key = (candidate.group_size, "eval")
+                    eval_cached = sample_cache.get(eval_key)
+                    if eval_cached is None:
+                        eval_cached = deterministic_group_partition_with_columns(
+                            tensor,
+                            candidate.group_size,
+                            args.max_elements_per_tensor,
+                            seed=args.seed,
+                            tensor_name=tensor_name,
+                            partition="eval",
+                        )
+                        sample_cache[eval_key] = eval_cached
+                    groups, columns = eval_cached
+
+                    fit_group_weights = None
                     group_weights = None
                     if activation_second_moment is not None:
-                        if columns is None:
+                        if fit_columns is None or columns is None:
                             raise ValueError(f"cannot apply activation stats to non-2D tensor {tensor_name}")
+                        fit_group_weights = activation_second_moment.index_select(
+                            0, fit_columns.flatten()
+                        ).view_as(fit_groups)
                         group_weights = activation_second_moment.index_select(0, columns.flatten()).view_as(groups)
                     codebook_override = family_codebooks.get((family, candidate.candidate_id))
+                    if codebook_override is None:
+                        codebook_weights = fit_group_weights if args.weighted_codebook else None
+                        codebook_override = codebook_from_groups(
+                            fit_groups,
+                            candidate.codebook_mode,
+                            codebook_weights,
+                            codebook_entries=candidate.codebook_entries,
+                            iterations=candidate.lloyd_iterations,
+                            storage_dtype=candidate.codebook_storage_dtype,
+                        )
+                    tensor_scale_override = choose_tensor_scale(
+                        fit_groups,
+                        candidate,
+                        scale_values(candidate.scale_format),
+                        codebook_override,
+                    )
                     metrics = evaluate_candidate(
                         groups,
                         candidate,
                         args.scale_window,
                         codebook_override,
+                        tensor_scale_override,
                         group_weights=group_weights,
                         weighted_scale_search=args.weighted_scale_search,
-                        weighted_codebook=args.weighted_codebook,
+                        weighted_codebook=False,
                         floor_states=evaluation_states,
                     )
                     evaluation_state = metrics.pop("_evaluation_state", None)

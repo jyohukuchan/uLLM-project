@@ -8,7 +8,7 @@
 
 ## Importance-score selection progress
 
-- Phase 0--2のQwen CPU-only provisional screenを完了した。registry commitは`49fceeeb`、UD label auditは427 GGUF tensor/200 eligible core tensor、C0/C2/C3は200/200 coverageである。
-- 同一cohort Q4_K_Mはlocalに無く、pairing・AUC/Precision@KはHOLD。AQ4/AQ5 storage contractも未完了のためgain/allocationは開始していない。
-- D_statsは32 prompt/3,416 valid tokenのpilotであり、formal 256k mixed-domain corpusではない。Gemma、GPU、service/systemd、新規downloadは未実行である。
-- 詳細は`benchmarks/results/2026-07-21/aq/importance-score/`のrun artifactと`journal/2026/07/21/importance-score-qwen-phase0-2-cpu-pilot.md`に記録した。
+- AQ5をAQ4と同じBF16 family-codebook/E4M3-like group-scale/tensor-scale構造の5-bit/32-entry候補としてCPU sampler/exporterへ実装した。AQ4/AQ5はdisjoint deterministic fit/evalとなり、synthetic testと実Qwen tensor smokeが成功した。
+- Qwen same-revision Q4_K_M（5.68 GB）とGemma E4B BF16（15.99 GB）、同revision UD/static GGUF（計10.10 GB）を取得し、全取得ファイルのSHA-256がHugging Face LFS SHAと一致した。Gemma UDはQ4_K/Q5_K/Q6_K混在で、E4B lockboxのまま進められる。
+- UltraChat、MBPP、JParaCrawl、GSM8K、FineWebを混ぜた正式raw corpusをhash選択でfreezeした。D_statsは2,400 recordsでQwen 267,068 / Gemma 267,794 valid tokens、D_blockはQwen 14,040 / Gemma 14,093、D_KLはQwen 7,032 / Gemma 7,033 tokensである。32-prompt pilotとは混ぜない。
+- Qwen UD/staticは427 tensorで名前・shapeが完全一致し、eligible core 200/200のpaired coverageを確認した。Qwenの正式score計測は次で、Gemmaのtensor labelとのjoinはQwen candidate freeze後まで行わない。

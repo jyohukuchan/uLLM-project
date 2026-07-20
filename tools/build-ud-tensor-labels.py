@@ -2,9 +2,11 @@
 """Build and audit Qwen3.5-9B Unsloth Dynamic tensor labels read-only.
 
 The script consumes ``gguf-dump --json`` and safetensors headers only.  It
-never dequantizes GGUF payloads, modifies model files, or downloads a static
-baseline.  A missing same-cohort Q4_K_M is recorded as an explicit pairing
-failure rather than converted into an admission-gate binary label.
+never dequantizes GGUF payloads or modifies model files.  When an explicit
+same-cohort Q4_K_M is supplied, tensor names and shapes are paired exactly and
+the ordinal/bpp promotion deltas are emitted.  A missing or mismatched baseline
+is recorded as an explicit pairing failure rather than silently replaced by a
+fallback label.
 """
 
 from __future__ import annotations
@@ -165,6 +167,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-id", default="qwen3.5-9b")
     parser.add_argument("--gguf-dump", type=Path, default=Path("/home/homelab1/hf_venv/bin/gguf-dump"))
+    parser.add_argument(
+        "--static-gguf-path",
+        type=Path,
+        help="Explicit same-repository/revision Q4_K_M baseline; no heuristic candidate is auto-selected.",
+    )
     parser.add_argument("--static-search-root", type=Path, default=Path("/home/homelab1/datapool/ai_models"))
     return parser.parse_args()
 
@@ -186,6 +193,28 @@ def main() -> int:
     )
     gguf = json.loads(dumped.stdout)
     tensors: dict[str, dict[str, Any]] = gguf["tensors"]
+    static_path = args.static_gguf_path.expanduser().resolve() if args.static_gguf_path else None
+    static_tensors: dict[str, dict[str, Any]] | None = None
+    static_pair_errors: list[str] = []
+    if static_path is not None:
+        if not static_path.is_file():
+            raise SystemExit(f"missing explicit static GGUF: {static_path}")
+        static_dumped = subprocess.run(
+            [str(gguf_dump), "--json", str(static_path)], check=True, text=True, capture_output=True
+        )
+        static_gguf = json.loads(static_dumped.stdout)
+        static_tensors = static_gguf["tensors"]
+        missing_in_static = sorted(set(tensors) - set(static_tensors))
+        extra_in_static = sorted(set(static_tensors) - set(tensors))
+        if missing_in_static:
+            static_pair_errors.append(f"missing_tensor_names:{len(missing_in_static)}")
+        if extra_in_static:
+            static_pair_errors.append(f"extra_tensor_names:{len(extra_in_static)}")
+        for name in sorted(set(tensors) & set(static_tensors)):
+            if [int(value) for value in tensors[name]["shape"]] != [
+                int(value) for value in static_tensors[name]["shape"]
+            ]:
+                static_pair_errors.append(f"shape_mismatch:{name}")
     hf_headers = load_safetensor_headers(model_dir)
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     text_config = config.get("text_config", {})
@@ -251,6 +280,19 @@ def main() -> int:
             eligible = True
             exclusion = ""
 
+        static_info = static_tensors.get(gguf_name) if static_tensors is not None else None
+        static_qtype = str(static_info["type"]) if static_info is not None else UNKNOWN
+        static_ordinal = ORDINAL.get(static_qtype, UNKNOWN)
+        static_bpp = PACKED_BPP.get(static_qtype, UNKNOWN)
+        pairable = (
+            static_tensors is not None
+            and not static_pair_errors
+            and static_info is not None
+            and qtype in ORDINAL
+            and static_qtype in ORDINAL
+        )
+        delta_ordinal = ORDINAL[qtype] - int(static_ordinal) if pairable else UNKNOWN
+        delta_bpp = PACKED_BPP[qtype] - float(static_bpp) if pairable else UNKNOWN
         label = {
             "model_id": args.model_id,
             "architecture": architecture,
@@ -261,18 +303,18 @@ def main() -> int:
             "shape": shape_json(hf_shape if hf_shape is not None else gguf_shape),
             "n_params": int(__import__("math").prod(hf_shape if hf_shape is not None else gguf_shape)),
             "qtype_ud": qtype,
-            "qtype_static": UNKNOWN,
+            "qtype_static": static_qtype,
             "ordinal_ud": ORDINAL.get(qtype, UNKNOWN),
-            "ordinal_static": UNKNOWN,
+            "ordinal_static": static_ordinal,
             "packed_bpp_ud": PACKED_BPP.get(qtype, UNKNOWN),
-            "packed_bpp_static": UNKNOWN,
-            "promotion_delta_ordinal": UNKNOWN,
-            "promotion_delta_bpp": UNKNOWN,
-            "promoted": UNKNOWN,
+            "packed_bpp_static": static_bpp,
+            "promotion_delta_ordinal": delta_ordinal,
+            "promotion_delta_bpp": delta_bpp,
+            "promoted": (delta_ordinal > 0) if pairable else UNKNOWN,
             "eligible": eligible,
             "exclusion_reason": exclusion,
             "promoted_vs_4bit_floor": fallback_label(qtype),
-            "label_mode": "unpaired_fallback_exploratory",
+            "label_mode": "paired_same_cohort_q4_k_m" if pairable else "unpaired_fallback_exploratory",
             "gguf_shape_ne": shape_json(gguf_shape),
             "hf_shape": shape_json(hf_shape),
             "shape_status": shape_state,
@@ -368,10 +410,26 @@ def main() -> int:
         "eligible_core_count": len(eligible),
         "eligible_core_family_counts": dict(sorted(Counter(str(row["canonical_family"]) for row in eligible).items())),
         "paired_static_q4_k_m": {
-            "status": "not_found_local; paired analysis skipped; no download attempted",
+            "status": (
+                "paired_exact_tensor_name_and_shape"
+                if static_tensors is not None and not static_pair_errors
+                else ("pairing_failed" if static_tensors is not None else "not_supplied")
+            ),
+            "explicit_path": str(static_path) if static_path is not None else None,
             "search_root": str(static_root),
             "candidates": static,
-            "admission_use": "HOLD: binary teacher incomplete"
+            "pairing_errors": static_pair_errors,
+            "eligible_paired_count": sum(
+                1 for row in eligible if row["label_mode"] == "paired_same_cohort_q4_k_m"
+            ),
+            "eligible_coverage": (
+                sum(1 for row in eligible if row["label_mode"] == "paired_same_cohort_q4_k_m") / len(eligible)
+                if eligible else 0.0
+            ),
+            "admission_use": (
+                "eligible" if eligible and all(row["label_mode"] == "paired_same_cohort_q4_k_m" for row in eligible)
+                else "HOLD: paired binary teacher incomplete"
+            ),
         },
         "fallback": {
             "name": "promoted_vs_4bit_floor",

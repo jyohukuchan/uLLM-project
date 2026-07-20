@@ -181,9 +181,7 @@ def build_family_codebooks(
     source_elements: dict[tuple[str, str], int] = defaultdict(int)
     fallbacks: list[dict[str, str]] = []
 
-    for candidate_index, candidate in enumerate(candidates):
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(args.seed + 100_000 + candidate_index)
+    for candidate in candidates:
         scope_values: dict[str, list[torch.Tensor]] = defaultdict(list)
         scope_weights: dict[str, list[torch.Tensor]] = defaultdict(list)
         scope_missing_stats: set[str] = set()
@@ -199,16 +197,18 @@ def build_family_codebooks(
             if tensor.ndim < 2 or not tensor.is_floating_point():
                 continue
             tensor_shape = tuple(int(dim) for dim in tensor.shape)
-            groups, columns = sampler.sample_groups_with_columns(
+            groups, columns = sampler.deterministic_group_partition_with_columns(
                 tensor,
                 candidate.group_size,
                 args.max_elements_per_tensor,
-                generator,
+                seed=args.seed,
+                tensor_name=tensor_ref.name,
+                partition="fit",
             )
             group_weights = None
             if args.weighted_codebook:
                 if columns is None:
-                    raise ValueError(f"cannot apply activation stats to non-2D tensor {tensor_name}")
+                    raise ValueError(f"cannot apply activation stats to non-2D tensor {tensor_ref.name}")
                 try:
                     activation_second_moment = sampler.activation_stats_for_tensor(
                         tensor_ref.name,
@@ -256,6 +256,9 @@ def build_family_codebooks(
                 values,
                 candidate.codebook_mode,
                 weights,
+                codebook_entries=candidate.codebook_entries,
+                iterations=candidate.lloyd_iterations,
+                storage_dtype=candidate.codebook_storage_dtype,
             )
             weighting[key] = weight_mode
             families[key] = scope_families[scope]
@@ -316,6 +319,14 @@ def main() -> int:
             "family": family,
             "candidate_id": candidate_id,
             "entry_count": len(values),
+            "index_bits": next(
+                candidate.index_bits for candidate in candidates if candidate.candidate_id == candidate_id
+            ),
+            "storage_dtype": next(
+                candidate.codebook_storage_dtype
+                for candidate in candidates
+                if candidate.candidate_id == candidate_id
+            ),
             "weighting": weighting[(scope, candidate_id)],
             "values_f32": values,
             "min": min(values),
@@ -340,6 +351,7 @@ def main() -> int:
         "activation_weighting_fallbacks": fallbacks,
         "seed": args.seed,
         "max_elements_per_tensor": args.max_elements_per_tensor,
+        "fit_sample_policy": "deterministic_affine_group_partition_v1; fit half only",
         "max_tensors": max_tensors,
         "max_tensors_per_family": max_tensors_per_family,
         "family_filter": args.family,

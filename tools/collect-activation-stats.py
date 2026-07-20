@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -101,14 +102,31 @@ def git_revision() -> str | None:
         return None
 
 
-def iter_prompts(path: Path | None) -> Iterable[str]:
+def iter_examples(path: Path | None) -> Iterable[dict]:
     if path is None:
-        yield from DEFAULT_PROMPTS
+        for index, prompt in enumerate(DEFAULT_PROMPTS):
+            yield {"record_id": f"default-{index:04d}", "domain": "default", "text": prompt}
+        return
+    if path.suffix == ".jsonl":
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                example = json.loads(line)
+                if not isinstance(example, dict):
+                    raise ValueError(f"{path}:{line_number}: JSONL record must be an object")
+                if ("text" in example) == ("messages" in example):
+                    raise ValueError(
+                        f"{path}:{line_number}: record must contain exactly one of text/messages"
+                    )
+                example.setdefault("record_id", f"line-{line_number:08d}")
+                example.setdefault("domain", "unknown")
+                yield example
         return
     for line in path.read_text(encoding="utf-8").splitlines():
         prompt = line.strip()
         if prompt:
-            yield prompt
+            yield {"record_id": f"line-{len(prompt)}-{hashlib.sha256(prompt.encode()).hexdigest()[:16]}", "domain": "text", "text": prompt}
 
 
 def dtype_from_arg(name: str) -> torch.dtype | str:
@@ -196,16 +214,55 @@ def register_hooks(
     return accumulators, handles
 
 
-def encode_prompt(tokenizer, prompt: str, sequence_length: int, repeat_to_length: bool) -> dict[str, torch.Tensor]:
+def render_example(
+    tokenizer,
+    example: dict,
+    repeat_to_length: bool,
+    sequence_length: int,
+) -> tuple[str, str]:
+    if "messages" in example:
+        messages = example["messages"]
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(f"record {example['record_id']} has invalid messages")
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        render_kind = "official_chat_template"
+    else:
+        prompt = str(example["text"])
+        render_kind = "plain_text"
     if repeat_to_length and len(prompt) > 0:
         prompt = (prompt + "\n") * max(1, sequence_length // max(1, len(prompt.split())) // 2)
+    return prompt, render_kind
+
+
+def encode_examples(
+    tokenizer,
+    examples: list[dict],
+    sequence_length: int,
+    repeat_to_length: bool,
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    rendered = [
+        render_example(tokenizer, example, repeat_to_length, sequence_length)
+        for example in examples
+    ]
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("batch padding requires a pad or EOS token")
+        tokenizer.pad_token = tokenizer.eos_token
     encoded = tokenizer(
-        prompt,
+        [item[0] for item in rendered],
         return_tensors="pt",
         truncation=True,
         max_length=sequence_length,
+        padding=True,
     )
-    return {key: value for key, value in encoded.items() if torch.is_tensor(value)}
+    return (
+        {key: value for key, value in encoded.items() if torch.is_tensor(value)},
+        [item[1] for item in rendered],
+    )
 
 
 def tensor_dict_for_output(accumulators: dict[str, ActivationAccumulator]) -> dict[str, torch.Tensor]:
@@ -226,6 +283,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--corpus-id", default=None)
     parser.add_argument("--shard-id", default=None)
     parser.add_argument("--max-samples", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--repeat-to-length", action="store_true")
     parser.add_argument(
@@ -256,8 +314,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.max_samples < 1:
-        raise SystemExit("--max-samples must be >= 1")
+    if args.max_samples < 1 or args.batch_size < 1:
+        raise SystemExit("--max-samples and --batch-size must be >= 1")
     if args.sequence_length < 1:
         raise SystemExit("--sequence-length must be >= 1")
     if args.max_modules is not None and args.max_modules < 1:
@@ -285,13 +343,25 @@ def main() -> int:
     device = next(model.parameters()).device
     samples_seen = 0
     tokens_seen = 0
+    domain_counts: Counter[str] = Counter()
+    render_kind_counts: Counter[str] = Counter()
+    record_id_digest = hashlib.sha256()
 
     try:
         with torch.inference_mode():
-            for prompt in iter_prompts(args.prompt_file):
-                if samples_seen >= args.max_samples:
+            examples_iter = iter(iter_examples(args.prompt_file))
+            while samples_seen < args.max_samples:
+                examples = []
+                for _ in range(min(args.batch_size, args.max_samples - samples_seen)):
+                    try:
+                        examples.append(next(examples_iter))
+                    except StopIteration:
+                        break
+                if not examples:
                     break
-                batch = encode_prompt(tokenizer, prompt, args.sequence_length, args.repeat_to_length)
+                batch, render_kinds = encode_examples(
+                    tokenizer, examples, args.sequence_length, args.repeat_to_length
+                )
                 batch = {key: value.to(device) for key, value in batch.items()}
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
@@ -305,7 +375,12 @@ def main() -> int:
                     if "use_cache" not in str(exc):
                         raise
                     model(**batch)
-                samples_seen += 1
+                samples_seen += len(examples)
+                for example, render_kind in zip(examples, render_kinds, strict=True):
+                    domain_counts[str(example.get("domain", "unknown"))] += 1
+                    render_kind_counts[render_kind] += 1
+                    record_id_digest.update(str(example["record_id"]).encode("utf-8"))
+                    record_id_digest.update(b"\n")
                 active_attention_mask["value"] = None
     finally:
         for handle in handles:
@@ -324,8 +399,12 @@ def main() -> int:
         "corpus_id": args.corpus_id,
         "shard_id": args.shard_id,
         "max_samples": args.max_samples,
+        "batch_size": args.batch_size,
         "samples_seen": samples_seen,
         "tokens_seen": tokens_seen,
+        "domain_counts": dict(sorted(domain_counts.items())),
+        "render_kind_counts": dict(sorted(render_kind_counts.items())),
+        "processed_record_ids_sha256": record_id_digest.hexdigest(),
         "sequence_length": args.sequence_length,
         "repeat_to_length": args.repeat_to_length,
         "module_pattern": args.module_pattern,
@@ -342,7 +421,8 @@ def main() -> int:
         "model_weight_index_sha256": sha256_file(args.model_dir / "model.safetensors.index.json"),
         "tokenizer_config_sha256": sha256_file(args.model_dir / "tokenizer_config.json"),
         "chat_template_sha256": sha256_file(args.model_dir / "chat_template.jinja"),
-        "padding_mask_policy": "attention_mask filters [batch, sequence, hidden] pre-hook activations; this run uses one unpadded prompt per forward.",
+        "padding_mask_policy": "attention_mask filters [batch, sequence, hidden] pre-hook activations; this run uses one unpadded example per forward.",
+        "chat_template_policy": "records with messages use tokenizer.apply_chat_template(add_generation_prompt=False); text records are tokenized verbatim",
         "reduction_dtype": "float64",
         "stored_second_moment_dtype": "float64",
         "notes": args.note,
