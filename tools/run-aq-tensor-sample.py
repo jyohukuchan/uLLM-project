@@ -580,6 +580,7 @@ def metrics_from_recon(
     group_weights: torch.Tensor | None,
     scales: torch.Tensor,
     best_scale: torch.Tensor,
+    population_elements: int | None = None,
 ) -> dict[str, float | int | str | None]:
     diff = groups - recon
     mse = float(diff.square().mean())
@@ -589,13 +590,14 @@ def metrics_from_recon(
     weighted_sse_value = None
     weighted_reference_sse_value = None
     weighted_weight_sum = None
+    weighted_sse_estimated_full_tensor = None
+    weighted_reference_sse_estimated_full_tensor = None
+    sample_expansion_factor = None
     if group_weights is not None:
         # Keep the C0 numerator and reference-energy denominator in FP64.  The
         # candidate reconstruction remains this tool's existing sampled FP32
         # evaluator; this change only preserves the reported reduction.
         weights = group_weights.to(torch.float64).clamp_min(0)
-        mean_weight = weights.mean().clamp_min(1e-30)
-        weights = weights / mean_weight
         diff64 = diff.to(torch.float64)
         groups64 = groups.to(torch.float64)
         weighted_sse = (diff64.square() * weights).sum()
@@ -606,6 +608,14 @@ def metrics_from_recon(
         weighted_sse_value = float(weighted_sse)
         weighted_reference_sse_value = float(weighted_denom_raw)
         weighted_weight_sum = float(weights.sum())
+        if population_elements is not None:
+            if population_elements < groups.numel():
+                raise ValueError("population element count cannot be smaller than the evaluation sample")
+            sample_expansion_factor = float(population_elements) / float(groups.numel())
+            weighted_sse_estimated_full_tensor = weighted_sse_value * sample_expansion_factor
+            weighted_reference_sse_estimated_full_tensor = (
+                weighted_reference_sse_value * sample_expansion_factor
+            )
     dot = float((groups * recon).sum())
     norm = float(groups.square().sum().sqrt() * recon.square().sum().sqrt())
     zero_mask = groups == 0
@@ -625,6 +635,9 @@ def metrics_from_recon(
         "weighted_relative_mse": weighted_relative_mse,
         "weighted_sse": weighted_sse_value,
         "weighted_reference_sse": weighted_reference_sse_value,
+        "weighted_sse_estimated_full_tensor": weighted_sse_estimated_full_tensor,
+        "weighted_reference_sse_estimated_full_tensor": weighted_reference_sse_estimated_full_tensor,
+        "sample_expansion_factor": sample_expansion_factor,
         "weighted_weight_sum": weighted_weight_sum,
         "max_abs_error": float(diff.abs().max()),
         "cosine_similarity": dot / norm if norm > 0 else 1.0,
@@ -647,6 +660,7 @@ def evaluate_candidate(
     weighted_scale_search: bool = False,
     weighted_codebook: bool = False,
     floor_states: list[EvaluationState] | None = None,
+    population_elements: int | None = None,
 ) -> dict[str, float | int | str | None]:
     scales = scale_values(candidate.scale_format)
     if codebook_override is not None:
@@ -700,7 +714,16 @@ def evaluate_candidate(
         best_code_idx = torch.where(mask[:, None], nearest, best_code_idx)
         best_recon = torch.where(mask[:, None], recon, best_recon)
 
-    metrics = metrics_from_recon(groups, best_recon, best_error, candidate, group_weights, scales, best_scale)
+    metrics = metrics_from_recon(
+        groups,
+        best_recon,
+        best_error,
+        candidate,
+        group_weights,
+        scales,
+        best_scale,
+        population_elements,
+    )
     metrics["tensor_scale_value"] = tensor_scale
     best_state = EvaluationState(
         candidate_id=candidate.candidate_id,
@@ -732,7 +755,16 @@ def evaluate_candidate(
         recon = quantized * group_scale[:, None] * float(floor_state.tensor_scale)
         square_error = (groups - recon).square()
         error = objective_error(square_error, group_weights, weighted_scale_search)
-        floor_metrics = metrics_from_recon(groups, recon, error, candidate, group_weights, scales, group_scale)
+        floor_metrics = metrics_from_recon(
+            groups,
+            recon,
+            error,
+            candidate,
+            group_weights,
+            scales,
+            group_scale,
+            population_elements,
+        )
         floor_metrics["tensor_scale_value"] = float(floor_state.tensor_scale)
         floor_metrics["lifted_from_candidate_id"] = floor_state.candidate_id
         floor_metrics["lifted_from_scale_format"] = floor_state.scale_format
@@ -1086,6 +1118,7 @@ def main() -> int:
                         weighted_scale_search=args.weighted_scale_search,
                         weighted_codebook=False,
                         floor_states=evaluation_states,
+                        population_elements=(tensor.numel() // candidate.group_size) * candidate.group_size,
                     )
                     evaluation_state = metrics.pop("_evaluation_state", None)
                     if isinstance(evaluation_state, EvaluationState):

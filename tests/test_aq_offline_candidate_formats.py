@@ -89,3 +89,28 @@ def test_aq4_and_aq5_emit_storage_rounded_codebooks_and_expected_bpp() -> None:
         )
         assert metrics["effective_bpp"] == expected_bpp
         assert torch.isfinite(torch.tensor(metrics["relative_mse"]))
+
+
+def test_c0_raw_moment_scale_and_full_tensor_expansion_are_preserved() -> None:
+    sampler = load_sampler()
+    candidate = sampler.Candidate(
+        "test", "e4m3", 2, "none", "none", "free16"
+    )
+    groups = torch.tensor([[1.0, 2.0]])
+    recon = torch.zeros_like(groups)
+    metrics = sampler.metrics_from_recon(
+        groups,
+        recon,
+        torch.tensor([18.0]),
+        candidate,
+        torch.tensor([[2.0, 4.0]]),
+        torch.tensor([1.0]),
+        torch.tensor([1.0]),
+        population_elements=4,
+    )
+
+    assert metrics["weighted_sse"] == 18.0
+    assert metrics["weighted_reference_sse"] == 18.0
+    assert metrics["weighted_weight_sum"] == 6.0
+    assert metrics["sample_expansion_factor"] == 2.0
+    assert metrics["weighted_sse_estimated_full_tensor"] == 36.0

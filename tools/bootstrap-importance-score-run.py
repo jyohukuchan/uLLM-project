@@ -88,6 +88,11 @@ def candidate_manifest(revision: str) -> dict[str, Any]:
             "contiguous groups; first min(4096,floor(N_groups/2)) groups fit codebook/tensor scale and next "
             "min(4096,N_groups-fit_count) disjoint groups evaluate; no replacement; AQ4/AQ5 share indices"
         ),
+        "C0 loss estimator": (
+            "evaluation uses the raw (not tensor-normalized) D_stats E[x_j^2] moments; sampled numerator "
+            "and reference energy are expanded by usable_tensor_elements/evaluation_sample_elements for "
+            "A_t and gain, while their ratio is L_t; the common deterministic sample is used for AQ4/AQ5"
+        ),
         "seed": 0,
         "iterations": 8,
         "rounding mode": (
