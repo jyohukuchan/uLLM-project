@@ -109,7 +109,11 @@ def validate_report_receipt(
     metrics: dict[str, Any],
     freeze: dict[str, Any],
     frozen_scores: list[str],
+    winner_eligible_scores: list[str] | None = None,
+    secondary_scores: list[str] | None = None,
 ) -> dict[str, Any]:
+    winner_eligible_scores = winner_eligible_scores or frozen_scores
+    secondary_scores = secondary_scores or []
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if receipt.get("schema_version") != "importance-score-formal-report-receipt-v0.1":
         raise SystemExit(f"{model_name} formal report receipt has an unexpected schema")
@@ -124,6 +128,14 @@ def validate_report_receipt(
         raise SystemExit(f"{model_name} bootstrap samples differ from their report receipt")
     if set(receipt.get("candidate_score_columns", [])) != set(frozen_scores):
         raise SystemExit(f"{model_name} report receipt score set differs from the freeze")
+    if set(receipt.get("winner_eligible_score_columns", winner_eligible_scores)) != set(
+        winner_eligible_scores
+    ):
+        raise SystemExit(f"{model_name} winner-eligible score set differs from the freeze")
+    if set(receipt.get("secondary_score_columns", secondary_scores)) != set(
+        secondary_scores
+    ):
+        raise SystemExit(f"{model_name} secondary score set differs from the freeze")
     formal_settings = receipt.get("execution_settings", {}).get("formal_report")
     if formal_settings != EXPECTED_FORMAL_SETTINGS:
         raise SystemExit(f"{model_name} formal report settings differ from the frozen contract")
@@ -234,7 +246,17 @@ def main() -> int:
         raise SystemExit("Gemma metrics do not prove a score-before-label join")
     if order.get("sealed_score_table_sha256") != prejoin.get("score_table_sha256"):
         raise SystemExit("Gemma label authorization and joined score table hashes differ")
-    frozen_scores = list(freeze["candidate_scores_transferred_unchanged"])
+    frozen_scores = list(
+        freeze.get("reported_score_columns", freeze["candidate_scores_transferred_unchanged"])
+    )
+    winner_eligible_scores = list(
+        freeze.get("winner_eligible_score_columns", frozen_scores)
+    )
+    secondary_scores = list(freeze.get("secondary_score_columns", []))
+    if set(winner_eligible_scores).intersection(secondary_scores):
+        raise SystemExit("freeze overlaps winner-eligible and secondary score roles")
+    if set(winner_eligible_scores).union(secondary_scores) != set(frozen_scores):
+        raise SystemExit("freeze score roles do not cover the complete reported score table")
     if set(frozen_scores) != set(qwen["scores"]) or set(frozen_scores) != set(gemma["scores"]):
         raise SystemExit("Qwen/Gemma score sets differ from the sealed candidate table")
     qwen_receipt = validate_report_receipt(
@@ -245,6 +267,8 @@ def main() -> int:
         qwen,
         freeze,
         frozen_scores,
+        winner_eligible_scores,
+        secondary_scores,
     )
     gemma_receipt = validate_report_receipt(
         "Gemma",
@@ -254,6 +278,8 @@ def main() -> int:
         gemma,
         freeze,
         frozen_scores,
+        winner_eligible_scores,
+        secondary_scores,
     )
     q_bootstrap = bootstrap_arrays(paths["qwen_bootstrap"], frozen_scores)
     g_bootstrap = bootstrap_arrays(paths["gemma_bootstrap"], frozen_scores)
@@ -262,7 +288,12 @@ def main() -> int:
     for score in frozen_scores:
         q_point = score_point(qwen, score)
         g_point = score_point(gemma, score)
-        two_model_pass = q_point["admission_pass"] and g_point["admission_pass"]
+        winner_eligible = score in winner_eligible_scores
+        two_model_pass = (
+            winner_eligible
+            and q_point["admission_pass"]
+            and g_point["admission_pass"]
+        )
         if two_model_pass:
             finalists.append(score)
         q_rho = q_point["rho"]
@@ -270,6 +301,8 @@ def main() -> int:
         rows.append(
             {
                 "score_id": score,
+                "winner_eligible": winner_eligible,
+                "secondary_only": score in secondary_scores,
                 "qwen": q_point,
                 "gemma": g_point,
                 "two_model_admission_pass": two_model_pass,
@@ -346,6 +379,9 @@ def main() -> int:
             ),
         },
         "candidate_rows": rows,
+        "reported_score_columns": frozen_scores,
+        "winner_eligible_score_columns": winner_eligible_scores,
+        "secondary_score_columns": secondary_scores,
         "two_model_finalists": finalists,
         "paired_bootstrap_comparisons": comparisons,
         "preregistered_metric_order": list(METRIC_ORDER),
@@ -392,12 +428,14 @@ def main() -> int:
         f"- Gemma lockbox: valid one-shot evaluation",
         f"- Phase 6 authorized: `{output['phase_6_authorized']}`",
         "",
-        "| Score | Qwen rho | Gemma rho | worst rho | Qwen gate | Gemma gate |",
-        "|---|---:|---:|---:|---|---|",
+        "| Score | role | Qwen rho | Gemma rho | worst rho | Qwen gate | Gemma gate |",
+        "|---|---|---:|---:|---:|---|---|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['score_id']} | {row['qwen']['rho']} | {row['gemma']['rho']} | "
+            f"| {row['score_id']} | "
+            f"{'winner-eligible' if row['winner_eligible'] else 'secondary'} | "
+            f"{row['qwen']['rho']} | {row['gemma']['rho']} | "
             f"{row['worst_model_rho']} | {row['qwen']['admission_pass']} | "
             f"{row['gemma']['admission_pass']} |"
         )

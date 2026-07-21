@@ -416,6 +416,71 @@ def test_paired_cohort_gate_requires_exact_full_pairing(tmp_path: Path) -> None:
     assert tool.paired_cohort_audit(path, 9)["pass"] is False
 
 
+def test_paired_cohort_gate_accepts_c5_join_against_previously_sealed_labels(
+    tmp_path: Path,
+) -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_c5_pair_audit")
+    path = tmp_path / "audit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "model_id": "gemma-4-E4B-it",
+                "paired_static_q4_k_m": {
+                    "status": "paired_exact_tensor_name_and_shape",
+                    "admission_use": "eligible",
+                    "eligible_coverage": 1.0,
+                    "eligible_paired_count": 8,
+                    "cohort_metadata_exact_match": True,
+                    "pairing_errors": [],
+                },
+                "lockbox_order_audit": {
+                    "status": (
+                        "C5 score-label join order verified against previously sealed GGUF labels"
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert tool.paired_cohort_audit(path, 8)["pass"] is True
+
+
+def test_c5_permutation_family_does_not_change_legacy_bh_values() -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_c5_bh_family")
+    rows = []
+    for family_index, family in enumerate(("mlp_up", "mlp_down")):
+        for layer in range(6):
+            row = {
+                "canonical_family": family,
+                "layer_id": layer,
+                "ordinal_ud": float((layer + family_index) % 4),
+            }
+            for score_index, score in enumerate(tool.LEGACY_SCORE_COLUMNS):
+                row[score] = float((layer * (score_index + 1) + family_index) % 7)
+            for score_index, score in enumerate(tool.C5_SCORE_GROUPS["C5a"]):
+                row[score] = float((layer * (score_index + 2) + family_index) % 9)
+            rows.append(row)
+
+    _legacy_draws, legacy = tool.permutation_tests(
+        rows, list(tool.LEGACY_SCORE_COLUMNS), 64, 17
+    )
+    _extended_draws, extended = tool.permutation_tests(
+        rows,
+        [*tool.LEGACY_SCORE_COLUMNS, *tool.C5_SCORE_GROUPS["C5a"]],
+        64,
+        17,
+    )
+
+    for score in tool.LEGACY_SCORE_COLUMNS:
+        assert extended[score] == legacy[score]
+        assert extended[score]["multiplicity_family"] == "legacy_v0.1"
+        assert extended[score]["multiplicity_family_size"] == 6
+    for score in tool.C5_SCORE_GROUPS["C5a"]:
+        assert extended[score]["multiplicity_family"] == "C5_extension"
+        assert extended[score]["multiplicity_family_size"] == 3
+
+
 def test_prejoin_score_receipt_is_verified_before_label_join(tmp_path: Path) -> None:
     tool = load_tool("report-importance-score-formal.py", "test_formal_prejoin")
     score_path = tmp_path / "scores-prejoin.jsonl"

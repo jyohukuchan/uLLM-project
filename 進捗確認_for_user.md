@@ -15,3 +15,11 @@
 - Gemma lockboxはQwen freeze→source-only prejoin（SHA-256 `f57b965d...`）→GGUF label-openの順で一度だけ開封した。GGUF physical core 294とsealed active roster 258の差は事前除外済みshared-KV 36個のみで、label値に依存しないactive-label viewで258/258 join、same-cohort coverage 1.0を得た。Qwenのscore式・閾値・実装hashは開封後に変更していない。
 - Gemma formal reportは258 eligible tensors、10,000 bootstrap / 10,000 permutationで完走した。同じ順でrhoは`0.0937/0.0271/0.2151/0.1053/-0.0432/0.1220`、tau-bは`0.0748/0.0231/0.1732/0.0782/-0.0331/0.1011`、admission合格は0/6。teacher coverageはpaired 1.0、nonconstant 4 families、mixed 5 familiesで合格した。
 - frozen worst-model ruleの最終結果は`NO-GO`、two-model finalists 0、winnerなし、phase 6非承認。lockbox receiptは`valid one-shot Gemma lockbox`、事後の式/閾値変更false、第三モデル不要と判定した。追加downloadは0 byte、GPU実行はすべて終了している。
+
+## C5 gradient extension progress
+
+- HEAD `532d488b`から、正式仕様どおりC5a Taylor deletion/Taylor-quantとC5b self-Fisher/empirical Fisherを追加する作業を開始した。
+- 既存C0/C1/C4/C6の成果物とmanifestは不変とし、未materializeの`D_fisher`は固定済みraw sourceから既存split非重複の追加manifestとして凍結する方針である。
+- 現在は既存quantizer・prejoin・formal report・Qwen freeze・Gemma one-shot lockboxの追加実装境界を監査中。GPU/serviceにはまだ触れていない。
+- C5 runner、追加`D_fisher` freezer、既存prejoinのbyte-preserving extension、旧6候補の数値不変検証付きformal report、Qwen freeze、Gemma active-label one-shot joinを実装した。Taylor-quant/self-Fisherだけをwinner eligibleとし、削除Taylor 2種とempirical Fisherはsecondaryに固定した。
+- C5は旧6候補と別のBH補正族にし、既存adjusted pを変更しない。CPU-onlyの関連testは現時点で全件成功しており、次は実装commit後にQwenの4 sample・2 tensor smokeから開始する。GPU/serviceには引き続き触れていない。

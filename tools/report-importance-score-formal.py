@@ -54,6 +54,111 @@ FORMAL_OUTPUT_FILENAMES = (
     "formal-report.receipt.json",
 )
 
+LEGACY_SCORE_COLUMNS = (
+    "C0_I",
+    "S_AWQ_level",
+    "S_AWQ_tail",
+    "S_range",
+    "C1_I",
+    "C4_I",
+)
+C5_PRIMARY_SCORE_COLUMNS = (
+    "C5a_Taylor_quant_I",
+    "C5b_Self_Fisher_I",
+)
+C5_SECONDARY_SCORE_COLUMNS = (
+    "C5a_Taylor_L1_S",
+    "C5a_Taylor_squared_S",
+    "C5b_Empirical_Fisher_I",
+)
+C5_SCORE_COLUMNS = (
+    "C5a_Taylor_quant_I",
+    "C5a_Taylor_L1_S",
+    "C5a_Taylor_squared_S",
+    "C5b_Self_Fisher_I",
+    "C5b_Empirical_Fisher_I",
+)
+C5_SCORE_GROUPS = {
+    "C5a": (
+        "C5a_Taylor_quant_I",
+        "C5a_Taylor_L1_S",
+        "C5a_Taylor_squared_S",
+    ),
+    "C5b": (
+        "C5b_Self_Fisher_I",
+        "C5b_Empirical_Fisher_I",
+    ),
+}
+WINNER_ELIGIBLE_SCORE_COLUMNS = LEGACY_SCORE_COLUMNS + C5_PRIMARY_SCORE_COLUMNS
+FORMAT_DEPENDENT_SCORE_COLUMNS = {
+    "C0_I",
+    "C1_I",
+    "C4_I",
+    "C5a_Taylor_quant_I",
+    "C5b_Self_Fisher_I",
+    "C5b_Empirical_Fisher_I",
+}
+BINARY_SCORE_COLUMNS = {
+    "C0_I": "C0_G",
+    "C1_I": "C1_G",
+    "C4_I": "C4_G",
+    "S_AWQ_level": "S_AWQ_level",
+    "S_AWQ_tail": "S_AWQ_tail",
+    "S_range": "S_range",
+    "C5a_Taylor_quant_I": "C5a_Taylor_quant_G",
+    "C5a_Taylor_L1_S": "C5a_Taylor_L1_S",
+    "C5a_Taylor_squared_S": "C5a_Taylor_squared_S",
+    "C5b_Self_Fisher_I": "C5b_Self_Fisher_G",
+    "C5b_Empirical_Fisher_I": "C5b_Empirical_Fisher_G",
+}
+SCORE_ROLES = {
+    **{
+        score: {
+            "stage": "legacy_v0.1",
+            "winner_eligible": True,
+            "secondary": False,
+            "format_dependent": score in FORMAT_DEPENDENT_SCORE_COLUMNS,
+            "binary_ranking": BINARY_SCORE_COLUMNS[score],
+        }
+        for score in LEGACY_SCORE_COLUMNS
+    },
+    "C5a_Taylor_quant_I": {
+        "stage": "C5_extension",
+        "winner_eligible": True,
+        "secondary": False,
+        "format_dependent": True,
+        "binary_ranking": "C5a_Taylor_quant_G",
+    },
+    "C5a_Taylor_L1_S": {
+        "stage": "C5_extension",
+        "winner_eligible": False,
+        "secondary": True,
+        "format_dependent": False,
+        "binary_ranking": "C5a_Taylor_L1_S",
+    },
+    "C5a_Taylor_squared_S": {
+        "stage": "C5_extension",
+        "winner_eligible": False,
+        "secondary": True,
+        "format_dependent": False,
+        "binary_ranking": "C5a_Taylor_squared_S",
+    },
+    "C5b_Self_Fisher_I": {
+        "stage": "C5_extension",
+        "winner_eligible": True,
+        "secondary": False,
+        "format_dependent": True,
+        "binary_ranking": "C5b_Self_Fisher_G",
+    },
+    "C5b_Empirical_Fisher_I": {
+        "stage": "C5_extension",
+        "winner_eligible": False,
+        "secondary": True,
+        "format_dependent": True,
+        "binary_ranking": "C5b_Empirical_Fisher_G",
+    },
+}
+
 
 def load_screen_module():
     path = Path(__file__).resolve().parent / "summarize-importance-score-screen.py"
@@ -661,10 +766,13 @@ def paired_cohort_audit(path: Path, eligible_count: int) -> dict[str, Any]:
     }
     lockbox_order_pass = True
     if str(raw.get("model_id", "")).lower().startswith("gemma"):
+        accepted_lockbox_statuses = {
+            "order verified before invoking gguf-dump",
+            "C5 score-label join order verified against previously sealed GGUF labels",
+        }
         lockbox_order_pass = (
             isinstance(raw.get("lockbox_order_audit"), dict)
-            and raw["lockbox_order_audit"].get("status")
-            == "order verified before invoking gguf-dump"
+            and raw["lockbox_order_audit"].get("status") in accepted_lockbox_statuses
         )
     result["lockbox_order_pass"] = lockbox_order_pass
     result["pass"] = (
@@ -786,7 +894,11 @@ def load_and_join_prejoin_scores(
         "receipt_implementation_hashes": receipt.get("implementation_hashes"),
         "receipt_input_hashes": receipt.get("input_hashes"),
         "receipt_execution_settings": receipt.get("execution_settings"),
+        "receipt_c5_execution_settings": receipt.get("c5_execution_settings"),
         "candidate_score_columns": receipt.get("candidate_score_columns"),
+        "winner_eligible_score_columns": receipt.get("winner_eligible_score_columns"),
+        "secondary_score_columns": receipt.get("secondary_score_columns"),
+        "c5_extension": receipt.get("c5_extension"),
     }
     return joined_rows, per_shard, prejoin_audit
 
@@ -838,16 +950,34 @@ def permutation_tests(rows: list[dict[str, Any]], score_columns: list[str], repl
             "replicates_defined": len(values),
             "two_sided_permutation_p": p,
         }
-    ordered = sorted(raw_p, key=raw_p.get)
-    adjusted = {}
-    running = 1.0
-    for reverse_index in range(len(ordered) - 1, -1, -1):
-        score = ordered[reverse_index]
-        rank = reverse_index + 1
-        running = min(running, raw_p[score] * len(ordered) / rank)
-        adjusted[score] = running
+    # The six v0.1 scores were already a sealed multiplicity family.  C5 is a
+    # conditional, later-stage escalation, so appending it to that family
+    # would retroactively change an existing reported number.  Correct the C5
+    # extension as its own pre-frozen family and retain the legacy correction
+    # byte-for-byte.
+    multiplicity_families = {
+        "legacy_v0.1": [score for score in LEGACY_SCORE_COLUMNS if score in raw_p],
+        "C5_extension": [score for score in C5_SCORE_COLUMNS if score in raw_p],
+    }
+    assigned = {score for members in multiplicity_families.values() for score in members}
     for score in score_columns:
-        summary[score]["benjamini_hochberg_adjusted_p"] = adjusted[score]
+        if score not in assigned:
+            multiplicity_families[f"standalone:{score}"] = [score]
+    for family_id, members in multiplicity_families.items():
+        if not members:
+            continue
+        ordered = sorted(members, key=raw_p.get)
+        adjusted: dict[str, float] = {}
+        running = 1.0
+        for reverse_index in range(len(ordered) - 1, -1, -1):
+            score = ordered[reverse_index]
+            rank = reverse_index + 1
+            running = min(running, raw_p[score] * len(ordered) / rank)
+            adjusted[score] = running
+        for score in members:
+            summary[score]["benjamini_hochberg_adjusted_p"] = adjusted[score]
+            summary[score]["multiplicity_family"] = family_id
+            summary[score]["multiplicity_family_size"] = len(members)
     return draw_rows, summary
 
 
@@ -879,11 +1009,11 @@ def kl_metrics(
         )
         result["scores"][score] = {"rho_score_vs_AQ4_KL": rho}
     gains = [max(0.0, low_kl[name] - high_kl[name]) for name in common]
-    for prefix in ("C0", "C1"):
-        column = f"{prefix}_G"
-        if f"{prefix}_I" in score_columns:
+    for score in score_columns:
+        column = BINARY_SCORE_COLUMNS[score]
+        if score in FORMAT_DEPENDENT_SCORE_COLUMNS:
             values = [float(by_name[name][column]) for name in common]
-            result["scores"][f"{prefix}_I"]["rho_gain_vs_KL_recovery_secondary"] = (
+            result["scores"][score]["rho_gain_vs_KL_recovery_secondary"] = (
                 float(spearmanr(values, gains).statistic)
                 if len(set(values)) > 1 and len(set(gains)) > 1
                 else None
@@ -1007,6 +1137,62 @@ def disagreement_rows(
     return list(selected.values())
 
 
+def assert_tree_preserved(old: Any, new: Any, path: str) -> None:
+    """Require every sealed legacy value to survive; additive keys are allowed."""
+
+    if isinstance(old, dict):
+        if not isinstance(new, dict):
+            raise ValueError(f"legacy metric changed type at {path}")
+        for key, value in old.items():
+            if key not in new:
+                raise ValueError(f"legacy metric key disappeared at {path}.{key}")
+            assert_tree_preserved(value, new[key], f"{path}.{key}")
+        return
+    if isinstance(old, list):
+        if not isinstance(new, list) or len(old) != len(new):
+            raise ValueError(f"legacy metric list changed at {path}")
+        for index, (left, right) in enumerate(zip(old, new, strict=True)):
+            assert_tree_preserved(left, right, f"{path}[{index}]")
+        return
+    if old != new:
+        raise ValueError(f"legacy metric changed at {path}: {old!r} != {new!r}")
+
+
+def verify_legacy_metric_invariance(
+    metrics: dict[str, Any], baseline: dict[str, Any], baseline_path: Path
+) -> dict[str, Any]:
+    if baseline.get("model_id") != metrics.get("model_id"):
+        raise ValueError("legacy baseline model differs from the C5 report model")
+    if set(baseline.get("candidate_score_columns", [])) != set(LEGACY_SCORE_COLUMNS):
+        raise ValueError("legacy baseline does not contain exactly the six sealed v0.1 scores")
+    for score in LEGACY_SCORE_COLUMNS:
+        for section in ("scores", "bootstrap", "permutation"):
+            assert_tree_preserved(
+                baseline[section][score], metrics[section][score], f"{section}.{score}"
+            )
+        assert_tree_preserved(
+            baseline["KL_core"]["scores"][score],
+            metrics["KL_core"]["scores"][score],
+            f"KL_core.scores.{score}",
+        )
+        if score in baseline.get("gain_fit_audit", {}):
+            assert_tree_preserved(
+                baseline["gain_fit_audit"][score],
+                metrics["gain_fit_audit"][score],
+                f"gain_fit_audit.{score}",
+            )
+    return {
+        "pass": True,
+        "baseline_path": str(baseline_path),
+        "baseline_sha256": sha256_file(baseline_path),
+        "legacy_score_columns": list(LEGACY_SCORE_COLUMNS),
+        "policy": (
+            "every pre-existing legacy metric key/value is exactly preserved; additive metadata "
+            "and separately corrected C5 metrics are allowed"
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path)
@@ -1023,6 +1209,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prejoin-scores", type=Path)
     parser.add_argument("--prejoin-receipt", type=Path)
     parser.add_argument("--prejoin-shard-scores", type=Path)
+    parser.add_argument(
+        "--legacy-baseline-metrics",
+        type=Path,
+        help="Required for a C5 extension; proves that all six sealed v0.1 metrics remain exact.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--weight-sample-size", type=int, default=65536)
     parser.add_argument("--bootstrap-replicates", type=int, default=10000)
@@ -1115,18 +1306,55 @@ def main() -> int:
         full_scores.append("C1_I")
     if all("C4_I" in row for row in rows):
         full_scores.append("C4_I")
+    c5_presence = {score: sum(score in row for row in rows) for score in C5_SCORE_COLUMNS}
+    present_c5_scores: list[str] = []
+    for group_name, group_scores in C5_SCORE_GROUPS.items():
+        counts = {score: c5_presence[score] for score in group_scores}
+        if not any(counts.values()):
+            continue
+        incomplete = {score: count for score, count in counts.items() if count != len(rows)}
+        if incomplete:
+            raise SystemExit(
+                f"{group_name} extension requires exact full-tensor coverage for every variant: "
+                f"{incomplete}"
+            )
+        present_c5_scores.extend(group_scores)
+    if present_c5_scores:
+        full_scores.extend(present_c5_scores)
+        if args.legacy_baseline_metrics is None:
+            raise SystemExit("C5 reporting requires --legacy-baseline-metrics")
+        if set(prejoin_audit.get("candidate_score_columns") or []) != set(full_scores):
+            raise SystemExit("C5 prejoin receipt score set differs from the joined score table")
+        expected_winner = [
+            score for score in full_scores if SCORE_ROLES[score]["winner_eligible"]
+        ]
+        expected_secondary = [
+            score for score in full_scores if SCORE_ROLES[score]["secondary"]
+        ]
+        if set(prejoin_audit.get("winner_eligible_score_columns") or []) != set(
+            expected_winner
+        ):
+            raise SystemExit("C5 prejoin winner-eligible score roles are not sealed correctly")
+        if set(prejoin_audit.get("secondary_score_columns") or []) != set(
+            expected_secondary
+        ):
+            raise SystemExit("C5 prejoin secondary score roles are not sealed correctly")
+        expected_stage = (
+            "full" if set(C5_SCORE_GROUPS["C5b"]).issubset(full_scores) else "c5a"
+        )
+        if (prejoin_audit.get("c5_extension") or {}).get("stage") != expected_stage:
+            raise SystemExit("C5 prejoin stage differs from its score coverage")
+        c5_settings = prejoin_audit.get("receipt_c5_execution_settings")
+        expected_setting_keys = (
+            {"empirical", "self_fisher"} if expected_stage == "full" else {"empirical"}
+        )
+        if not isinstance(c5_settings, dict) or set(c5_settings) != expected_setting_keys:
+            raise SystemExit("C5 prejoin execution settings are incomplete")
     row_tensor_names = {str(row["hf_name"]) for row in rows}
     if not set(c6).issubset(row_tensor_names):
         missing = sorted(set(c6) - row_tensor_names)
         raise SystemExit(f"KL-core tensors are absent from the eligible score table: {missing}")
-    binary_score = {
-        "C0_I": "C0_G",
-        "C1_I": "C1_G",
-        "C4_I": "C4_G",
-        "S_AWQ_level": "S_AWQ_level",
-        "S_AWQ_tail": "S_AWQ_tail",
-        "S_range": "S_range",
-    }
+    binary_score = {score: BINARY_SCORE_COLUMNS[score] for score in full_scores}
     family_rows = []
     score_generation_settings = (
         prejoin_audit.get("receipt_execution_settings")
@@ -1149,6 +1377,14 @@ def main() -> int:
         "model_id": rows[0]["model_id"],
         "eligible_tensor_count": len(rows),
         "candidate_score_columns": full_scores,
+        "legacy_score_columns": [score for score in LEGACY_SCORE_COLUMNS if score in full_scores],
+        "winner_eligible_score_columns": [
+            score for score in full_scores if SCORE_ROLES[score]["winner_eligible"]
+        ],
+        "secondary_score_columns": [
+            score for score in full_scores if SCORE_ROLES[score]["secondary"]
+        ],
+        "score_roles": {score: SCORE_ROLES[score] for score in full_scores},
         "execution_settings": {
             "formal_report": formal_settings,
             "score_generation": score_generation_settings,
@@ -1189,7 +1425,7 @@ def main() -> int:
             rank["secondary_targets"][target] = secondary
         rank["direction_gate"] = direction_gate(families)
         rank["binary"] = binary_metrics(rows, binary_score[score])
-        if score in {"C0_I", "C1_I", "C4_I"}:
+        if score in FORMAT_DEPENDENT_SCORE_COLUMNS:
             rank["binary"]["byte_matched"] = byte_matched_metrics(
                 rows, binary_score[score]
             )
@@ -1212,6 +1448,7 @@ def main() -> int:
                 "clipped_gain_column": binary_score[score],
                 "interpretation": "negative raw gain is retained and treated as an AQ5 fit failure",
             }
+        rank["candidate_role"] = SCORE_ROLES[score]
         metrics["scores"][score] = rank
 
     bootstrap_rows, bootstrap = cluster_bootstrap(
@@ -1277,11 +1514,37 @@ def main() -> int:
         metrics["scores"][score]["admission_gate"] = {
             "components": qwen_side,
             "pass": all(qwen_side.values()) and metrics["teacher_coverage"]["pass"],
+            "winner_eligible": SCORE_ROLES[score]["winner_eligible"],
+            "secondary_only": SCORE_ROLES[score]["secondary"],
         }
+
+    if args.legacy_baseline_metrics is not None:
+        legacy_baseline_path = args.legacy_baseline_metrics.expanduser().resolve()
+        if not legacy_baseline_path.is_file():
+            raise SystemExit(f"legacy baseline metrics are missing: {legacy_baseline_path}")
+        legacy_baseline = json.loads(legacy_baseline_path.read_text(encoding="utf-8"))
+        metrics["legacy_metric_invariance"] = verify_legacy_metric_invariance(
+            metrics, legacy_baseline, legacy_baseline_path
+        )
 
     stability = []
     k = int(sum(row["promoted"] for row in rows))
-    for score in ("S_AWQ_level", "S_AWQ_tail", "S_range"):
+    shard_score_columns = (
+        "S_AWQ_level",
+        "S_AWQ_tail",
+        "S_range",
+        *[score for score in C5_SCORE_COLUMNS if score in full_scores],
+    )
+    for score in shard_score_columns:
+        missing_shard_values = [
+            index
+            for index, shard in enumerate(per_shard)
+            if any(score not in shard.get(str(row["hf_name"]), {}) for row in rows)
+        ]
+        if missing_shard_values:
+            raise ValueError(
+                f"per-shard score coverage is incomplete for {score}: {missing_shard_values}"
+            )
         stability.extend(SCREEN.rank_stability(per_shard, score, k))
     if len(args.c0_shard_jsonl) == 4:
         c0_shards = [parse_quantizer_rows(path.expanduser().resolve()) for path in args.c0_shard_jsonl]
@@ -1382,6 +1645,10 @@ def main() -> int:
             input_paths["c1_jsonl"] = args.c1_jsonl.expanduser().resolve()
         if args.c4_jsonl:
             input_paths["c4_jsonl"] = args.c4_jsonl.expanduser().resolve()
+    if args.legacy_baseline_metrics is not None:
+        input_paths["legacy_baseline_metrics"] = (
+            args.legacy_baseline_metrics.expanduser().resolve()
+        )
     missing_receipt_inputs = [name for name, path in input_paths.items() if not path.is_file()]
     if missing_receipt_inputs:
         raise RuntimeError(f"formal report receipt inputs are missing: {missing_receipt_inputs}")
@@ -1396,6 +1663,9 @@ def main() -> int:
         "status": "sealed formal report outputs",
         "model_id": rows[0]["model_id"],
         "candidate_score_columns": full_scores,
+        "winner_eligible_score_columns": metrics["winner_eligible_score_columns"],
+        "secondary_score_columns": metrics["secondary_score_columns"],
+        "score_roles": metrics["score_roles"],
         "execution_settings": metrics["execution_settings"],
         "implementation_hashes": metrics["implementation_hashes"],
         "kl_core_selection_audit": kl_core_input_audit,

@@ -42,6 +42,58 @@ FORMULAS = {
         "definition": "0.5*(log r_x + log r_w) with Q0.99 activation max and Q0.999 absolute weight",
         "binary_ranking": "S_range",
         "format_dependent": False,
+        "winner_eligible": True,
+        "secondary": False,
+    },
+    "C5a_Taylor_quant_I": {
+        "definition": (
+            "E_s[abs(<grad_s causal-LM mean NLL, Delta W_t(b0)>)]/n_t; "
+            "absolute value is taken per sample after the full-tensor signed inner product"
+        ),
+        "binary_ranking": (
+            "C5a_Taylor_quant_G=max(0,A_Taylor_quant(aq4)-A_Taylor_quant(aq5))"
+        ),
+        "format_dependent": True,
+        "winner_eligible": True,
+        "secondary": False,
+    },
+    "C5a_Taylor_L1_S": {
+        "definition": "E_s[sum_i abs(g_s,i*w_i)]/n_t",
+        "binary_ranking": "C5a_Taylor_L1_S",
+        "format_dependent": False,
+        "winner_eligible": False,
+        "secondary": True,
+    },
+    "C5a_Taylor_squared_S": {
+        "definition": "E_s[sum_i (g_s,i*w_i)^2]/n_t",
+        "binary_ranking": "C5a_Taylor_squared_S",
+        "format_dependent": False,
+        "winner_eligible": False,
+        "secondary": True,
+    },
+    "C5b_Self_Fisher_I": {
+        "definition": (
+            "0.5*sum_i E_{x,y~p_theta(.|x)}[(grad_i log p_theta(y|x))^2]"
+            "*Delta w_i(b0)^2/n_t"
+        ),
+        "binary_ranking": (
+            "C5b_Self_Fisher_G=max(0,A_self_Fisher(aq4)-A_self_Fisher(aq5))"
+        ),
+        "format_dependent": True,
+        "winner_eligible": True,
+        "secondary": False,
+    },
+    "C5b_Empirical_Fisher_I": {
+        "definition": (
+            "0.5*sum_i E_x[(grad_i causal-LM mean NLL on corpus next tokens)^2]"
+            "*Delta w_i(b0)^2/n_t"
+        ),
+        "binary_ranking": (
+            "C5b_Empirical_Fisher_G=max(0,A_empirical_Fisher(aq4)-A_empirical_Fisher(aq5))"
+        ),
+        "format_dependent": True,
+        "winner_eligible": False,
+        "secondary": True,
     },
 }
 
@@ -111,6 +163,20 @@ def validate_qwen_report_receipt(
         raise SystemExit("Qwen metrics differ from their formal report receipt")
     if set(receipt.get("candidate_score_columns", [])) != set(evaluated):
         raise SystemExit("Qwen report receipt score set differs from evaluated candidates")
+    expected_winner = [
+        score for score in evaluated if FORMULAS[score].get("winner_eligible", True)
+    ]
+    expected_secondary = [
+        score for score in evaluated if FORMULAS[score].get("secondary", False)
+    ]
+    if set(receipt.get("winner_eligible_score_columns", expected_winner)) != set(
+        expected_winner
+    ):
+        raise SystemExit("Qwen report receipt winner-eligible score set is not frozen correctly")
+    if set(receipt.get("secondary_score_columns", expected_secondary)) != set(
+        expected_secondary
+    ):
+        raise SystemExit("Qwen report receipt secondary score set is not frozen correctly")
     formal_settings = receipt.get("execution_settings", {}).get("formal_report")
     if formal_settings != FROZEN_EXECUTION_SETTINGS["formal_report"]:
         raise SystemExit("Qwen formal report settings differ from the frozen v0.1 contract")
@@ -128,6 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--score-registry", type=Path, required=True)
     parser.add_argument("--corpus-manifest", type=Path, required=True)
+    parser.add_argument("--fisher-corpus-manifest", type=Path, required=True)
     parser.add_argument("--subset-manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -141,15 +208,41 @@ def main() -> int:
         "candidate_manifest": args.candidate_manifest.expanduser().resolve(),
         "score_registry": args.score_registry.expanduser().resolve(),
         "corpus_manifest": args.corpus_manifest.expanduser().resolve(),
+        "fisher_corpus_manifest": args.fisher_corpus_manifest.expanduser().resolve(),
         "subset_manifest": args.subset_manifest.expanduser().resolve(),
     }
     metrics = json.loads(paths["qwen_metrics"].read_text(encoding="utf-8"))
     evaluated = [score for score in FORMULAS if score in metrics["scores"]]
+    if set(evaluated) != set(FORMULAS):
+        missing = sorted(set(FORMULAS) - set(evaluated))
+        extra = sorted(set(metrics["scores"]) - set(FORMULAS))
+        raise SystemExit(
+            f"C5 candidate freeze requires the complete frozen score set; "
+            f"missing={missing}, extra={extra}"
+        )
     validate_qwen_report_receipt(
         paths["qwen_metrics"], paths["qwen_report_receipt"], metrics, evaluated
     )
+    if not metrics.get("legacy_metric_invariance", {}).get("pass"):
+        raise SystemExit("C5 candidate freeze requires exact legacy metric invariance evidence")
+    c5_execution_settings = metrics.get("prejoin_audit", {}).get(
+        "receipt_c5_execution_settings"
+    )
+    if not isinstance(c5_execution_settings, dict) or set(c5_execution_settings) != {
+        "empirical",
+        "self_fisher",
+    }:
+        raise SystemExit("C5 candidate freeze requires sealed empirical/self-Fisher settings")
+    winner_eligible = [
+        score for score in evaluated if FORMULAS[score].get("winner_eligible", True)
+    ]
+    secondary_scores = [
+        score for score in evaluated if FORMULAS[score].get("secondary", False)
+    ]
     qwen_finalists = [
-        score for score in evaluated if metrics["scores"][score]["admission_gate"]["pass"]
+        score
+        for score in winner_eligible
+        if metrics["scores"][score]["admission_gate"]["pass"]
     ]
     freeze = {
         "schema_version": "importance-score-qwen-candidate-freeze-v0.1",
@@ -159,6 +252,9 @@ def main() -> int:
         "lockbox_model": "gemma-4-E4B-it",
         "workspace_git_head": git_revision(),
         "candidate_scores_transferred_unchanged": evaluated,
+        "reported_score_columns": evaluated,
+        "winner_eligible_score_columns": winner_eligible,
+        "secondary_score_columns": secondary_scores,
         "qwen_side_finalists": qwen_finalists,
         "no_qwen_finalist_rule": (
             "Gemma may still receive the complete frozen candidate table descriptively, but no candidate can "
@@ -187,10 +283,16 @@ def main() -> int:
             ),
             "bootstrap": "10,000 whole-layer cluster resamples; 95% percentile CI",
             "permutation": "10,000 common global-layer permutations restricted to each family; BH correction",
-            "binary": "G_t for C0/C1; S_t itself for format-independent candidates",
+            "binary": (
+                "G_t for every format-dependent C0/C1/C4/Taylor-quant/Fisher candidate; "
+                "S_t itself for format-independent candidates"
+            ),
             "KL": "score sensitivity versus same-tensor AQ4 C6 KL on score/label-independent KL-core",
         },
-        "execution_settings": FROZEN_EXECUTION_SETTINGS,
+        "execution_settings": {
+            **FROZEN_EXECUTION_SETTINGS,
+            "c5_gradient": c5_execution_settings,
+        },
         "winner_rule": {
             "admission": "Only candidates passing every gate on both models are finalists.",
             "primary": "Maximize min(Qwen rho, Gemma rho).",
@@ -214,7 +316,11 @@ def main() -> int:
             name: sha256_file(Path(__file__).resolve().parent / name)
             for name in (
                 "build-importance-score-prejoin.py",
+                "extend-importance-score-prejoin-c5.py",
                 "build-ud-tensor-labels.py",
+                "build-importance-active-label-view.py",
+                "collect-importance-gradient-scores.py",
+                "freeze-importance-score-fisher-corpus.py",
                 "freeze-importance-kl-audit-subset.py",
                 "report-importance-score-formal.py",
                 "report-importance-score-two-model.py",
