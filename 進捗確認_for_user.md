@@ -8,10 +8,10 @@
 
 ## Importance-score selection progress
 
-- GPU resumeは安全停止した。`HIP_VISIBLE_DEVICES=1`で可視GPU 1台、`gfx1201`、31.859 GiBを確認したが、Qwen D_stats 2-sample smokeの初期化直後にlinear-attention fast-path不在とPyTorch fallbackの警告を検出したため、sample forward前にSIGINTで停止した（wall 20.56秒、完走sample 0）。
-- 正式Qwen run、D_stats/D_block/D_KL、Qwen/Gemma cpu-subsets、Gemma BF16/UD-Q4_K_XL/Q4_K_Mの実在を確認済み。追加downloadは0 byteで、Gemma lockboxは未開封のままである。
-- 関連GPUジョブは残っておらず、停止後のR9700空きは31.791 GiB。`ullm-openai.service`には触れておらず、V620を可視化するコマンドも実行していない。次はfast-path依存関係の扱いについて人間判断が必要である。
-- AQ5をAQ4と同じBF16 family-codebook/E4M3-like group-scale/tensor-scale構造の5-bit/32-entry候補としてCPU sampler/exporterへ実装した。AQ4/AQ5はdisjoint deterministic fit/evalとなり、synthetic testと実Qwen tensor smokeが成功した。
-- Qwen same-revision Q4_K_M（5.68 GB）とGemma E4B BF16（15.99 GB）、同revision UD/static GGUF（計10.10 GB）を取得し、全取得ファイルのSHA-256がHugging Face LFS SHAと一致した。Gemma UDはQ4_K/Q5_K/Q6_K混在で、E4B lockboxのまま進められる。
-- UltraChat、MBPP、JParaCrawl、GSM8K、FineWebを混ぜた正式raw corpusをhash選択でfreezeした。D_statsは2,400 recordsでQwen 267,068 / Gemma 267,794 valid tokens、D_blockはQwen 14,040 / Gemma 14,093、D_KLはQwen 7,032 / Gemma 7,033 tokensである。32-prompt pilotとは混ぜない。
-- Qwen UD/staticは427 tensorで名前・shapeが完全一致し、eligible core 200/200のpaired coverageを確認した。Qwenの正式score計測は次で、Gemmaのtensor labelとのjoinはQwen candidate freeze後まで行わない。
+- 2026-07-21の直接許可に基づき、全GPU実行を`HIP_VISIBLE_DEVICES=1`の論理`cuda:0` (`gfx1201`) だけに限定した。Qwenの既知linear-attention torch fallback警告だけを許容し、その他の未知warning/fallbackは0件だった。V620と`ullm-openai.service`には触れていない。
+- QwenはD_stats 4 shard（2,400 samples / 267,068 tokens、0.1283秒/sample）、C0/C2/C3 200 tensors、C1（16 samples、0.634秒/sample；score 0.0146秒/tensor-candidate）、C4 400 rows（平均5.943秒/tensor-candidate）、KL-core 50 rows（平均9.468秒/tensor-candidate）、descriptive KL-audit 24 rows（平均8.212秒/tensor-candidate）を完走した。
+- Qwen formal reportは200 eligible tensors、10,000 bootstrap / 10,000 permutationで封印した。`C0/C1/C4/AWQ-level/AWQ-tail/range`の順でrhoは`0.0022/-0.0824/0.1988/0.3717/-0.0801/0.3285`、tau-bは`0.0114/-0.0656/0.1716/0.3137/-0.0770/0.2747`で、admission合格は0/6。最終Qwen freezeはHEAD `54910a89`、SHA-256 `0d7a552f...`、Qwen finalistsは空である。
+- Gemmaは開封前にshared-KVの非実行layers 24–41 K/V 36 tensorsをconfig-onlyで除外し、258-tensor rosterを封印した。D_stats 4 shard（2,400 samples / 267,794 tokens、0.0914秒/sample）、C0/C2/C3 258 tensors、C1（16 samples、0.6955秒/sample；score 0.0231秒/tensor-candidate）、C4 516 rows（平均2.631秒/tensor-candidate）、KL-core 62 rows（平均6.226秒/tensor-candidate）、descriptive KL-audit 24 rows（平均6.885秒/tensor-candidate）を完走した。
+- Gemma lockboxはQwen freeze→source-only prejoin（SHA-256 `f57b965d...`）→GGUF label-openの順で一度だけ開封した。GGUF physical core 294とsealed active roster 258の差は事前除外済みshared-KV 36個のみで、label値に依存しないactive-label viewで258/258 join、same-cohort coverage 1.0を得た。Qwenのscore式・閾値・実装hashは開封後に変更していない。
+- Gemma formal reportは258 eligible tensors、10,000 bootstrap / 10,000 permutationで完走した。同じ順でrhoは`0.0937/0.0271/0.2151/0.1053/-0.0432/0.1220`、tau-bは`0.0748/0.0231/0.1732/0.0782/-0.0331/0.1011`、admission合格は0/6。teacher coverageはpaired 1.0、nonconstant 4 families、mixed 5 familiesで合格した。
+- frozen worst-model ruleの最終結果は`NO-GO`、two-model finalists 0、winnerなし、phase 6非承認。lockbox receiptは`valid one-shot Gemma lockbox`、事後の式/閾値変更false、第三モデル不要と判定した。追加downloadは0 byte、GPU実行はすべて終了している。
