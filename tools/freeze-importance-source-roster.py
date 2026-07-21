@@ -56,6 +56,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def inactive_source_tensor_reason(
+    model_config: dict[str, Any], name: str, layer_id: int
+) -> str | None:
+    """Return a source-only exclusion reason for weights absent from inference.
+
+    Gemma 4 checkpoints retain per-layer K/V tensors for the trailing KV-sharing
+    layers, while the architecture reuses K/V states produced by the last
+    non-sharing layers.  Transformers therefore does not instantiate or load
+    those trailing projection modules.  Keeping the redundant checkpoint
+    tensors in the score roster would fabricate activation statistics for
+    parameters that cannot affect a forward pass.
+    """
+
+    text_config = model_config.get("text_config", model_config)
+    if text_config.get("model_type") != "gemma4_text":
+        return None
+    layer_count = int(text_config.get("num_hidden_layers", 0))
+    shared_layer_count = int(text_config.get("num_kv_shared_layers", 0))
+    if layer_count < 1 or shared_layer_count < 1:
+        return None
+    first_shared_layer = layer_count - shared_layer_count
+    if first_shared_layer < 0:
+        raise ValueError("num_kv_shared_layers exceeds num_hidden_layers")
+    if layer_id < first_shared_layer:
+        return None
+    if re.search(r"\.self_attn\.(?:k_proj|v_proj)\.weight$", name):
+        return "inactive_gemma4_kv_shared_projection"
+    return None
+
+
 def main() -> int:
     args = parse_args()
     if args.group_size < 1:
@@ -65,6 +95,8 @@ def main() -> int:
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     allowed = set(args.family)
+    model_config_path = model_dir / "config.json"
+    model_config = json.loads(model_config_path.read_text(encoding="utf-8"))
     rows = []
     header_digest = hashlib.sha256()
     all_header_count = 0
@@ -98,13 +130,18 @@ def main() -> int:
                 if layer_match is None:
                     exclusion_counts["layer_id_unavailable"] += 1
                     continue
+                layer_id = int(layer_match.group(1))
+                inactive_reason = inactive_source_tensor_reason(model_config, name, layer_id)
+                if inactive_reason is not None:
+                    exclusion_counts[inactive_reason] += 1
+                    continue
                 rows.append(
                     {
                         "model_id": args.model_id,
                         "architecture": args.architecture,
                         "hf_name": name,
                         "canonical_family": family,
-                        "layer_id": int(layer_match.group(1)),
+                        "layer_id": layer_id,
                         "shape": shape,
                         "n_params": n_params,
                         "selection_inputs": [
@@ -113,6 +150,7 @@ def main() -> int:
                             "scope prefix",
                             "family taxonomy",
                             "group alignment",
+                            "source model config active-module semantics",
                         ],
                     }
                 )
@@ -131,6 +169,17 @@ def main() -> int:
         "model_id": args.model_id,
         "architecture": args.architecture,
         "model_dir": str(model_dir),
+        "model_config_path": str(model_config_path),
+        "model_config_sha256": sha256_file(model_config_path),
+        "source_activity_filter": {
+            "inputs": ["BF16 source tensor name", "BF16 source config.json"],
+            "gemma4_rule": (
+                "exclude k_proj/v_proj checkpoint tensors at layer >= "
+                "num_hidden_layers - num_kv_shared_layers because those decoder layers reuse "
+                "previously computed K/V states and instantiate no projection module"
+            ),
+            "label_blind": True,
+        },
         "scope_prefix": args.scope_prefix,
         "allowed_families": sorted(allowed),
         "group_size": args.group_size,

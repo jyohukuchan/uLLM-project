@@ -668,6 +668,45 @@ def test_c1_accepts_single_file_source_roster_without_labels(tmp_path: Path) -> 
         tool.read_source_roster(roster_path)
 
 
+def test_source_roster_excludes_inactive_gemma4_shared_kv_weights() -> None:
+    tool = load_tool("freeze-importance-source-roster.py", "test_gemma4_active_roster")
+    config = {
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "num_hidden_layers": 42,
+            "num_kv_shared_layers": 18,
+        },
+    }
+
+    assert (
+        tool.inactive_source_tensor_reason(
+            config,
+            "model.language_model.layers.23.self_attn.k_proj.weight",
+            23,
+        )
+        is None
+    )
+    assert tool.inactive_source_tensor_reason(
+        config,
+        "model.language_model.layers.24.self_attn.k_proj.weight",
+        24,
+    ) == "inactive_gemma4_kv_shared_projection"
+    assert tool.inactive_source_tensor_reason(
+        config,
+        "model.language_model.layers.41.self_attn.v_proj.weight",
+        41,
+    ) == "inactive_gemma4_kv_shared_projection"
+    assert (
+        tool.inactive_source_tensor_reason(
+            config,
+            "model.language_model.layers.41.self_attn.q_proj.weight",
+            41,
+        )
+        is None
+    )
+
+
 def test_two_model_comparison_pairs_worst_model_bootstrap_draws() -> None:
     tool = load_tool("report-importance-score-two-model.py", "test_two_model_report")
     qwen = {
