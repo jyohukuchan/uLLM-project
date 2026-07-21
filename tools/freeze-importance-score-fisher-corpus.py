@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import importlib.util
 import json
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -56,6 +57,12 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git_revision() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+    ).strip()
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -256,6 +263,15 @@ def main() -> int:
         "schema_version": SCHEMA_VERSION,
         "created_at_utc": utc_now(),
         "status": "sealed additive C5 corpus; existing frozen splits remain byte-for-byte unchanged",
+        "workspace_git_head": git_revision(),
+        "implementation_hashes": {
+            "freeze-importance-score-fisher-corpus.py": sha256_file(
+                Path(__file__).resolve()
+            ),
+            "freeze-importance-score-corpus.py": sha256_file(
+                Path(__file__).resolve().parent / "freeze-importance-score-corpus.py"
+            ),
+        },
         "source_plan": "docs/plans/importance-score-algorithm-selection-plan-v0.1.md",
         "base_corpus_manifest": {
             "path": str(base_manifest_path),
