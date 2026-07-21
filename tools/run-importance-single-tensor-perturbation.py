@@ -175,11 +175,45 @@ def prepare_formal_c4_shards(
 
 def model_module(model: torch.nn.Module, hf_stem: str) -> tuple[str, torch.nn.Module]:
     modules = dict(model.named_modules())
-    candidates = [hf_stem, hf_stem.removeprefix("model."), f"model.{hf_stem.removeprefix('model.')}"]
+    without_model = hf_stem.removeprefix("model.")
+    without_language_model = without_model.removeprefix("language_model.")
+    candidates = list(
+        dict.fromkeys(
+            [
+                hf_stem,
+                without_model,
+                f"model.{without_model}",
+                without_language_model,
+                f"model.{without_language_model}",
+                f"language_model.{without_language_model}",
+            ]
+        )
+    )
     for name in candidates:
         module = modules.get(name)
         if module is not None:
             return name, module
+    # Multimodal source checkpoints expose text weights below
+    # ``model.language_model.layers``. AutoModelForCausalLM deliberately loads
+    # the text-only wrapper, where the same modules live below ``model.layers``.
+    # Resolve that wrapper difference by a unique decoder-layer suffix, and
+    # fail closed if an architecture exposes more than one matching tower.
+    layer_marker = "layers."
+    marker_index = hf_stem.find(layer_marker)
+    if marker_index >= 0:
+        layer_suffix = hf_stem[marker_index:]
+        matches = [
+            name
+            for name in modules
+            if name == layer_suffix or name.endswith(f".{layer_suffix}")
+        ]
+        if len(matches) == 1:
+            return matches[0], modules[matches[0]]
+        if len(matches) > 1:
+            raise KeyError(
+                f"ambiguous model module for {hf_stem}; decoder suffix "
+                f"{layer_suffix!r} matched {matches}"
+            )
     raise KeyError(f"model module not found for {hf_stem}; tried {candidates}")
 
 

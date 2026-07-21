@@ -138,6 +138,40 @@ def test_optimized_codebook_lookup_matches_lowest_index_argmin() -> None:
     assert torch.equal(tool.nearest_sorted_codebook(values, codebook), expected)
 
 
+def test_perturbation_resolves_multimodal_source_name_in_text_causal_lm() -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_causal_lm_module_resolution"
+    )
+
+    class MLP(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.up_proj = torch.nn.Linear(2, 2, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = MLP()
+
+    class TextModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class CausalLM(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = TextModel()
+
+    model = CausalLM()
+    name, module = tool.model_module(
+        model, "model.language_model.layers.0.mlp.up_proj"
+    )
+
+    assert name == "model.layers.0.mlp.up_proj"
+    assert module is model.model.layers[0].mlp.up_proj
+
+
 def test_perturbation_progress_is_flushed_as_stderr_json(capsys) -> None:
     tool = load_tool(
         "run-importance-single-tensor-perturbation.py", "test_perturbation_progress"
