@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+from collections import UserDict
 from pathlib import Path
 
 import numpy as np
@@ -255,6 +256,24 @@ def test_cached_c4_block_call_matches_reference_and_detects_perturbation() -> No
     )
     assert metrics["C4_A"] > 0
     assert metrics["valid_tokens"] == 2
+
+
+def test_c4_call_cache_detaches_userdict_shared_kv_state() -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_c4_userdict_capture"
+    )
+    source_tensor = torch.tensor([1.0, 2.0])
+    source = UserDict({"sliding_attention": (source_tensor,)})
+
+    cloned = tool.clone_call_value(source)
+    moved = tool.move_call_value(cloned, torch.device("cpu"))
+
+    assert type(cloned) is dict
+    assert type(moved) is dict
+    assert cloned is not source.data
+    assert cloned["sliding_attention"][0] is not source_tensor
+    source.data["full_attention"] = (torch.tensor([3.0]),)
+    assert "full_attention" not in cloned
 
 
 def test_kl_core_selection_does_not_depend_on_type_or_promotion_columns(tmp_path: Path) -> None:

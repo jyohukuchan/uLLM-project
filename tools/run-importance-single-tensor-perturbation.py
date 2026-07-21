@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -545,7 +546,11 @@ def clone_call_value(value: Any) -> Any:
         return tuple(clone_call_value(item) for item in value)
     if isinstance(value, list):
         return [clone_call_value(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
+        # Gemma 4 passes shared KV state in collections.UserDict.  A plain
+        # detached dict preserves the layer-facing mapping semantics while
+        # ensuring every isolated replay receives an independent mutable
+        # container.
         return {key: clone_call_value(item) for key, item in value.items()}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -559,7 +564,7 @@ def move_call_value(value: Any, device: torch.device) -> Any:
         return tuple(move_call_value(item, device) for item in value)
     if isinstance(value, list):
         return [move_call_value(item, device) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: move_call_value(item, device) for key, item in value.items()}
     return value
 
