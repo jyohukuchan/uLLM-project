@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import sys
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -213,6 +214,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-window", type=int, default=4)
     parser.add_argument("--torch-threads", type=int, default=32)
     parser.add_argument("--torch-interop-threads", type=int, default=1)
+    parser.add_argument(
+        "--progress-every-tensors",
+        type=int,
+        default=0,
+        help="Emit a compact JSON progress row to stderr every N completed tensors; 0 disables it.",
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--note", action="append", default=[])
     return parser.parse_args()
@@ -222,6 +229,8 @@ def main() -> int:
     args = parse_args()
     if args.block_size != 128:
         raise SystemExit("the formal C1 primary uses block size 128")
+    if args.progress_every_tensors < 0:
+        raise SystemExit("--progress-every-tensors must be >= 0")
     torch.set_num_threads(args.torch_threads)
     torch.set_num_interop_threads(args.torch_interop_threads)
     model_dir = args.model_dir.expanduser().resolve()
@@ -244,8 +253,12 @@ def main() -> int:
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    started_at = time.perf_counter()
+    completed_tensors = 0
+    completed_rows = 0
     with output.open("w", encoding="utf-8", newline="\n") as handle:
         for label in labels:
+            tensor_started_at = time.perf_counter()
             tensor_name = label["hf_name"]
             family = label["canonical_family"]
             with safe_open(file_map[tensor_name], framework="pt", device="cpu") as source:
@@ -287,6 +300,7 @@ def main() -> int:
             cov_selected = covariance.index_select(0, blocks)
 
             for candidate in candidates:
+                candidate_started_at = time.perf_counter()
                 codebook = codebooks.get((family, candidate.candidate_id))
                 if codebook is None:
                     raise SystemExit(f"family codebook missing: {family}/{candidate.candidate_id}")
@@ -344,9 +358,49 @@ def main() -> int:
                     },
                     "notes": args.note,
                 }
+                row["measurement_elapsed_seconds"] = max(
+                    time.perf_counter() - candidate_started_at, 0.0
+                )
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+                completed_rows += 1
+            completed_tensors += 1
+            if args.progress_every_tensors and (
+                completed_tensors % args.progress_every_tensors == 0
+                or completed_tensors == len(labels)
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "run_id": args.run_id,
+                            "stage": "c1_tensor_scoring",
+                            "completed_tensors": completed_tensors,
+                            "total_tensors": len(labels),
+                            "completed_rows": completed_rows,
+                            "tensor_name": tensor_name,
+                            "tensor_elapsed_seconds": max(
+                                time.perf_counter() - tensor_started_at, 0.0
+                            ),
+                            "elapsed_seconds": max(time.perf_counter() - started_at, 0.0),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
             del tensor, values, groups, fit_groups
-    print(json.dumps({"rows": len(labels) * len(candidates), "output": str(output)}))
+    print(
+        json.dumps(
+            {
+                "rows": completed_rows,
+                "tensors": completed_tensors,
+                "elapsed_seconds": max(time.perf_counter() - started_at, 0.0),
+                "output": str(output),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return 0
 
 

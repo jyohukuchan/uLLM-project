@@ -14,6 +14,18 @@ import pyarrow.parquet as pq
 
 
 METRIC_ORDER = ("rho", "tau_b", "AUC_within", "Precision_at_K", "KL_rho")
+IMPLEMENTED_PAIRED_METRICS = ("rho", "tau_b")
+EXPECTED_FORMAL_SETTINGS = {
+    "weight_sample_size": 65536,
+    "seed": 0,
+    "bootstrap_replicates": 10000,
+    "permutation_replicates": 10000,
+}
+EXPECTED_BOOTSTRAP_REPLICATES = 10000
+OUTPUT_FILENAMES = (
+    "two-model-decision.json",
+    "two-model-decision.md",
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -42,26 +54,102 @@ def score_point(metrics: dict[str, Any], score: str) -> dict[str, Any]:
     }
 
 
-def bootstrap_arrays(path: Path) -> dict[str, dict[str, np.ndarray]]:
+def bootstrap_arrays(
+    path: Path,
+    expected_scores: list[str],
+    expected_replicates: int = EXPECTED_BOOTSTRAP_REPLICATES,
+) -> dict[str, dict[str, np.ndarray]]:
     rows = pq.read_table(path).to_pylist()
-    result: dict[str, dict[str, dict[int, float]]] = {}
+    expected_score_set = set(expected_scores)
+    result: dict[str, dict[str, np.ndarray]] = {
+        score: {
+            "rho": np.full(expected_replicates, np.nan, dtype=np.float64),
+            "tau_b": np.full(expected_replicates, np.nan, dtype=np.float64),
+        }
+        for score in expected_scores
+    }
+    seen: dict[str, set[int]] = {score: set() for score in expected_scores}
     for row in rows:
         score = str(row["score_id"])
-        result.setdefault(score, {"rho": {}, "tau_b": {}})
+        if score not in expected_score_set:
+            raise ValueError(f"bootstrap contains an unfrozen score: {score}")
+        replicate = int(row["replicate"])
+        if not 0 <= replicate < expected_replicates:
+            raise ValueError(f"bootstrap replicate is outside the frozen range: {replicate}")
+        if replicate in seen[score]:
+            raise ValueError(f"duplicate bootstrap replicate for {score}: {replicate}")
+        seen[score].add(replicate)
         if row.get("primary_rho") is not None:
-            result[score]["rho"][int(row["replicate"])] = float(row["primary_rho"])
+            result[score]["rho"][replicate] = float(row["primary_rho"])
         if row.get("primary_tau_b") is not None:
-            result[score]["tau_b"][int(row["replicate"])] = float(row["primary_tau_b"])
-    arrays = {}
-    for score, metrics in result.items():
-        arrays[score] = {}
-        for metric, values in metrics.items():
-            size = max(values, default=-1) + 1
-            array = np.full(size, np.nan, dtype=np.float64)
-            for replicate, value in values.items():
-                array[replicate] = value
-            arrays[score][metric] = array
-    return arrays
+            result[score]["tau_b"][replicate] = float(row["primary_tau_b"])
+    expected_ids = set(range(expected_replicates))
+    incomplete = {
+        score: sorted(expected_ids - replicates)
+        for score, replicates in seen.items()
+        if replicates != expected_ids
+    }
+    if incomplete:
+        counts = {score: len(missing) for score, missing in incomplete.items()}
+        raise ValueError(
+            f"bootstrap does not contain exactly {expected_replicates:,} rows per score: {counts}"
+        )
+    if len(rows) != len(expected_scores) * expected_replicates:
+        raise ValueError(
+            f"bootstrap row count differs from score_count * {expected_replicates:,}"
+        )
+    return result
+
+
+def validate_report_receipt(
+    model_name: str,
+    metrics_path: Path,
+    bootstrap_path: Path,
+    receipt_path: Path,
+    metrics: dict[str, Any],
+    freeze: dict[str, Any],
+    frozen_scores: list[str],
+) -> dict[str, Any]:
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if receipt.get("schema_version") != "importance-score-formal-report-receipt-v0.1":
+        raise SystemExit(f"{model_name} formal report receipt has an unexpected schema")
+    if receipt.get("status") != "sealed formal report outputs":
+        raise SystemExit(f"{model_name} formal report receipt is not sealed")
+    if receipt.get("model_id") != metrics.get("model_id"):
+        raise SystemExit(f"{model_name} metrics and report receipt model IDs differ")
+    outputs = receipt.get("output_hashes", {})
+    if outputs.get("metrics-by-model.json") != sha256_file(metrics_path):
+        raise SystemExit(f"{model_name} metrics differ from their report receipt")
+    if outputs.get("bootstrap-samples.parquet") != sha256_file(bootstrap_path):
+        raise SystemExit(f"{model_name} bootstrap samples differ from their report receipt")
+    if set(receipt.get("candidate_score_columns", [])) != set(frozen_scores):
+        raise SystemExit(f"{model_name} report receipt score set differs from the freeze")
+    formal_settings = receipt.get("execution_settings", {}).get("formal_report")
+    if formal_settings != EXPECTED_FORMAL_SETTINGS:
+        raise SystemExit(f"{model_name} formal report settings differ from the frozen contract")
+    if metrics.get("execution_settings", {}).get("formal_report") != formal_settings:
+        raise SystemExit(f"{model_name} metrics and report receipt settings differ")
+    frozen_implementations = freeze.get("implementation_hashes", {})
+    implementations = receipt.get("implementation_hashes", {})
+    for name in (
+        "report-importance-score-formal.py",
+        "summarize-importance-score-screen.py",
+    ):
+        if implementations.get(name) != frozen_implementations.get(name):
+            raise SystemExit(f"{model_name} {name} differs from the candidate freeze")
+        if metrics.get("implementation_hashes", {}).get(name) != implementations.get(name):
+            raise SystemExit(f"{model_name} metrics and report receipt disagree on {name}")
+    bootstrap_contract = receipt.get("bootstrap_contract", {})
+    if (
+        bootstrap_contract.get("replicates_per_score") != EXPECTED_BOOTSTRAP_REPLICATES
+        or bootstrap_contract.get("score_count") != len(frozen_scores)
+        or bootstrap_contract.get("row_count")
+        != EXPECTED_BOOTSTRAP_REPLICATES * len(frozen_scores)
+        or bootstrap_contract.get("expected_row_count")
+        != EXPECTED_BOOTSTRAP_REPLICATES * len(frozen_scores)
+    ):
+        raise SystemExit(f"{model_name} bootstrap receipt differs from the frozen contract")
+    return receipt
 
 
 def paired_worst_model_difference(
@@ -101,6 +189,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gemma-metrics", type=Path, required=True)
     parser.add_argument("--qwen-bootstrap", type=Path, required=True)
     parser.add_argument("--gemma-bootstrap", type=Path, required=True)
+    parser.add_argument("--qwen-report-receipt", type=Path, required=True)
+    parser.add_argument("--gemma-report-receipt", type=Path, required=True)
     parser.add_argument("--qwen-candidate-freeze", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -115,14 +205,25 @@ def main() -> int:
             "gemma_metrics": args.gemma_metrics,
             "qwen_bootstrap": args.qwen_bootstrap,
             "gemma_bootstrap": args.gemma_bootstrap,
+            "qwen_report_receipt": args.qwen_report_receipt,
+            "gemma_report_receipt": args.gemma_report_receipt,
             "qwen_candidate_freeze": args.qwen_candidate_freeze,
         }.items()
     }
     qwen = json.loads(paths["qwen_metrics"].read_text(encoding="utf-8"))
     gemma = json.loads(paths["gemma_metrics"].read_text(encoding="utf-8"))
     freeze = json.loads(paths["qwen_candidate_freeze"].read_text(encoding="utf-8"))
+    current_two_model_hash = sha256_file(Path(__file__).resolve())
+    if freeze.get("implementation_hashes", {}).get(
+        "report-importance-score-two-model.py"
+    ) != current_two_model_hash:
+        raise SystemExit("current two-model report implementation differs from the candidate freeze")
     if freeze["input_hashes"]["qwen_metrics"] != sha256_file(paths["qwen_metrics"]):
         raise SystemExit("Qwen metrics differ from the sealed candidate freeze")
+    if freeze["input_hashes"].get("qwen_report_receipt") != sha256_file(
+        paths["qwen_report_receipt"]
+    ):
+        raise SystemExit("Qwen formal report receipt differs from the candidate freeze")
     order = gemma.get("paired_cohort_audit", {}).get("lockbox_order_audit") or {}
     if order.get("qwen_candidate_freeze_sha256") != sha256_file(
         paths["qwen_candidate_freeze"]
@@ -133,17 +234,29 @@ def main() -> int:
         raise SystemExit("Gemma metrics do not prove a score-before-label join")
     if order.get("sealed_score_table_sha256") != prejoin.get("score_table_sha256"):
         raise SystemExit("Gemma label authorization and joined score table hashes differ")
-    frozen_implementations = freeze.get("implementation_hashes", {})
-    for model_name, metrics in (("Qwen", qwen), ("Gemma", gemma)):
-        report_hash = metrics.get("implementation_hashes", {}).get(
-            "report-importance-score-formal.py"
-        )
-        if report_hash != frozen_implementations.get("report-importance-score-formal.py"):
-            raise SystemExit(f"{model_name} report implementation differs from the candidate freeze")
-
     frozen_scores = list(freeze["candidate_scores_transferred_unchanged"])
     if set(frozen_scores) != set(qwen["scores"]) or set(frozen_scores) != set(gemma["scores"]):
         raise SystemExit("Qwen/Gemma score sets differ from the sealed candidate table")
+    qwen_receipt = validate_report_receipt(
+        "Qwen",
+        paths["qwen_metrics"],
+        paths["qwen_bootstrap"],
+        paths["qwen_report_receipt"],
+        qwen,
+        freeze,
+        frozen_scores,
+    )
+    gemma_receipt = validate_report_receipt(
+        "Gemma",
+        paths["gemma_metrics"],
+        paths["gemma_bootstrap"],
+        paths["gemma_report_receipt"],
+        gemma,
+        freeze,
+        frozen_scores,
+    )
+    q_bootstrap = bootstrap_arrays(paths["qwen_bootstrap"], frozen_scores)
+    g_bootstrap = bootstrap_arrays(paths["gemma_bootstrap"], frozen_scores)
     rows = []
     finalists = []
     for score in frozen_scores:
@@ -181,8 +294,6 @@ def main() -> int:
         by_id = {row["score_id"]: row for row in rows}
         ordered = sorted(finalists, key=lambda score: (-by_id[score]["worst_model_rho"], score))
         provisional = ordered[0]
-        q_bootstrap = bootstrap_arrays(paths["qwen_bootstrap"])
-        g_bootstrap = bootstrap_arrays(paths["gemma_bootstrap"])
         rho_comparisons = [
             paired_worst_model_difference(
                 q_bootstrap, g_bootstrap, provisional, other, "rho"
@@ -216,8 +327,9 @@ def main() -> int:
             else:
                 decision = "HOLD: statistical tie"
                 reason = (
-                    "Frozen rho/tau paired comparisons did not separate every finalist; paired "
-                    "AUC/Precision@K/KL tie-break resampling is required before selecting a winner."
+                    "The pre-frozen paired worst-model rho/tau comparisons did not separate every "
+                    "finalist. AUC/Precision@K/KL remain reported point estimates only; no unfrozen "
+                    "post-lockbox resampling or winner selection is permitted."
                 )
 
     output = {
@@ -228,18 +340,44 @@ def main() -> int:
             "gemma_prejoin_score_sha256": prejoin["score_table_sha256"],
             "formula_or_threshold_change_after_gemma": False,
             "third_model_required": False,
+            "validation_scope": (
+                "This receipt proves the sealed Qwen freeze, authorized Gemma prejoin/label order, "
+                "formal report hashes, and frozen implementations used by this decision."
+            ),
         },
         "candidate_rows": rows,
         "two_model_finalists": finalists,
         "paired_bootstrap_comparisons": comparisons,
-        "metric_tie_break_order": list(METRIC_ORDER),
+        "preregistered_metric_order": list(METRIC_ORDER),
+        "implemented_paired_metric_order": list(IMPLEMENTED_PAIRED_METRICS),
+        "unimplemented_metric_policy": (
+            "AUC_within, Precision_at_K, and KL_rho are not resampled by v0.1. If rho/tau-b do "
+            "not separate finalists, the only authorized decision is HOLD: statistical tie."
+        ),
         "decision": decision,
         "winner_candidate": winner,
         "reason": reason,
         "phase_6_authorized": decision == "WINNER",
+        "report_receipts": {
+            "qwen": {
+                "path": str(paths["qwen_report_receipt"]),
+                "sha256": sha256_file(paths["qwen_report_receipt"]),
+                "model_id": qwen_receipt["model_id"],
+            },
+            "gemma": {
+                "path": str(paths["gemma_report_receipt"]),
+                "sha256": sha256_file(paths["gemma_report_receipt"]),
+                "model_id": gemma_receipt["model_id"],
+            },
+        },
         "input_hashes": {name: sha256_file(path) for name, path in paths.items()},
     }
     output_dir = args.output_dir.expanduser().resolve()
+    existing_outputs = [
+        output_dir / name for name in OUTPUT_FILENAMES if (output_dir / name).exists()
+    ]
+    if existing_outputs:
+        raise SystemExit(f"refusing to overwrite sealed two-model outputs: {existing_outputs}")
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "two-model-decision.json"
     json_path.write_text(

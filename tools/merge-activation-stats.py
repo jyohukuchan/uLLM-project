@@ -38,6 +38,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def merged_execution_provenance(metadata: list[dict]) -> tuple[str, str]:
+    """Return a single explicit execution device/class or reject mixed provenance."""
+
+    provenance = [(item.get("require_cpu"), item.get("device")) for item in metadata]
+    if all(require_cpu is True and device == "cpu" for require_cpu, device in provenance):
+        return "cpu", "cpu"
+
+    if not all(require_cpu is False for require_cpu, _device in provenance):
+        raise SystemExit(
+            "activation-stat shards must all be explicit CPU runs or all be matching explicit GPU runs"
+        )
+    devices = [device for _require_cpu, device in provenance]
+    if any(not isinstance(device, str) or not device or device == "auto" for device in devices):
+        raise SystemExit("GPU activation-stat shards require an explicit device")
+    if len(set(devices)) != 1:
+        raise SystemExit("GPU activation-stat shard devices differ")
+    try:
+        parsed_device = torch.device(devices[0])
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"invalid activation-stat shard device: {devices[0]}") from exc
+    if parsed_device.type in {"cpu", "meta"}:
+        raise SystemExit("GPU activation-stat shards require a non-CPU execution device")
+    return devices[0], "gpu"
+
+
 def main() -> int:
     args = parse_args()
     input_dirs = [path.expanduser().resolve() for path in args.input_dir]
@@ -48,8 +73,7 @@ def main() -> int:
     modules = [set(item["modules"]) for item in metadata]
     if any(module_set != modules[0] for module_set in modules[1:]):
         raise SystemExit("module coverage differs across activation-stat shards")
-    if any(item.get("device") != "cpu" or not item.get("require_cpu") for item in metadata):
-        raise SystemExit("all activation-stat shards must be explicitly CPU-only")
+    execution_device, device_class = merged_execution_provenance(metadata)
     stats = [load_stats(path / "activation_second_moments.safetensors") for path in input_dirs]
     if any(set(item) != set(stats[0]) for item in stats[1:]):
         raise SystemExit("stat key coverage differs across shards")
@@ -98,6 +122,9 @@ def main() -> int:
         "tokens_seen": sum(int(item["tokens_seen"]) for item in metadata),
         "samples_seen": sum(int(item["samples_seen"]) for item in metadata),
         "module_count": len(modules[0]),
+        "execution_device": execution_device,
+        "device_class": device_class,
+        "merge_implementation_sha256": sha256_file(Path(__file__).resolve()),
         "stat_dtype": "float64 second moment and mean_abs; float32 max_abs",
         "padding_mask_policy": metadata[0].get("padding_mask_policy"),
         "output_sha256": sha256_file(output_path),

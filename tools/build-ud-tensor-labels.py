@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import hashlib
 import json
 import re
@@ -68,6 +69,19 @@ CORE_FAMILIES = {
     "mlp_up",
     "mlp_down",
 }
+LOCKBOX_SHARED_IMPLEMENTATIONS = (
+    "build-importance-score-prejoin.py",
+    "report-importance-score-formal.py",
+    "summarize-importance-score-screen.py",
+    "run-aq-tensor-sample.py",
+    "score-block-covariance-c1.py",
+    "run-importance-single-tensor-perturbation.py",
+)
+LOCKBOX_INPUT_HASHES = (
+    "candidate_manifest",
+    "score_registry",
+    "corpus_manifest",
+)
 
 
 def shape_json(shape: list[int] | tuple[int, ...] | None) -> str:
@@ -223,16 +237,24 @@ def verify_lockbox_order(
     score_path = Path(str(receipt.get("score_table_path", ""))).expanduser().resolve()
     if not score_path.is_file() or sha256_file(score_path) != receipt.get("score_table_sha256"):
         raise ValueError("sealed prejoin score table is missing or differs from its receipt")
+    freeze_inputs = freeze.get("input_hashes", {})
+    receipt_inputs = receipt.get("input_hashes", {})
+    compared_inputs = {}
+    for name in LOCKBOX_INPUT_HASHES:
+        compared_inputs[name] = {
+            "candidate_freeze": freeze_inputs.get(name),
+            "prejoin_receipt": receipt_inputs.get(name),
+        }
+        if not compared_inputs[name]["candidate_freeze"] or (
+            compared_inputs[name]["candidate_freeze"]
+            != compared_inputs[name]["prejoin_receipt"]
+        ):
+            raise ValueError(f"lockbox input hash mismatch for {name}")
+
     freeze_hashes = freeze.get("implementation_hashes", {})
     receipt_hashes = receipt.get("implementation_hashes", {})
     compared = {}
-    for name in (
-        "build-importance-score-prejoin.py",
-        "report-importance-score-formal.py",
-        "run-aq-tensor-sample.py",
-        "score-block-covariance-c1.py",
-        "run-importance-single-tensor-perturbation.py",
-    ):
+    for name in LOCKBOX_SHARED_IMPLEMENTATIONS:
         compared[name] = {
             "candidate_freeze": freeze_hashes.get(name),
             "prejoin_receipt": receipt_hashes.get(name),
@@ -241,7 +263,32 @@ def verify_lockbox_order(
             compared[name]["candidate_freeze"] != compared[name]["prejoin_receipt"]
         ):
             raise ValueError(f"lockbox implementation hash mismatch for {name}")
-    if str(freeze.get("created_at_utc", "")) >= str(receipt.get("created_at_utc", "")):
+    label_builder_hash = freeze_hashes.get("build-ud-tensor-labels.py")
+    if label_builder_hash != sha256_file(Path(__file__).resolve()):
+        raise ValueError("current Gemma label builder differs from the candidate freeze")
+
+    frozen_settings = freeze.get("execution_settings", {}).get(
+        "prejoin_score_generation"
+    )
+    if not isinstance(frozen_settings, dict) or receipt.get("execution_settings") != frozen_settings:
+        raise ValueError("prejoin execution settings differ from the Qwen candidate freeze")
+    frozen_scores = freeze.get("candidate_scores_transferred_unchanged")
+    receipt_scores = receipt.get("candidate_score_columns")
+    if not isinstance(frozen_scores, list) or receipt_scores != frozen_scores:
+        raise ValueError("prejoin candidate score columns differ from the Qwen candidate freeze")
+    if not set(frozen_scores).issubset(set(receipt.get("score_columns", []))):
+        raise ValueError("prejoin receipt does not contain every frozen candidate score column")
+    if freeze.get("workspace_git_head") != receipt.get("workspace_git_head"):
+        raise ValueError("candidate freeze and prejoin receipt use different workspace revisions")
+
+    try:
+        freeze_time = dt.datetime.fromisoformat(str(freeze.get("created_at_utc", "")))
+        receipt_time = dt.datetime.fromisoformat(str(receipt.get("created_at_utc", "")))
+    except ValueError as error:
+        raise ValueError("lockbox timestamps are not valid ISO-8601") from error
+    if freeze_time.utcoffset() is None or receipt_time.utcoffset() is None:
+        raise ValueError("lockbox timestamps must include a timezone")
+    if freeze_time >= receipt_time:
         raise ValueError("prejoin score receipt is not later than the Qwen candidate freeze")
     return {
         "status": "order verified before invoking gguf-dump",
@@ -251,6 +298,9 @@ def verify_lockbox_order(
         "prejoin_score_receipt_sha256": sha256_file(score_receipt_path),
         "sealed_score_table_path": str(score_path),
         "sealed_score_table_sha256": receipt["score_table_sha256"],
+        "candidate_score_columns": frozen_scores,
+        "execution_settings": frozen_settings,
+        "input_hash_comparison": compared_inputs,
         "implementation_hash_comparison": compared,
     }
 

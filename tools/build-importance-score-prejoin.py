@@ -29,6 +29,22 @@ FORBIDDEN_ROSTER_KEYS = {
     "promoted",
 }
 
+PRIMARY_SCORE_ORDER = (
+    "C0_I",
+    "C1_I",
+    "C4_I",
+    "S_AWQ_level",
+    "S_AWQ_tail",
+    "S_range",
+)
+FROZEN_EXECUTION_SETTINGS = {
+    "weight_sample_size": 65536,
+    "seed": 0,
+    "torch_threads": 16,
+    "torch_interop_threads": 1,
+    "activation_stat_shard_count": 4,
+}
+
 
 def load_report_module():
     path = Path(__file__).resolve().parent / "report-importance-score-formal.py"
@@ -107,6 +123,18 @@ def main() -> int:
         raise SystemExit("prejoin score build requires exactly four activation-stat shards")
     if min(args.weight_sample_size, args.torch_threads, args.torch_interop_threads) < 1:
         raise SystemExit("sample and thread counts must be positive")
+    execution_settings = {
+        "weight_sample_size": args.weight_sample_size,
+        "seed": args.seed,
+        "torch_threads": args.torch_threads,
+        "torch_interop_threads": args.torch_interop_threads,
+        "activation_stat_shard_count": len(args.shard_stats),
+    }
+    if execution_settings != FROZEN_EXECUTION_SETTINGS:
+        raise SystemExit(
+            "lockbox prejoin execution settings differ from the frozen v0.1 contract: "
+            f"{execution_settings} != {FROZEN_EXECUTION_SETTINGS}"
+        )
     torch.set_num_threads(args.torch_threads)
     torch.set_num_interop_threads(args.torch_interop_threads)
     output_dir = args.output_dir.expanduser().resolve()
@@ -176,6 +204,9 @@ def main() -> int:
         raise RuntimeError(f"prejoin score table leaked label fields: {forbidden_output}")
     if {row["hf_name"] for row in rows} != {row["hf_name"] for row in roster}:
         raise RuntimeError("prejoin score table tensor set differs from source roster")
+    candidate_score_columns = [
+        score for score in PRIMARY_SCORE_ORDER if all(score in row for row in rows)
+    ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     with scores_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -206,6 +237,7 @@ def main() -> int:
         "shard_scores_sha256": sha256_file(shard_path),
         "tensor_count": len(rows),
         "tensor_name_set_sha256": tensor_set_sha,
+        "candidate_score_columns": candidate_score_columns,
         "score_columns": sorted({
             key
             for row in rows
@@ -213,6 +245,7 @@ def main() -> int:
             if key.startswith("C") or key.startswith("S_")
         }),
         "forbidden_label_keys_verified_absent": sorted(FORBIDDEN_ROSTER_KEYS),
+        "execution_settings": execution_settings,
         "input_hashes": input_hashes,
         "implementation_hashes": {
             name: sha256_file(tool_dir / name)

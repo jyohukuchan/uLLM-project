@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect CPU-only block-diagonal input covariance for C1.
+"""Collect block-diagonal input covariance for C1 on an explicit device.
 
 The primary block width is fixed at 128 channels by the frozen plan.  Products
 are evaluated in FP32 and accumulated/stored in FP64.  Modules that provably
@@ -17,6 +17,7 @@ import importlib.util
 import json
 import re
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,6 +105,20 @@ def sha256_file(path: Path | None) -> str | None:
     return digest.hexdigest()
 
 
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def timing_snapshot(
+    device: torch.device, started_at: float, samples_seen: int
+) -> tuple[float, float]:
+    synchronize_device(device)
+    elapsed_seconds = max(time.perf_counter() - started_at, 0.0)
+    samples_per_second = samples_seen / elapsed_seconds if elapsed_seconds > 0.0 else 0.0
+    return elapsed_seconds, samples_per_second
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -116,6 +131,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-cpu", action="store_true")
     parser.add_argument("--max-samples", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=0,
+        help="Emit a JSON progress row to stderr every N batches; 0 disables it.",
+    )
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--torch-threads", type=int, default=16)
@@ -139,8 +160,11 @@ def main() -> int:
     args = parse_args()
     if args.require_cpu and args.device != "cpu":
         raise SystemExit("--require-cpu requires --device cpu")
-    if min(args.max_samples, args.batch_size, args.sequence_length, args.block_size) < 1:
-        raise SystemExit("sample, batch, sequence, and block sizes must be positive")
+    if (
+        min(args.max_samples, args.batch_size, args.sequence_length, args.block_size) < 1
+        or args.progress_every_batches < 0
+    ):
+        raise SystemExit("sample, batch, sequence, and block sizes must be positive; progress must be >= 0")
     if args.block_size != 128:
         raise SystemExit("the formal C1 primary requires --block-size 128")
     args.model_dir = args.model_dir.expanduser().resolve()
@@ -185,9 +209,12 @@ def main() -> int:
     device = next(model.parameters()).device
     samples_seen = 0
     tokens_seen = 0
+    batches_seen = 0
     domains: Counter[str] = Counter()
     record_digest = hashlib.sha256()
     examples_iter = iter(COLLECTOR.iter_examples(args.prompt_file))
+    synchronize_device(device)
+    collection_started_at = time.perf_counter()
     try:
         with torch.inference_mode():
             while samples_seen < args.max_samples:
@@ -218,12 +245,37 @@ def main() -> int:
                     model(**batch)
                 active_mask["value"] = None
                 samples_seen += len(examples)
+                batches_seen += 1
                 for example in examples:
                     domains[str(example.get("domain", "unknown"))] += 1
                     record_digest.update(str(example["record_id"]).encode("utf-8") + b"\n")
+                if args.progress_every_batches and batches_seen % args.progress_every_batches == 0:
+                    elapsed_seconds, samples_per_second = timing_snapshot(
+                        device, collection_started_at, samples_seen
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "run_id": args.run_id,
+                                "stage": "block_covariance_collection",
+                                "batches_seen": batches_seen,
+                                "samples_seen": samples_seen,
+                                "tokens_seen": tokens_seen,
+                                "elapsed_seconds": elapsed_seconds,
+                                "samples_per_second": samples_per_second,
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
     finally:
         for handle in handles:
             handle.remove()
+
+    elapsed_seconds, samples_per_second = timing_snapshot(
+        device, collection_started_at, samples_seen
+    )
 
     output_path = args.output_dir / "block_covariance_128.safetensors"
     save_file(
@@ -242,6 +294,10 @@ def main() -> int:
         "shard_id": args.shard_id,
         "samples_seen": samples_seen,
         "tokens_seen": tokens_seen,
+        "batches_seen": batches_seen,
+        "progress_every_batches": args.progress_every_batches,
+        "elapsed_seconds": elapsed_seconds,
+        "samples_per_second": samples_per_second,
         "domain_counts": dict(sorted(domains.items())),
         "processed_record_ids_sha256": record_digest.hexdigest(),
         "sequence_length": args.sequence_length,
@@ -273,7 +329,20 @@ def main() -> int:
         json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    print(json.dumps({"samples_seen": samples_seen, "tokens_seen": tokens_seen, "modules": len(accumulators)}))
+    print(
+        json.dumps(
+            {
+                "samples_seen": samples_seen,
+                "tokens_seen": tokens_seen,
+                "batches_seen": batches_seen,
+                "modules": len(accumulators),
+                "elapsed_seconds": elapsed_seconds,
+                "samples_per_second": samples_per_second,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return 0
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run bounded CPU-only C4 block perturbation or C6 full-vocabulary KL."""
+"""Run bounded C4 block perturbation or C6 full-vocabulary KL on an explicit device."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import argparse
 import datetime as dt
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +36,30 @@ SAMPLER = load_tool("run-aq-tensor-sample.py", "importance_perturb_sampler")
 COLLECTOR = load_tool("collect-activation-stats.py", "importance_perturb_collector")
 
 
+FORMAL_C4_SHARD_COUNT = 4
+FORMAL_C4_TEMP_CACHE_LIMIT_BYTES = 8 * 1024**3
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def elapsed_since(device: torch.device, started_at: float) -> float:
+    synchronize_device(device)
+    return max(time.perf_counter() - started_at, 0.0)
+
+
+def emit_progress(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def canonical_sha(value: Any) -> str:
@@ -107,6 +127,50 @@ def make_batches(tokenizer, examples: list[dict[str, Any]], batch_size: int, seq
             }
         )
     return batches
+
+
+def prepare_formal_c4_shards(
+    tokenizer,
+    prompt_paths: list[Path],
+    batch_size: int,
+    sequence_length: int,
+) -> list[dict[str, Any]]:
+    """Load four disjoint prompt shards in their explicit command-line order."""
+
+    if len(prompt_paths) != FORMAL_C4_SHARD_COUNT:
+        raise SystemExit(
+            f"formal C4 requires exactly {FORMAL_C4_SHARD_COUNT} --prompt-shard arguments"
+        )
+    if len(set(prompt_paths)) != len(prompt_paths):
+        raise SystemExit("formal C4 prompt shard paths must be distinct")
+    seen_record_ids: set[str] = set()
+    shards = []
+    for shard_index, path in enumerate(prompt_paths):
+        examples = load_examples(path)
+        if not examples:
+            raise SystemExit(f"formal C4 prompt shard is empty: {path}")
+        record_ids = [str(item["record_id"]) for item in examples]
+        duplicates = seen_record_ids.intersection(record_ids)
+        if duplicates:
+            raise SystemExit(
+                "formal C4 prompt shards overlap in record IDs: "
+                + ", ".join(sorted(duplicates))
+            )
+        if len(set(record_ids)) != len(record_ids):
+            raise SystemExit(f"formal C4 prompt shard contains duplicate record IDs: {path}")
+        seen_record_ids.update(record_ids)
+        shards.append(
+            {
+                "shard_index": shard_index,
+                "path": path,
+                "sha256": sha256_file(path),
+                "examples": examples,
+                "batches": make_batches(tokenizer, examples, batch_size, sequence_length),
+                "record_ids": record_ids,
+                "domains": [str(item.get("domain", "unknown")) for item in examples],
+            }
+        )
+    return shards
 
 
 def model_module(model: torch.nn.Module, hf_stem: str) -> tuple[str, torch.nn.Module]:
@@ -305,6 +369,126 @@ def load_or_quantize(
     return quantized, quantization, cache_path
 
 
+class FormalC4EphemeralCache:
+    """Run-owned, layer-scoped cache with a strict active-byte ceiling."""
+
+    def __init__(
+        self,
+        base_dir: Path,
+        run_id: str,
+        output_path: Path,
+        max_active_bytes: int,
+    ) -> None:
+        if max_active_bytes < 1 or max_active_bytes > FORMAL_C4_TEMP_CACHE_LIMIT_BYTES:
+            raise ValueError(
+                "formal C4 cache limit must be in [1, 8 GiB]"
+            )
+        base_dir.mkdir(parents=True, exist_ok=True)
+        owner = canonical_sha(
+            {
+                "run_id": run_id,
+                "output": str(output_path),
+                "pid": os.getpid(),
+                "time_ns": time.time_ns(),
+            }
+        )[:16]
+        self.root = base_dir / f"formal-c4-{owner}"
+        self.root.mkdir(parents=False, exist_ok=False)
+        self.max_active_bytes = int(max_active_bytes)
+        self.active_bytes = 0
+        self.peak_bytes = 0
+        self.layer_peak_bytes = 0
+        self.files_created = 0
+        self._active_paths: list[Path] = []
+        self._created_directories: list[Path] = []
+        self._layer_dir: Path | None = None
+
+    def begin_layer(self, layer_name: str) -> Path:
+        if self._active_paths or self._layer_dir is not None or self.active_bytes:
+            raise RuntimeError("formal C4 cache layer changed before prior cleanup")
+        layer_key = canonical_sha({"layer": layer_name})[:16]
+        layer_dir = self.root / f"layer-{layer_key}"
+        layer_dir.mkdir(parents=False, exist_ok=False)
+        self._created_directories.append(layer_dir)
+        self._layer_dir = layer_dir
+        self.layer_peak_bytes = 0
+        return layer_dir
+
+    def store(
+        self,
+        metadata: dict[str, Any],
+        quantization: dict[str, Any],
+        quantized: torch.Tensor,
+    ) -> Path:
+        if self._layer_dir is None:
+            raise RuntimeError("formal C4 cache has no active layer")
+        payload = {
+            "metadata": metadata,
+            "quantization": quantization,
+            "weight": quantized,
+        }
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        serialized_bytes = buffer.getbuffer().nbytes
+        if self.active_bytes + serialized_bytes > self.max_active_bytes:
+            raise RuntimeError(
+                "formal C4 active temporary cache would exceed 8 GiB hard cap: "
+                f"active={self.active_bytes}, next={serialized_bytes}, "
+                f"configured_limit={self.max_active_bytes}"
+            )
+        path = self._layer_dir / f"{canonical_sha(metadata)}.pt"
+        if path.exists():
+            raise RuntimeError(f"formal C4 cache path collision: {path}")
+        try:
+            with path.open("xb") as handle:
+                handle.write(buffer.getbuffer())
+        except BaseException:
+            # The path is run-owned but is not tracked until its write completes.
+            # Remove a partial file so cleanup_layer() can always remove the layer.
+            if path.exists():
+                path.unlink()
+            raise
+        actual_bytes = path.stat().st_size
+        if actual_bytes != serialized_bytes:
+            path.unlink()
+            raise RuntimeError("formal C4 cache serialized byte count changed while writing")
+        self._active_paths.append(path)
+        self.active_bytes += actual_bytes
+        self.peak_bytes = max(self.peak_bytes, self.active_bytes)
+        self.layer_peak_bytes = max(self.layer_peak_bytes, self.active_bytes)
+        self.files_created += 1
+        return path
+
+    @staticmethod
+    def load(path: Path, expected_metadata: dict[str, Any]) -> dict[str, Any]:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("metadata") != expected_metadata:
+            raise ValueError(f"formal C4 cache metadata mismatch: {path}")
+        return payload
+
+    def cleanup_layer(self) -> None:
+        for path in reversed(self._active_paths):
+            if path.exists():
+                size = path.stat().st_size
+                path.unlink()
+                self.active_bytes -= size
+        self._active_paths.clear()
+        if self.active_bytes != 0:
+            raise RuntimeError("formal C4 cache active-byte accounting did not return to zero")
+        if self._layer_dir is not None:
+            if self._layer_dir.exists():
+                self._layer_dir.rmdir()
+            self._layer_dir = None
+
+    def cleanup_run(self) -> None:
+        self.cleanup_layer()
+        for directory in reversed(self._created_directories):
+            if directory.exists():
+                directory.rmdir()
+        if self.root.exists():
+            self.root.rmdir()
+
+
 def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
     return {key: value.to(device) for key, value in batch["tensors"].items()}
 
@@ -423,7 +607,13 @@ def validate_c4_call_cache(layer_modules, reference, device: torch.device) -> di
     return result
 
 
-def candidate_c4(batches, layer_name: str, layer_module, reference, device: torch.device):
+def candidate_c4_sums(
+    batches,
+    layer_name: str,
+    layer_module,
+    reference,
+    device: torch.device,
+) -> dict[str, float | int]:
     numerator = 0.0
     denominator = 0.0
     tokens = 0
@@ -448,11 +638,522 @@ def candidate_c4(batches, layer_name: str, layer_module, reference, device: torc
             denominator += float(ref64.square().sum(dim=-1)[valid].sum())
             tokens += int(valid.sum())
     return {
+        "numerator": numerator,
+        "reference_denominator": denominator,
+        "valid_tokens": tokens,
+    }
+
+
+def merge_c4_sums(parts: list[dict[str, float | int]]) -> dict[str, float | int]:
+    return {
+        "numerator": math.fsum(float(part["numerator"]) for part in parts),
+        "reference_denominator": math.fsum(
+            float(part["reference_denominator"]) for part in parts
+        ),
+        "valid_tokens": sum(int(part["valid_tokens"]) for part in parts),
+    }
+
+
+def c4_metrics_from_sums(
+    sums: dict[str, float | int],
+    *,
+    execution: str = "isolated target block on cached BF16 reference block inputs",
+) -> dict[str, float | int | str]:
+    numerator = float(sums["numerator"])
+    denominator = float(sums["reference_denominator"])
+    tokens = int(sums["valid_tokens"])
+    return {
         "C4_A": numerator / max(tokens, 1),
         "C4_reference_energy": denominator / max(tokens, 1),
         "C4_L": numerator / max(denominator, 1e-30),
         "valid_tokens": tokens,
-        "execution": "isolated target block on cached BF16 reference block inputs",
+        "execution": execution,
+    }
+
+
+def candidate_c4(batches, layer_name: str, layer_module, reference, device: torch.device):
+    return c4_metrics_from_sums(
+        candidate_c4_sums(batches, layer_name, layer_module, reference, device)
+    )
+
+
+def reference_c4_one_layer(
+    model,
+    batches,
+    layer_name: str,
+    layer_module: torch.nn.Module,
+    device: torch.device,
+):
+    """Capture exactly one model/layer/shard reference working set."""
+
+    return reference_c4(model, batches, {layer_name: layer_module}, device)
+
+
+def formal_c4_input_signature(
+    args: argparse.Namespace,
+    selection: list[dict[str, Any]],
+    candidates: list[Any],
+    shards: list[dict[str, Any]],
+    codebook_file_sha: str,
+    stats_sha: str,
+) -> str:
+    return canonical_sha(
+        {
+            "schema_version": "importance-score-formal-c4-input-v0.1",
+            "run_id": args.run_id,
+            "model_dir": str(args.model_dir),
+            "tensor_selection_sha256": sha256_file(args.tensor_selection),
+            "selected_tensor_names": [str(row["hf_name"]) for row in selection],
+            "candidate_ids": [candidate.candidate_id for candidate in candidates],
+            "prompt_shards": [
+                {
+                    "index": int(shard["shard_index"]),
+                    "sha256": str(shard["sha256"]),
+                    "record_ids": list(shard["record_ids"]),
+                }
+                for shard in shards
+            ],
+            "activation_stats_sha256": stats_sha,
+            "family_codebooks_sha256": codebook_file_sha,
+            "batch_size": args.batch_size,
+            "sequence_length": args.sequence_length,
+            "max_fit_elements": args.max_fit_elements,
+            "scale_window": args.scale_window,
+            "group_chunk": args.group_chunk,
+            "dtype": args.dtype,
+            "seed": args.seed,
+            "sampler_sha256": sha256_file(
+                Path(__file__).resolve().parent / "run-aq-tensor-sample.py"
+            ),
+        }
+    )
+
+
+def completed_work_keys(
+    output: Path,
+    mode: str,
+    *,
+    formal_c4_signature: str | None = None,
+) -> set[tuple[str, str, str]]:
+    completed: set[tuple[str, str, str]] = set()
+    if not output.is_file():
+        return completed
+    for line_number, line in enumerate(output.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("status") != "ok" or row.get("mode") != mode:
+            continue
+        if formal_c4_signature is not None:
+            observed = row.get("formal_c4_input_signature_sha256")
+            if observed != formal_c4_signature:
+                raise SystemExit(
+                    "formal C4 resume row has different frozen inputs at "
+                    f"{output}:{line_number}"
+                )
+        completed.add((str(row["tensor_name"]), str(row["candidate_id"]), mode))
+    return completed
+
+
+def _layer_sort_key(layer_name: str) -> tuple[int, str]:
+    match = re.search(r"\.layers\.(\d+)(?:\.|$)", layer_name)
+    return (int(match.group(1)) if match else 2**31 - 1, layer_name)
+
+
+def run_formal_c4_streaming(
+    args: argparse.Namespace,
+    model,
+    selection: list[dict[str, Any]],
+    candidates: list[Any],
+    codebooks: dict[tuple[str, str], torch.Tensor],
+    codebook_file_sha: str,
+    activation_stats: dict[str, torch.Tensor],
+    stats_sha: str,
+    target_modules: dict[str, tuple[str, torch.nn.Linear]],
+    layer_modules: dict[str, torch.nn.Module],
+    target_layers: dict[str, str],
+    shards: list[dict[str, Any]],
+    device: torch.device,
+    completed: set[tuple[str, str, str]],
+    input_signature: str,
+    overall_started_at: float,
+) -> dict[str, Any]:
+    work_keys = {
+        (str(selected["hf_name"]), candidate.candidate_id, "c4")
+        for selected in selection
+        for candidate in candidates
+    }
+    completed_before_run = len(work_keys & completed)
+    remaining_before_run = len(work_keys) - completed_before_run
+    completed_this_run = 0
+    candidate_stage_started_at = time.perf_counter()
+    cache = FormalC4EphemeralCache(
+        args.quantized_cache_dir,
+        args.run_id,
+        args.output,
+        args.formal_c4_max_cache_bytes,
+    )
+    selected_by_layer: dict[str, list[dict[str, Any]]] = {}
+    for selected in selection:
+        layer_name = target_layers[str(selected["hf_name"])]
+        selected_by_layer.setdefault(layer_name, []).append(selected)
+    prompt_shard_metadata = [
+        {
+            "shard_index": int(shard["shard_index"]),
+            "path": str(shard["path"]),
+            "sha256": str(shard["sha256"]),
+            "record_count": len(shard["examples"]),
+            "record_ids": list(shard["record_ids"]),
+            "domains": list(shard["domains"]),
+        }
+        for shard in shards
+    ]
+    all_record_ids = [record_id for shard in shards for record_id in shard["record_ids"]]
+
+    emit_progress(
+        {
+            "event": "stage_start",
+            "stage": "formal_c4_layer_shard_streaming",
+            "run_id": args.run_id,
+            "mode": "c4",
+            "layer_count": len(selected_by_layer),
+            "shard_count": len(shards),
+            "tensor_candidates_total": len(work_keys),
+            "tensor_candidates_already_completed": completed_before_run,
+            "tensor_candidates_remaining": remaining_before_run,
+            "elapsed_seconds": time.perf_counter() - overall_started_at,
+        }
+    )
+
+    try:
+        with args.output.open("a", encoding="utf-8", newline="\n") as handle:
+            for layer_name in sorted(selected_by_layer, key=_layer_sort_key):
+                layer_rows = selected_by_layer[layer_name]
+                pending: list[tuple[dict[str, Any], Any]] = []
+                for selected in layer_rows:
+                    tensor_name = str(selected["hf_name"])
+                    for candidate in candidates:
+                        key = (tensor_name, candidate.candidate_id, "c4")
+                        if key not in completed:
+                            pending.append((selected, candidate))
+                if not pending:
+                    continue
+
+                layer_started_at = time.perf_counter()
+                emit_progress(
+                    {
+                        "event": "stage_start",
+                        "stage": "formal_c4_layer",
+                        "run_id": args.run_id,
+                        "mode": "c4",
+                        "layer_name": layer_name,
+                        "pending_tensor_candidates": len(pending),
+                    }
+                )
+                cache.begin_layer(layer_name)
+                prepared: dict[tuple[str, str, str], dict[str, Any]] = {}
+                shard_sums: dict[tuple[str, str, str], list[dict[str, float | int]]] = {
+                    (str(selected["hf_name"]), candidate.candidate_id, "c4"): []
+                    for selected, candidate in pending
+                }
+                elapsed_by_key = {key: 0.0 for key in shard_sums}
+                shard_audits: list[dict[str, Any]] = []
+                layer_peak_temp_bytes = 0
+                try:
+                    for selected, candidate in pending:
+                        tensor_name = str(selected["hf_name"])
+                        family = str(selected["canonical_family"])
+                        key = (tensor_name, candidate.candidate_id, "c4")
+                        _linear_name, linear = target_modules[tensor_name]
+                        original_parameter = linear._parameters["weight"]
+                        if original_parameter is None:
+                            raise RuntimeError(f"target weight parameter missing: {tensor_name}")
+                        activation = SAMPLER.activation_stats_for_tensor(
+                            tensor_name,
+                            tuple(int(value) for value in original_parameter.shape),
+                            activation_stats,
+                        )
+                        codebook = codebooks.get((family, candidate.candidate_id))
+                        if codebook is None:
+                            raise SystemExit(
+                                f"codebook missing: {family}/{candidate.candidate_id}"
+                            )
+                        synchronize_device(device)
+                        quantize_started_at = time.perf_counter()
+                        quantized, quantization = quantize_weight_exact_contract(
+                            original_parameter,
+                            tensor_name,
+                            activation,
+                            candidate,
+                            codebook,
+                            args.max_fit_elements,
+                            args.scale_window,
+                            args.group_chunk,
+                        )
+                        metadata = cache_metadata(
+                            args,
+                            tensor_name,
+                            family,
+                            candidate.candidate_id,
+                            original_parameter,
+                            codebook,
+                            codebook_file_sha,
+                            stats_sha,
+                        )
+                        cache_path = cache.store(metadata, quantization, quantized)
+                        cache_elapsed_seconds = elapsed_since(device, quantize_started_at)
+                        elapsed_by_key[key] += cache_elapsed_seconds
+                        prepared[key] = {
+                            "selected": selected,
+                            "candidate": candidate,
+                            "cache_path": cache_path,
+                            "cache_metadata": metadata,
+                            "quantization": quantization,
+                        }
+                        del quantized
+                        emit_progress(
+                            {
+                                "event": "progress",
+                                "stage": "formal_c4_layer_cache",
+                                "run_id": args.run_id,
+                                "mode": "c4",
+                                "layer_name": layer_name,
+                                "tensor_name": tensor_name,
+                                "candidate_id": candidate.candidate_id,
+                                "active_temp_bytes": cache.active_bytes,
+                                "max_active_temp_bytes": cache.max_active_bytes,
+                                "tensor_candidate_cache_elapsed_seconds": cache_elapsed_seconds,
+                            }
+                        )
+                    layer_peak_temp_bytes = cache.layer_peak_bytes
+
+                    for shard in shards:
+                        shard_index = int(shard["shard_index"])
+                        shard_started_at = time.perf_counter()
+                        emit_progress(
+                            {
+                                "event": "stage_start",
+                                "stage": "formal_c4_reference_shard",
+                                "run_id": args.run_id,
+                                "mode": "c4",
+                                "layer_name": layer_name,
+                                "shard_index": shard_index,
+                                "batch_count": len(shard["batches"]),
+                                "record_count": len(shard["examples"]),
+                            }
+                        )
+                        reference = reference_c4_one_layer(
+                            model,
+                            shard["batches"],
+                            layer_name,
+                            layer_modules[layer_name],
+                            device,
+                        )
+                        cache_audit = validate_c4_call_cache(
+                            {layer_name: layer_modules[layer_name]}, reference, device
+                        )[layer_name]
+                        for selected, candidate in pending:
+                            tensor_name = str(selected["hf_name"])
+                            key = (tensor_name, candidate.candidate_id, "c4")
+                            _linear_name, linear = target_modules[tensor_name]
+                            original_parameter = linear._parameters["weight"]
+                            if original_parameter is None:
+                                raise RuntimeError(
+                                    f"target weight parameter missing: {tensor_name}"
+                                )
+                            synchronize_device(device)
+                            evaluation_started_at = time.perf_counter()
+                            payload = cache.load(
+                                prepared[key]["cache_path"],
+                                prepared[key]["cache_metadata"],
+                            )
+                            linear._parameters["weight"] = torch.nn.Parameter(
+                                payload["weight"].to(
+                                    device=original_parameter.device,
+                                    dtype=original_parameter.dtype,
+                                ),
+                                requires_grad=False,
+                            )
+                            try:
+                                sums = candidate_c4_sums(
+                                    shard["batches"],
+                                    layer_name,
+                                    layer_modules[layer_name],
+                                    reference,
+                                    device,
+                                )
+                            finally:
+                                linear._parameters["weight"] = original_parameter
+                            shard_tensor_elapsed_seconds = elapsed_since(
+                                device, evaluation_started_at
+                            )
+                            elapsed_by_key[key] += shard_tensor_elapsed_seconds
+                            shard_sums[key].append(sums)
+                            del payload
+                            emit_progress(
+                                {
+                                    "event": "progress",
+                                    "stage": "formal_c4_shard_tensor_candidate",
+                                    "run_id": args.run_id,
+                                    "mode": "c4",
+                                    "layer_name": layer_name,
+                                    "shard_index": shard_index,
+                                    "tensor_name": tensor_name,
+                                    "candidate_id": candidate.candidate_id,
+                                    "valid_tokens": int(sums["valid_tokens"]),
+                                    "shard_tensor_candidate_elapsed_seconds": (
+                                        shard_tensor_elapsed_seconds
+                                    ),
+                                }
+                            )
+                        shard_audits.append(
+                            {
+                                "shard_index": shard_index,
+                                "path": str(shard["path"]),
+                                "sha256": str(shard["sha256"]),
+                                "record_count": len(shard["examples"]),
+                                "record_ids": list(shard["record_ids"]),
+                                "batch_count": len(shard["batches"]),
+                                "cache_audit": cache_audit,
+                                "elapsed_seconds": elapsed_since(device, shard_started_at),
+                            }
+                        )
+                        emit_progress(
+                            {
+                                "event": "stage_complete",
+                                "stage": "formal_c4_reference_shard",
+                                "run_id": args.run_id,
+                                "mode": "c4",
+                                "layer_name": layer_name,
+                                "shard_index": shard_index,
+                                "tensor_candidates_completed": len(pending),
+                                "shard_elapsed_seconds": shard_audits[-1][
+                                    "elapsed_seconds"
+                                ],
+                            }
+                        )
+                        del reference
+                finally:
+                    cache.cleanup_layer()
+
+                for selected, candidate in pending:
+                    tensor_name = str(selected["hf_name"])
+                    family = str(selected["canonical_family"])
+                    key = (tensor_name, candidate.candidate_id, "c4")
+                    merged_sums = merge_c4_sums(shard_sums[key])
+                    metrics = c4_metrics_from_sums(
+                        merged_sums,
+                        execution=(
+                            "four fixed shards; one model x one layer x one shard BF16 "
+                            "reference cache; FP64 scalar sum aggregation"
+                        ),
+                    )
+                    row = {
+                        "schema_version": "importance-score-single-tensor-perturbation-v0.1",
+                        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "status": "ok",
+                        "run_id": args.run_id,
+                        "mode": "c4",
+                        "model_dir": str(args.model_dir),
+                        "tensor_name": tensor_name,
+                        "canonical_family": family,
+                        "layer_id": int(selected["layer_id"]),
+                        "layer_module": layer_name,
+                        "candidate_id": candidate.candidate_id,
+                        "elapsed_seconds": elapsed_by_key[key],
+                        "metrics": metrics,
+                        "quantization": prepared[key]["quantization"],
+                        "quantized_cache": str(prepared[key]["cache_path"]),
+                        "quantized_cache_retained": False,
+                        "prompt_file": None,
+                        "prompt_file_sha256": None,
+                        "prompt_shards": prompt_shard_metadata,
+                        "tensor_selection": str(args.tensor_selection),
+                        "tensor_selection_sha256": sha256_file(args.tensor_selection),
+                        "record_count": len(all_record_ids),
+                        "record_ids": all_record_ids,
+                        "sequence_length": args.sequence_length,
+                        "batch_size": args.batch_size,
+                        "device": str(device),
+                        "require_cpu": args.require_cpu,
+                        "reference_dtype": args.dtype,
+                        "codebook_file_sha256": codebook_file_sha,
+                        "activation_stats_sha256": stats_sha,
+                        "c4_reference_cache_audit": shard_audits,
+                        "formal_c4_input_signature_sha256": input_signature,
+                        "c4_streaming_contract": {
+                            "formal": True,
+                            "shard_count": FORMAL_C4_SHARD_COUNT,
+                            "reference_cache_scope": "one model x one layer x one shard",
+                            "reference_cache_dtype": "bfloat16",
+                            "candidate_output_storage": "none; FP64-equivalent Python scalar sums only",
+                            "aggregation": "sum numerator/reference denominator/token count across fixed shards before normalization",
+                            "record_overlap_count": 0,
+                        },
+                        "c4_cache_policy": {
+                            "mode": "run-owned layer-scoped ephemeral disk cache",
+                            "max_active_temp_bytes": cache.max_active_bytes,
+                            "layer_peak_temp_bytes": layer_peak_temp_bytes,
+                            "run_peak_temp_bytes_at_layer": cache.peak_bytes,
+                            "cache_files_created_for_layer": len(pending),
+                            "cleanup_completed_before_row_write": True,
+                            "run_owned_root": str(cache.root),
+                        },
+                        "notes": args.note,
+                    }
+                    handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                    handle.flush()
+                    completed_this_run += 1
+                    if args.progress_every_tensors and (
+                        completed_this_run % args.progress_every_tensors == 0
+                        or completed_this_run == remaining_before_run
+                    ):
+                        emit_progress(
+                            {
+                                "event": "progress",
+                                "stage": "tensor_candidates",
+                                "run_id": args.run_id,
+                                "mode": "c4",
+                                "layer_name": layer_name,
+                                "tensor_name": tensor_name,
+                                "candidate_id": candidate.candidate_id,
+                                "tensor_candidate_elapsed_seconds": elapsed_by_key[key],
+                                "stage_elapsed_seconds": elapsed_since(
+                                    device, candidate_stage_started_at
+                                ),
+                                "tensor_candidates_completed_this_run": completed_this_run,
+                                "tensor_candidates_completed_total": (
+                                    completed_before_run + completed_this_run
+                                ),
+                                "tensor_candidates_total": len(work_keys),
+                            }
+                        )
+                emit_progress(
+                    {
+                        "event": "stage_complete",
+                        "stage": "formal_c4_layer",
+                        "run_id": args.run_id,
+                        "mode": "c4",
+                        "layer_name": layer_name,
+                        "layer_elapsed_seconds": elapsed_since(device, layer_started_at),
+                        "layer_peak_temp_bytes": layer_peak_temp_bytes,
+                    }
+                )
+    finally:
+        cache.cleanup_run()
+
+    return {
+        "mode": "c4",
+        "tensors": len(selection),
+        "candidates": len(candidates),
+        "tensor_candidates_total": len(work_keys),
+        "tensor_candidates_already_completed": completed_before_run,
+        "tensor_candidates_completed_this_run": completed_this_run,
+        "formal_c4_streaming": True,
+        "formal_c4_shards": len(shards),
+        "peak_temp_cache_bytes": cache.peak_bytes,
+        "cache_cleanup_completed": not cache.root.exists(),
+        "elapsed_seconds": elapsed_since(device, overall_started_at),
     }
 
 
@@ -535,11 +1236,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-stats", type=Path, required=True)
     parser.add_argument("--family-codebooks", type=Path, required=True)
     parser.add_argument("--tensor-selection", type=Path, required=True)
-    parser.add_argument("--prompt-file", type=Path, required=True)
+    parser.add_argument("--prompt-file", type=Path)
+    parser.add_argument(
+        "--prompt-shard",
+        type=Path,
+        action="append",
+        default=[],
+        help="Formal C4 only: repeat exactly four times in frozen shard order.",
+    )
     parser.add_argument("--candidate", action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--quantized-cache-dir", type=Path, required=True)
     parser.add_argument("--max-tensors", type=int)
+    parser.add_argument(
+        "--progress-every-tensors",
+        type=int,
+        default=0,
+        help="Emit JSON progress every N completed tensor-candidates; 0 disables it.",
+    )
+    parser.add_argument(
+        "--formal-c4-streaming",
+        action="store_true",
+        help="Enforce four-shard one-layer reference streaming and ephemeral cache limits.",
+    )
+    parser.add_argument(
+        "--formal-c4-max-cache-bytes",
+        type=int,
+        default=FORMAL_C4_TEMP_CACHE_LIMIT_BYTES,
+        help="Active formal C4 cache cap; may be lowered but never exceed 8 GiB.",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--max-fit-elements", type=int, default=65536)
@@ -562,8 +1287,29 @@ def main() -> int:
     args = parse_args()
     if args.require_cpu and args.device != "cpu":
         raise SystemExit("--require-cpu requires --device cpu")
-    if min(args.batch_size, args.sequence_length, args.group_chunk, args.vocab_chunk) < 1:
-        raise SystemExit("batch/sequence/chunk arguments must be positive")
+    if (
+        min(args.batch_size, args.sequence_length, args.group_chunk, args.vocab_chunk) < 1
+        or args.progress_every_tensors < 0
+    ):
+        raise SystemExit("batch/sequence/chunk arguments must be positive; progress must be >= 0")
+    if args.max_tensors is not None and args.max_tensors < 1:
+        raise SystemExit("--max-tensors must be positive")
+    if args.formal_c4_streaming:
+        if args.mode != "c4":
+            raise SystemExit("--formal-c4-streaming is valid only with --mode c4")
+        if args.prompt_file is not None:
+            raise SystemExit("formal C4 uses --prompt-shard, not --prompt-file")
+        if len(args.prompt_shard) != FORMAL_C4_SHARD_COUNT:
+            raise SystemExit(
+                f"formal C4 requires exactly {FORMAL_C4_SHARD_COUNT} --prompt-shard arguments"
+            )
+        if not 1 <= args.formal_c4_max_cache_bytes <= FORMAL_C4_TEMP_CACHE_LIMIT_BYTES:
+            raise SystemExit("formal C4 active cache cap must be in [1, 8 GiB]")
+    else:
+        if args.prompt_file is None:
+            raise SystemExit("non-formal C4/C6 requires --prompt-file")
+        if args.prompt_shard:
+            raise SystemExit("--prompt-shard requires --formal-c4-streaming")
     torch.set_num_threads(args.torch_threads)
     torch.set_num_interop_threads(args.torch_interop_threads)
     torch.manual_seed(args.seed)
@@ -571,12 +1317,22 @@ def main() -> int:
     args.activation_stats = args.activation_stats.expanduser().resolve()
     args.family_codebooks = args.family_codebooks.expanduser().resolve()
     args.tensor_selection = args.tensor_selection.expanduser().resolve()
-    args.prompt_file = args.prompt_file.expanduser().resolve()
+    args.prompt_file = args.prompt_file.expanduser().resolve() if args.prompt_file else None
+    args.prompt_shard = [path.expanduser().resolve() for path in args.prompt_shard]
     args.output = args.output.expanduser().resolve()
     args.quantized_cache_dir = args.quantized_cache_dir.expanduser().resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.quantized_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    overall_started_at = time.perf_counter()
+    emit_progress(
+        {
+            "event": "stage_start",
+            "stage": "prepare_inputs",
+            "run_id": args.run_id,
+            "mode": args.mode,
+        }
+    )
     selection = load_selection(args.tensor_selection)
     if args.max_tensors is not None:
         selection = selection[: args.max_tensors]
@@ -593,10 +1349,34 @@ def main() -> int:
         stats_path = stats_path / "activation_second_moments.safetensors"
     stats_sha = sha256_file(stats_path)
     args.model_class = "auto_model" if args.mode == "c4" else "causal_lm"
+    emit_progress(
+        {
+            "event": "stage_start",
+            "stage": "load_model",
+            "run_id": args.run_id,
+            "mode": args.mode,
+            "elapsed_seconds": time.perf_counter() - overall_started_at,
+        }
+    )
     tokenizer, model = COLLECTOR.load_transformers_model(args)
     device = next(model.parameters()).device
-    examples = load_examples(args.prompt_file)
-    batches = make_batches(tokenizer, examples, args.batch_size, args.sequence_length)
+    formal_shards = (
+        prepare_formal_c4_shards(
+            tokenizer,
+            args.prompt_shard,
+            args.batch_size,
+            args.sequence_length,
+        )
+        if args.formal_c4_streaming
+        else []
+    )
+    if args.formal_c4_streaming:
+        examples = []
+        batches = []
+    else:
+        assert args.prompt_file is not None
+        examples = load_examples(args.prompt_file)
+        batches = make_batches(tokenizer, examples, args.batch_size, args.sequence_length)
 
     target_modules = {}
     layer_modules = {}
@@ -609,6 +1389,53 @@ def main() -> int:
         layer_modules[layer_name] = layer
         target_layers[tensor_name] = layer_name
 
+    if args.formal_c4_streaming:
+        input_signature = formal_c4_input_signature(
+            args,
+            selection,
+            candidates,
+            formal_shards,
+            codebook_file_sha,
+            stats_sha,
+        )
+        completed = completed_work_keys(
+            args.output,
+            "c4",
+            formal_c4_signature=input_signature,
+        )
+        summary = run_formal_c4_streaming(
+            args,
+            model,
+            selection,
+            candidates,
+            codebooks,
+            codebook_file_sha,
+            activation_stats,
+            stats_sha,
+            target_modules,
+            layer_modules,
+            target_layers,
+            formal_shards,
+            device,
+            completed,
+            input_signature,
+            overall_started_at,
+        )
+        print(json.dumps(summary, sort_keys=True), flush=True)
+        return 0
+
+    synchronize_device(device)
+    reference_started_at = time.perf_counter()
+    emit_progress(
+        {
+            "event": "stage_start",
+            "stage": f"{args.mode}_reference",
+            "run_id": args.run_id,
+            "mode": args.mode,
+            "batch_count": len(batches),
+            "elapsed_seconds": time.perf_counter() - overall_started_at,
+        }
+    )
     if args.mode == "c4":
         reference = reference_c4(model, batches, layer_modules, device)
         c4_cache_audit = validate_c4_call_cache(layer_modules, reference, device)
@@ -616,15 +1443,31 @@ def main() -> int:
         reference = reference_c6(model, batches, device)
         c4_cache_audit = {}
 
-    completed = set()
-    if args.output.is_file():
-        for line in args.output.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("status") == "ok":
-                completed.add((row["tensor_name"], row["candidate_id"], row["mode"]))
+    completed = completed_work_keys(args.output, args.mode)
 
+    work_keys = {
+        (str(selected["hf_name"]), candidate.candidate_id, args.mode)
+        for selected in selection
+        for candidate in candidates
+    }
+    completed_before_run = len(work_keys & completed)
+    remaining_before_run = len(work_keys) - completed_before_run
+    completed_this_run = 0
+    synchronize_device(device)
+    candidate_stage_started_at = time.perf_counter()
+    emit_progress(
+        {
+            "event": "stage_start",
+            "stage": "tensor_candidates",
+            "run_id": args.run_id,
+            "mode": args.mode,
+            "tensor_candidates_total": len(work_keys),
+            "tensor_candidates_already_completed": completed_before_run,
+            "tensor_candidates_remaining": remaining_before_run,
+            "reference_elapsed_seconds": elapsed_since(device, reference_started_at),
+            "elapsed_seconds": time.perf_counter() - overall_started_at,
+        }
+    )
     with args.output.open("a", encoding="utf-8", newline="\n") as handle:
         for selected in selection:
             tensor_name = str(selected["hf_name"])
@@ -643,6 +1486,8 @@ def main() -> int:
                 key = (tensor_name, candidate.candidate_id, args.mode)
                 if key in completed:
                     continue
+                synchronize_device(device)
+                tensor_candidate_started_at = time.perf_counter()
                 codebook = codebooks.get((family, candidate.candidate_id))
                 if codebook is None:
                     raise SystemExit(f"codebook missing: {family}/{candidate.candidate_id}")
@@ -675,6 +1520,9 @@ def main() -> int:
                     )
                 finally:
                     linear._parameters["weight"] = original_parameter
+                tensor_candidate_elapsed_seconds = elapsed_since(
+                    device, tensor_candidate_started_at
+                )
                 row = {
                     "schema_version": "importance-score-single-tensor-perturbation-v0.1",
                     "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -687,6 +1535,7 @@ def main() -> int:
                     "layer_id": int(selected["layer_id"]),
                     "layer_module": layer_name,
                     "candidate_id": candidate.candidate_id,
+                    "elapsed_seconds": tensor_candidate_elapsed_seconds,
                     "metrics": metrics,
                     "quantization": quantization,
                     "quantized_cache": str(cache_path),
@@ -708,8 +1557,46 @@ def main() -> int:
                 }
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
                 handle.flush()
+                completed_this_run += 1
+                if args.progress_every_tensors and (
+                    completed_this_run % args.progress_every_tensors == 0
+                    or completed_this_run == remaining_before_run
+                ):
+                    emit_progress(
+                        {
+                            "event": "progress",
+                            "stage": "tensor_candidates",
+                            "run_id": args.run_id,
+                            "mode": args.mode,
+                            "tensor_name": tensor_name,
+                            "candidate_id": candidate.candidate_id,
+                            "tensor_candidate_elapsed_seconds": tensor_candidate_elapsed_seconds,
+                            "stage_elapsed_seconds": elapsed_since(
+                                device, candidate_stage_started_at
+                            ),
+                            "tensor_candidates_completed_this_run": completed_this_run,
+                            "tensor_candidates_completed_total": (
+                                completed_before_run + completed_this_run
+                            ),
+                            "tensor_candidates_total": len(work_keys),
+                        }
+                    )
                 del quantized
-    print(json.dumps({"mode": args.mode, "tensors": len(selection), "candidates": len(candidates)}))
+    print(
+        json.dumps(
+            {
+                "mode": args.mode,
+                "tensors": len(selection),
+                "candidates": len(candidates),
+                "tensor_candidates_total": len(work_keys),
+                "tensor_candidates_already_completed": completed_before_run,
+                "tensor_candidates_completed_this_run": completed_this_run,
+                "elapsed_seconds": elapsed_since(device, overall_started_at),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return 0
 
 

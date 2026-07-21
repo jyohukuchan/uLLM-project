@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -21,6 +22,88 @@ def load_tool(filename: str, name: str):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_activation_stats_merge_accepts_only_uniform_explicit_execution_provenance() -> None:
+    tool = load_tool("merge-activation-stats.py", "test_activation_merge_provenance")
+
+    assert tool.merged_execution_provenance(
+        [{"require_cpu": True, "device": "cpu"} for _ in range(4)]
+    ) == ("cpu", "cpu")
+    assert tool.merged_execution_provenance(
+        [{"require_cpu": False, "device": "cuda:0"} for _ in range(4)]
+    ) == ("cuda:0", "gpu")
+
+
+def test_activation_stats_merge_writes_gpu_execution_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tool = load_tool("merge-activation-stats.py", "test_activation_merge_metadata")
+    module_name = "model.layers.0.mlp.up_proj"
+    input_dirs = []
+    for index in range(4):
+        input_dir = tmp_path / f"shard-{index}"
+        input_dir.mkdir()
+        (input_dir / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "device": "cuda:0",
+                    "require_cpu": False,
+                    "tokens_seen": 2,
+                    "samples_seen": 1,
+                    "padding_mask_policy": "test",
+                    "modules": {module_name: {"activation_count": 2}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        save_file(
+            {
+                module_name: torch.tensor([1.0, 2.0], dtype=torch.float64),
+                f"{module_name}.mean_abs": torch.tensor([0.5, 1.0], dtype=torch.float64),
+                f"{module_name}.max_abs": torch.tensor([1.0, 2.0], dtype=torch.float32),
+            },
+            str(input_dir / "activation_second_moments.safetensors"),
+        )
+        input_dirs.append(input_dir)
+    output_dir = tmp_path / "merged"
+    argv = ["merge-activation-stats.py"]
+    for input_dir in input_dirs:
+        argv.extend(("--input-dir", str(input_dir)))
+    argv.extend(("--output-dir", str(output_dir), "--run-id", "gpu-merge-test"))
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert tool.main() == 0
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["execution_device"] == "cuda:0"
+    assert metadata["device_class"] == "gpu"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        [
+            {"require_cpu": True, "device": "cpu"},
+            {"require_cpu": False, "device": "cuda:0"},
+            {"require_cpu": True, "device": "cpu"},
+            {"require_cpu": False, "device": "cuda:0"},
+        ],
+        [{"require_cpu": False, "device": "auto"} for _ in range(4)],
+        [
+            {"require_cpu": False, "device": device}
+            for device in ("cuda:0", "cuda:0", "cuda:1", "cuda:0")
+        ],
+        [{"require_cpu": False, "device": "cpu"} for _ in range(4)],
+        [{"device": "cuda:0"} for _ in range(4)],
+    ],
+)
+def test_activation_stats_merge_rejects_mixed_or_implicit_execution_provenance(
+    metadata: list[dict],
+) -> None:
+    tool = load_tool("merge-activation-stats.py", f"test_bad_merge_provenance_{id(metadata)}")
+
+    with pytest.raises(SystemExit):
+        tool.merged_execution_provenance(metadata)
 
 
 def test_block_covariance_accumulator_preserves_off_diagonal_terms() -> None:
@@ -37,6 +120,13 @@ def test_block_covariance_accumulator_preserves_off_diagonal_terms() -> None:
     )
 
 
+def test_block_covariance_timing_snapshot_reports_throughput(monkeypatch) -> None:
+    tool = load_tool("collect-block-covariance-stats.py", "test_c1_timing")
+    monkeypatch.setattr(tool.time, "perf_counter", lambda: 12.0)
+
+    assert tool.timing_snapshot(torch.device("cpu"), 10.0, 5) == (2.0, 2.5)
+
+
 def test_optimized_codebook_lookup_matches_lowest_index_argmin() -> None:
     tool = load_tool(
         "run-importance-single-tensor-perturbation.py", "test_single_tensor_perturbation"
@@ -46,6 +136,21 @@ def test_optimized_codebook_lookup_matches_lowest_index_argmin() -> None:
     expected = (values[:, None] - codebook[None, :]).abs().argmin(dim=1)
 
     assert torch.equal(tool.nearest_sorted_codebook(values, codebook), expected)
+
+
+def test_perturbation_progress_is_flushed_as_stderr_json(capsys) -> None:
+    tool = load_tool(
+        "run-importance-single-tensor-perturbation.py", "test_perturbation_progress"
+    )
+
+    tool.emit_progress({"event": "progress", "tensor_candidates_completed_this_run": 1})
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "event": "progress",
+        "tensor_candidates_completed_this_run": 1,
+    }
 
 
 def test_perturbation_selection_rejects_label_or_score_columns(tmp_path: Path) -> None:
@@ -393,17 +498,30 @@ def test_score_features_accepts_source_only_roster(tmp_path: Path) -> None:
     assert all(name in shard for shard in per_shard)
 
 
-def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) -> None:
-    tool = load_tool("build-ud-tensor-labels.py", "test_lockbox_label_order")
+def write_lockbox_order_fixture(tool, tmp_path: Path) -> tuple[Path, Path, Path]:
     score_path = tmp_path / "scores-prejoin.jsonl"
     score_path.write_text("{}\n", encoding="utf-8")
-    hashes = {
+    shared_hashes = {
         "build-importance-score-prejoin.py": "a",
         "report-importance-score-formal.py": "b",
-        "run-aq-tensor-sample.py": "c",
-        "score-block-covariance-c1.py": "d",
-        "run-importance-single-tensor-perturbation.py": "e",
+        "summarize-importance-score-screen.py": "c",
+        "run-aq-tensor-sample.py": "d",
+        "score-block-covariance-c1.py": "e",
+        "run-importance-single-tensor-perturbation.py": "f",
     }
+    input_hashes = {
+        "candidate_manifest": "candidate",
+        "score_registry": "registry",
+        "corpus_manifest": "corpus",
+    }
+    execution_settings = {
+        "weight_sample_size": 65536,
+        "seed": 0,
+        "torch_threads": 16,
+        "torch_interop_threads": 1,
+        "activation_stat_shard_count": 4,
+    }
+    scores = ["C0_I", "S_AWQ_level"]
     freeze_path = tmp_path / "qwen-candidate-freeze.json"
     freeze_path.write_text(
         json.dumps(
@@ -411,7 +529,16 @@ def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) 
                 "status": "sealed before any Gemma tensor-level score/label join",
                 "lockbox_model": "gemma-4-E4B-it",
                 "created_at_utc": "2026-07-21T00:00:00+00:00",
-                "implementation_hashes": hashes,
+                "workspace_git_head": "head",
+                "candidate_scores_transferred_unchanged": scores,
+                "execution_settings": {"prejoin_score_generation": execution_settings},
+                "input_hashes": input_hashes,
+                "implementation_hashes": {
+                    **shared_hashes,
+                    "build-ud-tensor-labels.py": tool.sha256_file(
+                        Path(tool.__file__).resolve()
+                    ),
+                },
             }
         ),
         encoding="utf-8",
@@ -425,13 +552,24 @@ def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) 
                 ),
                 "model_id": "gemma-4-E4B-it",
                 "created_at_utc": "2026-07-21T01:00:00+00:00",
+                "workspace_git_head": "head",
                 "score_table_path": str(score_path),
                 "score_table_sha256": tool.sha256_file(score_path),
-                "implementation_hashes": hashes,
+                "candidate_score_columns": scores,
+                "score_columns": [*scores, "C0_G"],
+                "execution_settings": execution_settings,
+                "input_hashes": input_hashes,
+                "implementation_hashes": shared_hashes,
             }
         ),
         encoding="utf-8",
     )
+    return freeze_path, receipt_path, score_path
+
+
+def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) -> None:
+    tool = load_tool("build-ud-tensor-labels.py", "test_lockbox_label_order")
+    freeze_path, receipt_path, score_path = write_lockbox_order_fixture(tool, tmp_path)
 
     audit = tool.verify_lockbox_order(
         "gemma-4-E4B-it", freeze_path, receipt_path
@@ -439,6 +577,36 @@ def test_gemma_label_builder_verifies_freeze_then_prejoin_order(tmp_path: Path) 
 
     assert audit["status"] == "order verified before invoking gguf-dump"
     assert audit["sealed_score_table_sha256"] == tool.sha256_file(score_path)
+    assert audit["input_hash_comparison"]["score_registry"]["candidate_freeze"] == "registry"
+    assert "summarize-importance-score-screen.py" in audit["implementation_hash_comparison"]
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("input_hashes", "score_registry", "changed", "input hash mismatch"),
+        (
+            "implementation_hashes",
+            "summarize-importance-score-screen.py",
+            "changed",
+            "implementation hash mismatch",
+        ),
+        ("execution_settings", "seed", 1, "execution settings differ"),
+    ],
+)
+def test_gemma_label_builder_rejects_lockbox_chain_mismatch(
+    tmp_path: Path, section: str, key: str, value, message: str
+) -> None:
+    tool = load_tool(
+        "build-ud-tensor-labels.py", f"test_lockbox_mismatch_{section}_{key}"
+    )
+    freeze_path, receipt_path, _score_path = write_lockbox_order_fixture(tool, tmp_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt[section][key] = value
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        tool.verify_lockbox_order("gemma-4-E4B-it", freeze_path, receipt_path)
 
 
 def test_c1_accepts_single_file_source_roster_without_labels(tmp_path: Path) -> None:
@@ -483,6 +651,228 @@ def test_two_model_comparison_pairs_worst_model_bootstrap_draws() -> None:
 
     assert result["replicates"] == 3
     assert result["left_strictly_better"] is True
+
+
+def test_two_model_bootstrap_loader_requires_every_frozen_replicate(
+    tmp_path: Path,
+) -> None:
+    tool = load_tool("report-importance-score-two-model.py", "test_two_model_bootstrap")
+    scores = ["C0_I", "C1_I"]
+    rows = [
+        {
+            "score_id": score,
+            "replicate": replicate,
+            "primary_rho": float(replicate),
+            "primary_tau_b": float(replicate) / 2,
+        }
+        for score in scores
+        for replicate in range(3)
+    ]
+    path = tmp_path / "bootstrap.parquet"
+    tool.pq.write_table(pa.Table.from_pylist(rows), path)
+
+    arrays = tool.bootstrap_arrays(path, scores, expected_replicates=3)
+
+    assert arrays["C0_I"]["rho"].tolist() == [0.0, 1.0, 2.0]
+    tool.pq.write_table(pa.Table.from_pylist(rows[:-1]), path)
+    with pytest.raises(ValueError, match="exactly 3 rows per score"):
+        tool.bootstrap_arrays(path, scores, expected_replicates=3)
+
+
+def write_formal_report_receipt_fixture(
+    tool, tmp_path: Path
+) -> tuple[Path, Path, Path, dict, dict, list[str]]:
+    scores = ["C0_I", "C1_I"]
+    implementations = {
+        "report-importance-score-formal.py": "formal-hash",
+        "summarize-importance-score-screen.py": "summarizer-hash",
+    }
+    metrics = {
+        "model_id": "m",
+        "execution_settings": {"formal_report": dict(tool.EXPECTED_FORMAL_SETTINGS)},
+        "implementation_hashes": implementations,
+    }
+    freeze = {"implementation_hashes": implementations}
+    metrics_path = tmp_path / "metrics-by-model.json"
+    bootstrap_path = tmp_path / "bootstrap-samples.parquet"
+    receipt_path = tmp_path / "formal-report.receipt.json"
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    bootstrap_path.write_bytes(b"sealed bootstrap")
+    receipt = {
+        "schema_version": "importance-score-formal-report-receipt-v0.1",
+        "status": "sealed formal report outputs",
+        "model_id": "m",
+        "candidate_score_columns": scores,
+        "execution_settings": {"formal_report": dict(tool.EXPECTED_FORMAL_SETTINGS)},
+        "implementation_hashes": implementations,
+        "bootstrap_contract": {
+            "replicates_per_score": tool.EXPECTED_BOOTSTRAP_REPLICATES,
+            "score_count": len(scores),
+            "row_count": tool.EXPECTED_BOOTSTRAP_REPLICATES * len(scores),
+            "expected_row_count": tool.EXPECTED_BOOTSTRAP_REPLICATES * len(scores),
+        },
+        "output_hashes": {
+            "metrics-by-model.json": tool.sha256_file(metrics_path),
+            "bootstrap-samples.parquet": tool.sha256_file(bootstrap_path),
+        },
+    }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    return metrics_path, bootstrap_path, receipt_path, metrics, freeze, scores
+
+
+def test_two_model_report_receipt_binds_metrics_bootstrap_settings_and_code(
+    tmp_path: Path,
+) -> None:
+    tool = load_tool("report-importance-score-two-model.py", "test_report_receipt")
+    fixture = write_formal_report_receipt_fixture(tool, tmp_path)
+
+    receipt = tool.validate_report_receipt("model", *fixture)
+
+    assert receipt["status"] == "sealed formal report outputs"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("bootstrap_hash", "bootstrap samples differ"),
+        ("settings", "settings differ"),
+        ("implementation", "differs from the candidate freeze"),
+        ("row_count", "bootstrap receipt differs"),
+    ],
+)
+def test_two_model_report_receipt_rejects_chain_mismatch(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    tool = load_tool(
+        "report-importance-score-two-model.py", f"test_bad_report_receipt_{mutation}"
+    )
+    fixture = write_formal_report_receipt_fixture(tool, tmp_path)
+    metrics_path, bootstrap_path, receipt_path, metrics, freeze, scores = fixture
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if mutation == "bootstrap_hash":
+        receipt["output_hashes"]["bootstrap-samples.parquet"] = "changed"
+    elif mutation == "settings":
+        receipt["execution_settings"]["formal_report"]["seed"] = 1
+    elif mutation == "implementation":
+        receipt["implementation_hashes"]["report-importance-score-formal.py"] = "changed"
+    else:
+        receipt["bootstrap_contract"]["row_count"] -= 1
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=message):
+        tool.validate_report_receipt(
+            "model",
+            metrics_path,
+            bootstrap_path,
+            receipt_path,
+            metrics,
+            freeze,
+            scores,
+        )
+
+
+def write_kl_core_fixture(tool, tmp_path: Path) -> tuple[Path, Path, list[dict]]:
+    selection = [
+        {
+            "model_id": "m",
+            "hf_name": f"model.layers.{index}.mlp.up_proj.weight",
+            "canonical_family": "mlp_up",
+            "layer_id": index,
+            "shape": [8, 8],
+        }
+        for index in range(2)
+    ]
+    selection_path = tmp_path / "KL-core.json"
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    selection_sha = tool.sha256_file(selection_path)
+    prompt_rows = [{"record_id": "r0"}, {"record_id": "r1"}]
+    prompt_path = tmp_path / "D_KL-cpu-subset.jsonl"
+    prompt_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in prompt_rows), encoding="utf-8"
+    )
+    prompt_sha = tool.sha256_file(prompt_path)
+    manifest_path = tmp_path / "subset-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "importance-score-cpu-subsets-v0.1",
+                "C6": {
+                    "path": str(prompt_path),
+                    "sha256": prompt_sha,
+                    "records": len(prompt_rows),
+                },
+                "KL_core": {
+                    "path": str(selection_path),
+                    "sha256": selection_sha,
+                    "selected_tensor_count": len(selection),
+                },
+                "model_token_counts": {
+                    "m": {
+                        "D_KL_cpu": {
+                            "sequence_length": 128,
+                            "valid_tokens": 2,
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {
+            "status": "ok",
+            "mode": "c6",
+            "tensor_name": selected["hf_name"],
+            "candidate_id": candidate,
+            "tensor_selection_sha256": selection_sha,
+            "prompt_file_sha256": prompt_sha,
+            "record_count": len(prompt_rows),
+            "record_ids": [row["record_id"] for row in prompt_rows],
+            "sequence_length": 128,
+            "metrics": {"C6_L": 0.1, "valid_tokens": 2},
+        }
+        for selected in selection
+        for candidate in (tool.LOW, tool.HIGH)
+    ]
+    c6_path = tmp_path / "c6.jsonl"
+    c6_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return c6_path, manifest_path, rows
+
+
+def test_formal_report_accepts_exact_manifest_bound_kl_core(tmp_path: Path) -> None:
+    tool = load_tool("report-importance-score-formal.py", "test_exact_kl_core")
+    c6_path, manifest_path, _rows = write_kl_core_fixture(tool, tmp_path)
+
+    parsed, audit = tool.validate_kl_core_inputs(c6_path, manifest_path)
+
+    assert len(parsed) == 2
+    assert all(set(candidates) == {tool.LOW, tool.HIGH} for candidates in parsed.values())
+    assert audit["tensor_set_and_candidate_coverage_exact"] is True
+    assert audit["kl_audit_rows_rejected"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation", ("selection_hash", "prompt_hash", "extra_tensor", "wrong_mode")
+)
+def test_formal_report_rejects_kl_audit_or_c6_contract_mismatch(
+    tmp_path: Path, mutation: str
+) -> None:
+    tool = load_tool(
+        "report-importance-score-formal.py", f"test_bad_kl_core_{mutation}"
+    )
+    c6_path, manifest_path, rows = write_kl_core_fixture(tool, tmp_path)
+    if mutation == "selection_hash":
+        rows[0]["tensor_selection_sha256"] = "audit-selection"
+    elif mutation == "prompt_hash":
+        rows[0]["prompt_file_sha256"] = "wrong-corpus"
+    elif mutation == "extra_tensor":
+        rows[0]["tensor_name"] = "model.layers.99.mlp.up_proj.weight"
+    else:
+        rows[0]["mode"] = "c4"
+    c6_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        tool.validate_kl_core_inputs(c6_path, manifest_path)
 
 
 def test_kl_audit_cap_preserves_score_extremes_without_label_fields() -> None:

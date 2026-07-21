@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -35,6 +36,23 @@ COMMON_QWEN_GEMMA_FAMILIES = {
     "mlp_gate",
     "mlp_up",
 }
+FORMAL_REPORT_SETTINGS = {
+    "weight_sample_size": 65536,
+    "seed": 0,
+    "bootstrap_replicates": 10000,
+    "permutation_replicates": 10000,
+}
+FORMAL_OUTPUT_FILENAMES = (
+    "scores.parquet",
+    "bootstrap-samples.parquet",
+    "permutation-samples.parquet",
+    "metrics-by-family.tsv",
+    "shard-stability.tsv",
+    "disagreements.tsv",
+    "metrics-by-model.json",
+    "final-report.md",
+    "formal-report.receipt.json",
+)
 
 
 def load_screen_module():
@@ -57,6 +75,13 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_stats_file(path: Path) -> Path:
+    path = path.expanduser().resolve()
+    if path.is_dir():
+        path = path / "activation_second_moments.safetensors"
+    return path
 
 
 def read_labels(path: Path) -> list[dict[str, str]]:
@@ -116,6 +141,142 @@ def parse_perturbation(path: Path | None, mode: str) -> dict[str, dict[str, dict
         if row.get("status") == "ok" and row.get("mode") == mode:
             result[str(row["tensor_name"])][str(row["candidate_id"])] = row
     return result
+
+
+def validate_kl_core_inputs(
+    c6_path: Path, selection_manifest_path: Path
+) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[str, Any]]:
+    manifest = json.loads(selection_manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != "importance-score-cpu-subsets-v0.1":
+        raise ValueError("KL-core selection manifest has an unexpected schema")
+    kl_core = manifest.get("KL_core")
+    if not isinstance(kl_core, dict):
+        raise ValueError("KL-core selection manifest lacks KL_core metadata")
+    raw_selection_path = Path(str(kl_core.get("path", ""))).expanduser()
+    selection_path = (
+        raw_selection_path.resolve()
+        if raw_selection_path.is_absolute()
+        else (selection_manifest_path.parent / raw_selection_path).resolve()
+    )
+    if not selection_path.is_file():
+        raise ValueError(f"KL-core selection file is missing: {selection_path}")
+    selection_sha = sha256_file(selection_path)
+    if kl_core.get("sha256") != selection_sha:
+        raise ValueError("KL-core selection hash differs from its manifest")
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(selection, list) or not selection:
+        raise ValueError("KL-core selection must be a nonempty JSON list")
+    selected_by_name = {str(row["hf_name"]): row for row in selection}
+    if len(selected_by_name) != len(selection):
+        raise ValueError("KL-core selection contains duplicate tensor names")
+    if int(kl_core.get("selected_tensor_count", -1)) != len(selection):
+        raise ValueError("KL-core selected tensor count differs from its manifest")
+    selection_model_ids = {str(row.get("model_id", "")) for row in selection}
+    if len(selection_model_ids) != 1 or "" in selection_model_ids:
+        raise ValueError("KL-core selection must name exactly one model_id")
+    selection_model_id = next(iter(selection_model_ids))
+
+    c6_subset = manifest.get("C6")
+    if not isinstance(c6_subset, dict):
+        raise ValueError("KL-core selection manifest lacks C6 corpus metadata")
+    raw_prompt_path = Path(str(c6_subset.get("path", ""))).expanduser()
+    prompt_path = (
+        raw_prompt_path.resolve()
+        if raw_prompt_path.is_absolute()
+        else (selection_manifest_path.parent / raw_prompt_path).resolve()
+    )
+    if not prompt_path.is_file():
+        raise ValueError(f"C6 prompt subset is missing: {prompt_path}")
+    prompt_sha = sha256_file(prompt_path)
+    if c6_subset.get("sha256") != prompt_sha:
+        raise ValueError("C6 prompt subset hash differs from its manifest")
+    prompt_rows = [
+        json.loads(line)
+        for line in prompt_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    prompt_record_ids = [str(row["record_id"]) for row in prompt_rows]
+    if len(set(prompt_record_ids)) != len(prompt_record_ids):
+        raise ValueError("C6 prompt subset contains duplicate record IDs")
+    if int(c6_subset.get("records", -1)) != len(prompt_rows):
+        raise ValueError("C6 prompt subset record count differs from its manifest")
+    token_contract = (
+        manifest.get("model_token_counts", {})
+        .get(selection_model_id, {})
+        .get("D_KL_cpu")
+    )
+    if not isinstance(token_contract, dict):
+        raise ValueError(
+            f"C6 manifest lacks D_KL token counts for {selection_model_id}"
+        )
+    expected_sequence_length = int(token_contract.get("sequence_length", -1))
+    expected_valid_tokens = int(token_contract.get("valid_tokens", -1))
+    if expected_sequence_length < 1 or expected_valid_tokens < 1:
+        raise ValueError("C6 token-count contract is incomplete")
+
+    parsed: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    seen: set[tuple[str, str]] = set()
+    for line_number, line in enumerate(c6_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("status") != "ok":
+            raise ValueError(f"C6 row {line_number} is not status=ok")
+        if row.get("mode") != "c6":
+            raise ValueError(f"C6 row {line_number} is not mode=c6")
+        name = str(row.get("tensor_name", ""))
+        candidate = str(row.get("candidate_id", ""))
+        if name not in selected_by_name:
+            raise ValueError(f"C6 row contains a tensor outside KL-core: {name}")
+        if candidate not in {LOW, HIGH}:
+            raise ValueError(f"C6 row contains an unfrozen candidate: {candidate}")
+        if row.get("tensor_selection_sha256") != selection_sha:
+            raise ValueError(
+                f"C6 row uses a different tensor selection (possible KL-audit contamination): {name}"
+            )
+        if row.get("prompt_file_sha256") != prompt_sha:
+            raise ValueError(f"C6 row uses a different D_KL prompt subset: {name}")
+        if int(row.get("record_count", -1)) != len(prompt_rows) or [
+            str(value) for value in row.get("record_ids", [])
+        ] != prompt_record_ids:
+            raise ValueError(f"C6 row has different D_KL record coverage: {name}")
+        if int(row.get("sequence_length", -1)) != expected_sequence_length:
+            raise ValueError(f"C6 row has a different sequence length: {name}")
+        if int(row.get("metrics", {}).get("valid_tokens", -1)) != expected_valid_tokens:
+            raise ValueError(f"C6 row has a different valid-token count: {name}")
+        key = (name, candidate)
+        if key in seen:
+            raise ValueError(f"duplicate C6 tensor/candidate row: {name}/{candidate}")
+        seen.add(key)
+        parsed[name][candidate] = row
+    if set(parsed) != set(selected_by_name):
+        missing = sorted(set(selected_by_name) - set(parsed))
+        extra = sorted(set(parsed) - set(selected_by_name))
+        raise ValueError(f"C6 tensor set differs from KL-core selection: missing={missing}, extra={extra}")
+    bad_coverage = sorted(name for name, candidates in parsed.items() if set(candidates) != {LOW, HIGH})
+    if bad_coverage:
+        raise ValueError(f"C6 low/high candidate coverage is incomplete: {bad_coverage}")
+    audit = {
+        "selection_manifest_path": str(selection_manifest_path),
+        "selection_manifest_sha256": sha256_file(selection_manifest_path),
+        "selection_path": str(selection_path),
+        "selection_sha256": selection_sha,
+        "selection_model_id": selection_model_id,
+        "prompt_path": str(prompt_path),
+        "prompt_sha256": prompt_sha,
+        "prompt_record_count": len(prompt_rows),
+        "prompt_record_ids": prompt_record_ids,
+        "sequence_length": expected_sequence_length,
+        "valid_tokens": expected_valid_tokens,
+        "c6_jsonl_path": str(c6_path),
+        "c6_jsonl_sha256": sha256_file(c6_path),
+        "selected_tensor_count": len(selection),
+        "candidate_ids": [LOW, HIGH],
+        "mode": "c6",
+        "tensor_set_and_candidate_coverage_exact": True,
+        "kl_audit_rows_rejected": True,
+    }
+    return parsed, audit
 
 
 def full_loss(metrics: dict[str, Any]) -> float:
@@ -623,6 +784,9 @@ def load_and_join_prejoin_scores(
         "label_join_performed_after_receipt": True,
         "receipt_workspace_git_head": receipt.get("workspace_git_head"),
         "receipt_implementation_hashes": receipt.get("implementation_hashes"),
+        "receipt_input_hashes": receipt.get("input_hashes"),
+        "receipt_execution_settings": receipt.get("execution_settings"),
+        "candidate_score_columns": receipt.get("candidate_score_columns"),
     }
     return joined_rows, per_shard, prejoin_audit
 
@@ -854,7 +1018,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c0-shard-jsonl", type=Path, action="append", default=[])
     parser.add_argument("--c1-jsonl", type=Path)
     parser.add_argument("--c4-jsonl", type=Path)
-    parser.add_argument("--c6-jsonl", type=Path)
+    parser.add_argument("--c6-jsonl", type=Path, required=True)
+    parser.add_argument("--kl-core-selection-manifest", type=Path, required=True)
     parser.add_argument("--prejoin-scores", type=Path)
     parser.add_argument("--prejoin-receipt", type=Path)
     parser.add_argument("--prejoin-shard-scores", type=Path)
@@ -868,6 +1033,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    formal_settings = {
+        "weight_sample_size": args.weight_sample_size,
+        "seed": args.seed,
+        "bootstrap_replicates": args.bootstrap_replicates,
+        "permutation_replicates": args.permutation_replicates,
+    }
+    if formal_settings != FORMAL_REPORT_SETTINGS:
+        raise SystemExit(
+            "formal report execution settings differ from the frozen v0.1 contract: "
+            f"{formal_settings} != {FORMAL_REPORT_SETTINGS}"
+        )
     prejoin_args = (args.prejoin_scores, args.prejoin_receipt, args.prejoin_shard_scores)
     using_prejoin = any(prejoin_args)
     if using_prejoin and not all(prejoin_args):
@@ -886,8 +1062,17 @@ def main() -> int:
     cohort = paired_cohort_audit(
         args.label_audit_summary.expanduser().resolve(), len(labels)
     )
-    c6 = parse_perturbation(args.c6_jsonl.expanduser().resolve() if args.c6_jsonl else None, "c6")
+    c6_path = args.c6_jsonl.expanduser().resolve()
+    kl_core_manifest_path = args.kl_core_selection_manifest.expanduser().resolve()
+    c6, kl_core_input_audit = validate_kl_core_inputs(c6_path, kl_core_manifest_path)
     output_dir = args.output_dir.expanduser().resolve()
+    existing_outputs = [
+        output_dir / name
+        for name in FORMAL_OUTPUT_FILENAMES
+        if (output_dir / name).exists()
+    ]
+    if existing_outputs:
+        raise SystemExit(f"refusing to overwrite sealed formal report outputs: {existing_outputs}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if using_prejoin:
         rows, per_shard, prejoin_audit = load_and_join_prejoin_scores(
@@ -901,6 +1086,11 @@ def main() -> int:
             if order.get("sealed_score_table_sha256") != prejoin_audit["score_table_sha256"]:
                 raise ValueError(
                     "Gemma label audit was authorized for a different sealed prejoin score table"
+                )
+            if order.get("prejoin_score_receipt_sha256") != prejoin_audit["receipt_sha256"]:
+                raise ValueError(
+                    "Gemma formal report received a different prejoin receipt than the one "
+                    "authorized before label opening"
                 )
     else:
         model_dir = args.model_dir.expanduser().resolve()
@@ -917,12 +1107,18 @@ def main() -> int:
         prejoin_audit = {
             "label_join_performed_after_receipt": False,
             "mode": "legacy direct score/label mode; do not use this mode for a lockbox model",
+            "receipt_execution_settings": None,
+            "candidate_score_columns": None,
         }
     full_scores = ["C0_I", "S_AWQ_level", "S_AWQ_tail", "S_range"]
     if all("C1_I" in row for row in rows):
         full_scores.append("C1_I")
     if all("C4_I" in row for row in rows):
         full_scores.append("C4_I")
+    row_tensor_names = {str(row["hf_name"]) for row in rows}
+    if not set(c6).issubset(row_tensor_names):
+        missing = sorted(set(c6) - row_tensor_names)
+        raise SystemExit(f"KL-core tensors are absent from the eligible score table: {missing}")
     binary_score = {
         "C0_I": "C0_G",
         "C1_I": "C1_G",
@@ -932,6 +1128,16 @@ def main() -> int:
         "S_range": "S_range",
     }
     family_rows = []
+    score_generation_settings = (
+        prejoin_audit.get("receipt_execution_settings")
+        if using_prejoin
+        else {
+            "weight_sample_size": args.weight_sample_size,
+            "seed": args.seed,
+            "activation_stat_shard_count": len(args.shard_stats),
+            "mode": "legacy direct score/label generation",
+        }
+    )
     metrics: dict[str, Any] = {
         "schema_version": "importance-score-formal-statistics-v0.1",
         "implementation_hashes": {
@@ -942,6 +1148,11 @@ def main() -> int:
         },
         "model_id": rows[0]["model_id"],
         "eligible_tensor_count": len(rows),
+        "candidate_score_columns": full_scores,
+        "execution_settings": {
+            "formal_report": formal_settings,
+            "score_generation": score_generation_settings,
+        },
         "paired_labels_sha256": sha256_file(labels_path),
         "paired_cohort_audit": cohort,
         "prejoin_audit": prejoin_audit,
@@ -1010,6 +1221,7 @@ def main() -> int:
         rows, full_scores, args.permutation_replicates, args.seed
     )
     kl = kl_metrics(rows, full_scores, c6)
+    kl["selection_audit"] = kl_core_input_audit
     metrics["bootstrap"] = bootstrap
     metrics["permutation"] = permutation
     metrics["KL_core"] = kl
@@ -1136,6 +1348,78 @@ def main() -> int:
             f"{binary['Precision_at_K']} | {kl_rho} | {item['admission_gate']['pass']} |"
         )
     (output_dir / "final-report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    input_paths = {
+        "labels": labels_path,
+        "label_audit_summary": args.label_audit_summary.expanduser().resolve(),
+        "c6_jsonl": c6_path,
+        "kl_core_selection_manifest": kl_core_manifest_path,
+        "kl_core_selection": Path(kl_core_input_audit["selection_path"]),
+        "kl_prompt_subset": Path(kl_core_input_audit["prompt_path"]),
+    }
+    if using_prejoin:
+        input_paths.update(
+            {
+                "prejoin_scores": args.prejoin_scores.expanduser().resolve(),
+                "prejoin_receipt": args.prejoin_receipt.expanduser().resolve(),
+                "prejoin_shard_scores": args.prejoin_shard_scores.expanduser().resolve(),
+            }
+        )
+    else:
+        input_paths.update(
+            {
+                "model_index_or_config": (
+                    args.model_dir.expanduser().resolve() / "model.safetensors.index.json"
+                    if (args.model_dir.expanduser().resolve() / "model.safetensors.index.json").is_file()
+                    else args.model_dir.expanduser().resolve() / "config.json"
+                ),
+                "combined_stats": resolve_stats_file(args.combined_stats),
+                "c0_jsonl": args.c0_jsonl.expanduser().resolve(),
+            }
+        )
+        for index, path in enumerate(args.shard_stats):
+            input_paths[f"shard_stats_{index}"] = resolve_stats_file(path)
+        if args.c1_jsonl:
+            input_paths["c1_jsonl"] = args.c1_jsonl.expanduser().resolve()
+        if args.c4_jsonl:
+            input_paths["c4_jsonl"] = args.c4_jsonl.expanduser().resolve()
+    missing_receipt_inputs = [name for name, path in input_paths.items() if not path.is_file()]
+    if missing_receipt_inputs:
+        raise RuntimeError(f"formal report receipt inputs are missing: {missing_receipt_inputs}")
+    output_hashes = {
+        name: sha256_file(output_dir / name)
+        for name in FORMAL_OUTPUT_FILENAMES
+        if name != "formal-report.receipt.json"
+    }
+    receipt = {
+        "schema_version": "importance-score-formal-report-receipt-v0.1",
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "status": "sealed formal report outputs",
+        "model_id": rows[0]["model_id"],
+        "candidate_score_columns": full_scores,
+        "execution_settings": metrics["execution_settings"],
+        "implementation_hashes": metrics["implementation_hashes"],
+        "kl_core_selection_audit": kl_core_input_audit,
+        "bootstrap_contract": {
+            "replicates_per_score": args.bootstrap_replicates,
+            "score_count": len(full_scores),
+            "row_count": len(bootstrap_rows),
+            "expected_row_count": args.bootstrap_replicates * len(full_scores),
+        },
+        "permutation_contract": {
+            "replicates": args.permutation_replicates,
+            "row_count": len(permutation_rows),
+        },
+        "input_hashes": {name: sha256_file(path) for name, path in input_paths.items()},
+        "output_hashes": output_hashes,
+    }
+    if receipt["bootstrap_contract"]["row_count"] != receipt["bootstrap_contract"][
+        "expected_row_count"
+    ]:
+        raise RuntimeError("formal bootstrap output row count differs from the frozen contract")
+    (output_dir / "formal-report.receipt.json").write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
