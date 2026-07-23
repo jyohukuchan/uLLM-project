@@ -81,6 +81,10 @@ LOCKBOX_SHARED_IMPLEMENTATIONS = (
     "score-block-covariance-c1.py",
     "summarize-importance-score-screen.py",
 )
+GEMMA_SELF_FISHER_PINNED_STAGING_EXTENSION = {
+    "enabled": True,
+    "host_bytes": 6 * 1024 * 1024,
+}
 FORBIDDEN_LABEL_KEYS = {
     "gguf_name",
     "qtype_ud",
@@ -239,6 +243,30 @@ def normalized_shape(value: Any, label: str) -> list[int]:
     return shape
 
 
+def normalize_c5_execution_settings(
+    value: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate the one allowed Gemma-only performance setting from score settings."""
+    if not isinstance(value, dict):
+        raise ValueError("prejoin C5 execution settings are missing")
+    normalized = deepcopy(value)
+    runtime_extensions: dict[str, Any] = {}
+    self_fisher = normalized.get("self_fisher")
+    if not isinstance(self_fisher, dict):
+        return normalized, runtime_extensions
+    if "pinned_transfer_staging" not in self_fisher:
+        return normalized, runtime_extensions
+    pinned_staging = self_fisher.pop("pinned_transfer_staging")
+    if pinned_staging != GEMMA_SELF_FISHER_PINNED_STAGING_EXTENSION:
+        raise ValueError("Gemma self-Fisher pinned-staging runtime extension is not sealed")
+    runtime_extensions["self_fisher"] = {
+        "pinned_transfer_staging": deepcopy(pinned_staging),
+        "admission_use": "performance-only; excluded from frozen score semantics",
+        "score_formula_or_reduction_changed": False,
+    }
+    return normalized, runtime_extensions
+
+
 def verify_lockbox_authorization(
     freeze_path: Path,
     receipt_path: Path,
@@ -377,7 +405,10 @@ def verify_lockbox_authorization(
         raise ValueError("candidate freeze execution settings are missing")
     if receipt.get("execution_settings") != freeze_settings.get("prejoin_score_generation"):
         raise ValueError("base prejoin execution settings differ from the Qwen freeze")
-    if receipt.get("c5_execution_settings") != freeze_settings.get("c5_gradient"):
+    normalized_c5_settings, c5_runtime_extensions = normalize_c5_execution_settings(
+        receipt.get("c5_execution_settings")
+    )
+    if normalized_c5_settings != freeze_settings.get("c5_gradient"):
         raise ValueError("C5 execution settings differ from the Qwen freeze")
 
     receipt_score_columns = receipt.get("score_columns")
@@ -400,6 +431,8 @@ def verify_lockbox_authorization(
         "threshold_sha256": canonical_json_sha256(thresholds),
         "prejoin_execution_settings": receipt["execution_settings"],
         "c5_execution_settings": receipt["c5_execution_settings"],
+        "frozen_c5_execution_settings": normalized_c5_settings,
+        "c5_runtime_extensions": c5_runtime_extensions,
     }
 
 
@@ -736,6 +769,8 @@ def build_active_label_view(
         "threshold_sha256": authorization["threshold_sha256"],
         "execution_settings": authorization["prejoin_execution_settings"],
         "c5_execution_settings": authorization["c5_execution_settings"],
+        "frozen_c5_execution_settings": authorization["frozen_c5_execution_settings"],
+        "c5_runtime_extensions": authorization["c5_runtime_extensions"],
         "input_hash_comparison": authorization["input_hash_comparison"],
         "implementation_hash_comparison": authorization["implementation_hash_comparison"],
         "previously_sealed_label_source": {

@@ -242,6 +242,127 @@ def test_post_accumulate_hook_reduces_then_immediately_clears_gradient() -> None
         assert timings["tiny.weight"] >= 0.0
 
 
+def test_deferred_post_accumulate_hook_activation_preserves_scores() -> None:
+    linear = torch.nn.Linear(2, 1, bias=False)
+    source = linear.weight.detach().cpu().clone()
+    cache = TOOL.TensorQuantCache(
+        tensor_name="tiny.weight",
+        source_bf16_cpu=source,
+        quantized_bf16_cpu=quantized(source.clone(), source.clone()),
+    )
+    output = linear(torch.tensor([[3.0, 4.0]]))
+
+    with TOOL.PostAccumulateGradientSession(
+        {"tiny.weight": linear.weight},
+        {"tiny.weight": cache},
+        mode="self_fisher",
+        chunk_elements=2,
+        auto_activate=False,
+    ) as session:
+        session.activate()
+        session.begin({"record_id": "tiny"})
+        output.sum().backward()
+        results, _ = session.finish()
+        session.deactivate()
+
+    assert results["tiny.weight"]["gradient_trace"] == 25.0
+    assert linear.weight.grad is None
+
+
+def test_only_gemma_self_fisher_requires_pinned_transfer_staging() -> None:
+    assert TOOL.requires_pinned_transfer_staging("gemma4_text", "self_fisher")
+    assert not TOOL.requires_pinned_transfer_staging("gemma4_text", "empirical")
+    assert not TOOL.requires_pinned_transfer_staging("qwen3_5_text", "self_fisher")
+
+
+def test_pinned_transfer_staging_path_preserves_exact_reduction_values() -> None:
+    class CpuStager:
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def to_device(
+            self, key: str, source_cpu: torch.Tensor, *, device: torch.device
+        ) -> torch.Tensor:
+            self.keys.append(key)
+            return source_cpu.to(device=device, dtype=torch.float32)
+
+    gradient = torch.tensor([1.5, -2.0, 0.25])
+    source = torch.tensor([0.25, -0.5, 1.0], dtype=torch.bfloat16)
+    candidates = quantized(
+        torch.tensor([0.5, -0.25, 0.5], dtype=torch.bfloat16),
+        torch.tensor([0.25, -0.5, 1.0], dtype=torch.bfloat16),
+    )
+    direct = TOOL.reduce_gradient_scores(
+        gradient,
+        source,
+        candidates,
+        mode="self_fisher",
+        chunk_elements=2,
+    )
+    stager = CpuStager()
+    staged = TOOL.reduce_gradient_scores(
+        gradient,
+        source,
+        candidates,
+        mode="self_fisher",
+        chunk_elements=2,
+        transfer_stager=stager,
+    )
+
+    assert staged == direct
+    assert stager.keys == [
+        "source",
+        TOOL.LOW_CANDIDATE_ID,
+        TOOL.HIGH_CANDIDATE_ID,
+    ] * 2
+
+
+def test_pinned_stager_separates_bf16_h2d_from_device_fp32_cast(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    result = object()
+
+    class FakeDeviceTensor:
+        def to(self, **kwargs):
+            calls.append(("device_cast", kwargs))
+            return result
+
+    class FakePinnedTensor:
+        def __getitem__(self, _index):
+            return self
+
+        def copy_(self, source):
+            calls.append(("host_copy", {"dtype": source.dtype}))
+
+        def numel(self):
+            return 4
+
+        def element_size(self):
+            return 2
+
+        def to(self, **kwargs):
+            calls.append(("h2d", kwargs))
+            return FakeDeviceTensor()
+
+    monkeypatch.setattr(TOOL.torch, "empty", lambda *args, **kwargs: FakePinnedTensor())
+    stager = TOOL.PinnedGradientScoreStager(4)
+    device = torch.device("cuda:0")
+
+    observed = stager.to_device(
+        TOOL.PinnedGradientScoreStager.SOURCE_KEY,
+        torch.ones(4, dtype=torch.bfloat16),
+        device=device,
+    )
+
+    assert observed is result
+    assert calls == [
+        ("host_copy", {"dtype": torch.bfloat16}),
+        ("h2d", {"device": device, "non_blocking": False}),
+        ("device_cast", {"dtype": torch.float32}),
+    ]
+
+
 def test_candidate_ids_are_the_frozen_low_and_only_high_pair() -> None:
     assert TOOL.LOW_CANDIDATE_ID == "aq4_e4m3_g16_ts_flloyd16"
     assert TOOL.HIGH_CANDIDATE_ID == "aq5_e4m3_g16_ts_flloyd32"

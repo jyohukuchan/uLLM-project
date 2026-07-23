@@ -246,3 +246,38 @@ def test_c5_prejoin_extension_rejects_nonfinite_scores(
             tool.main()
     finally:
         monkeypatch.setattr(sys, "argv", old_argv)
+
+
+def test_gradient_collector_compatibility_is_narrowly_scoped() -> None:
+    tool = load_tool()
+    receipt = {"architecture": "gemma4_text"}
+    current = tool.sha256_file(
+        Path(tool.__file__).resolve().parent
+        / "collect-importance-gradient-scores.py"
+    )
+
+    accepted = tool.gradient_collector_compatibility(
+        receipt,
+        expected_mode="empirical",
+        expected_model_id="gemma-4-E4B-it",
+        sealed_runner_sha256=tool.GEMMA4_EMPIRICAL_BASE_RUNNER_SHA256,
+        current_runner_sha256=current,
+    )
+    assert accepted["status"].startswith("accepted-score-equivalent")
+
+    with pytest.raises(ValueError, match="implementation hash mismatch"):
+        tool.gradient_collector_compatibility(
+            receipt,
+            expected_mode="self_fisher",
+            expected_model_id="gemma-4-E4B-it",
+            sealed_runner_sha256=tool.GEMMA4_EMPIRICAL_BASE_RUNNER_SHA256,
+            current_runner_sha256=current,
+        )
+    with pytest.raises(ValueError, match="implementation hash mismatch"):
+        tool.gradient_collector_compatibility(
+            receipt,
+            expected_mode="empirical",
+            expected_model_id="another-model",
+            sealed_runner_sha256=tool.GEMMA4_EMPIRICAL_BASE_RUNNER_SHA256,
+            current_runner_sha256=current,
+        )

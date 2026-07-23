@@ -305,6 +305,55 @@ def test_builds_exact_one_shot_active_label_view(tmp_path: Path, monkeypatch: py
         tool.build_active_label_view(**fixture)
 
 
+def test_accepts_exact_gemma_self_fisher_pinned_staging_runtime_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = load_tool()
+    fixture = build_fixture(tmp_path, tool)
+    current_git = fixture.pop("current_git")
+    monkeypatch.setattr(tool, "git_revision", lambda: current_git)
+    receipt_path = fixture["prejoin_receipt_path"]
+    receipt = json.loads(receipt_path.read_text())
+    receipt["c5_execution_settings"]["self_fisher"]["pinned_transfer_staging"] = {
+        "enabled": True,
+        "host_bytes": 6 * 1024 * 1024,
+    }
+    write_json(receipt_path, receipt)
+
+    tool.build_active_label_view(**fixture)
+
+    audit = json.loads(
+        (fixture["output_dir"] / "ud-label-audit-summary-active.json").read_text()
+    )
+    order = audit["lockbox_order_audit"]
+    assert order["frozen_c5_execution_settings"]["self_fisher"] == {
+        "sample_count": 128,
+        "mc_samples": 4,
+    }
+    assert order["c5_runtime_extensions"]["self_fisher"][
+        "score_formula_or_reduction_changed"
+    ] is False
+
+
+def test_rejects_unsealed_pinned_staging_runtime_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = load_tool()
+    fixture = build_fixture(tmp_path, tool)
+    current_git = fixture.pop("current_git")
+    monkeypatch.setattr(tool, "git_revision", lambda: current_git)
+    receipt_path = fixture["prejoin_receipt_path"]
+    receipt = json.loads(receipt_path.read_text())
+    receipt["c5_execution_settings"]["self_fisher"]["pinned_transfer_staging"] = {
+        "enabled": True,
+        "host_bytes": 1,
+    }
+    write_json(receipt_path, receipt)
+
+    with pytest.raises(ValueError, match="runtime extension is not sealed"):
+        tool.build_active_label_view(**fixture)
+
+
 def test_rejects_bad_score_hash_before_opening_old_label_tsv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

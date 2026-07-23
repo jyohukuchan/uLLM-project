@@ -100,6 +100,9 @@ CURRENT_IMPLEMENTATION_FILES = (
     "summarize-importance-score-screen.py",
 )
 SEALED_STATUS = "sealed score table generated without accepting or opening a GGUF label manifest"
+GEMMA4_EMPIRICAL_BASE_RUNNER_SHA256 = (
+    "f82431fc1dc5b19b06b485a6a60a15b51111c2268aaebc661f64536302fc9293"
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -145,6 +148,40 @@ def require_finite_map(values: dict[str, Any], context: str) -> None:
             raise ValueError(f"{context}.{key} is not a numeric score")
         if not math.isfinite(float(value)):
             raise ValueError(f"{context}.{key} is not finite")
+
+
+def gradient_collector_compatibility(
+    receipt: dict[str, Any],
+    *,
+    expected_mode: str,
+    expected_model_id: str,
+    sealed_runner_sha256: str | None,
+    current_runner_sha256: str,
+) -> dict[str, Any]:
+    if sealed_runner_sha256 == current_runner_sha256:
+        return {
+            "status": "exact-current-implementation",
+            "sealed_runner_sha256": sealed_runner_sha256,
+            "current_runner_sha256": current_runner_sha256,
+        }
+    # The ef5dac90 Gemma empirical result predates the Gemma-only self-Fisher
+    # transfer-staging fix.  That fix is gated by both architecture and
+    # self_fisher mode, so it cannot change the already sealed empirical
+    # formulas, execution path, or score table.  Keep this exception narrow:
+    # one model, one architecture, one mode, and the known base implementation.
+    if (
+        expected_mode == "empirical"
+        and expected_model_id == "gemma-4-E4B-it"
+        and receipt.get("architecture") == "gemma4_text"
+        and sealed_runner_sha256 == GEMMA4_EMPIRICAL_BASE_RUNNER_SHA256
+    ):
+        return {
+            "status": "accepted-score-equivalent-gemma-self-fisher-performance-fix",
+            "sealed_runner_sha256": sealed_runner_sha256,
+            "current_runner_sha256": current_runner_sha256,
+            "scope": "gemma-4-E4B-it empirical receipt only",
+        }
+    raise ValueError("gradient collector implementation hash mismatch")
 
 
 def verify_base(
@@ -196,7 +233,7 @@ def verify_gradient_result(
     expected_names: set[str],
     expected_model_id: str,
     expected_inputs: dict[str, str],
-) -> tuple[dict[str, dict[str, Any]], dict[str, Any], Path]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], Path, dict[str, Any]]:
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if receipt.get("mode") != expected_mode:
         raise ValueError(
@@ -246,8 +283,13 @@ def verify_gradient_result(
     current_runner_hash = sha256_file(
         Path(__file__).resolve().parent / "collect-importance-gradient-scores.py"
     )
-    if runner_hash != current_runner_hash:
-        raise ValueError("gradient collector implementation hash mismatch")
+    collector_compatibility = gradient_collector_compatibility(
+        receipt,
+        expected_mode=expected_mode,
+        expected_model_id=expected_model_id,
+        sealed_runner_sha256=runner_hash,
+        current_runner_sha256=current_runner_hash,
+    )
     for name, row in by_name.items():
         leaked = sorted(FORBIDDEN_LABEL_KEYS.intersection(row))
         if leaked:
@@ -263,7 +305,7 @@ def verify_gradient_result(
             if not isinstance(shard_scores, dict):
                 raise ValueError(f"gradient shard score map is invalid: {name}:{index}")
             require_finite_map(shard_scores, f"{expected_mode}:{name}:shard-{index}")
-    return by_name, receipt, result_path
+    return by_name, receipt, result_path, collector_compatibility
 
 
 def structural_match(base: dict[str, Any], gradient: dict[str, Any], context: str) -> None:
@@ -359,7 +401,12 @@ def main() -> int:
     }
     if any(value is None for value in expected_gradient_inputs.values()):
         raise ValueError("base prejoin does not bind the source roster inputs")
-    empirical, empirical_receipt, empirical_result_path = verify_gradient_result(
+    (
+        empirical,
+        empirical_receipt,
+        empirical_result_path,
+        empirical_collector_compatibility,
+    ) = verify_gradient_result(
         gradient_receipts["empirical_receipt"],
         "empirical",
         names,
@@ -369,8 +416,14 @@ def main() -> int:
     self_fisher: dict[str, dict[str, Any]] | None = None
     self_receipt: dict[str, Any] | None = None
     self_result_path: Path | None = None
+    self_collector_compatibility: dict[str, Any] | None = None
     if args.stage == "full":
-        self_fisher, self_receipt, self_result_path = verify_gradient_result(
+        (
+            self_fisher,
+            self_receipt,
+            self_result_path,
+            self_collector_compatibility,
+        ) = verify_gradient_result(
             gradient_receipts["self_fisher_receipt"],
             "self_fisher",
             names,
@@ -511,6 +564,10 @@ def main() -> int:
             "fisher_corpus_manifest_sha256": common_hashes[
                 "fisher_corpus_manifest"
             ],
+            "gradient_collector_compatibility": {
+                "empirical": empirical_collector_compatibility,
+                "self_fisher": self_collector_compatibility,
+            },
             "label_or_GGUF_inputs_accepted": False,
         },
     }

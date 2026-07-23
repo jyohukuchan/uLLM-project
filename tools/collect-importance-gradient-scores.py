@@ -42,6 +42,25 @@ RECEIPT_SCHEMA_VERSION = "importance-score-gradient-c5-receipt-v0.1"
 CHECKPOINT_SCHEMA_VERSION = "importance-score-gradient-c5-checkpoint-v0.1"
 DEFAULT_HOST_CACHE_LIMIT_BYTES = 64 * 1024**3
 DEFAULT_DISK_CACHE_LIMIT_BYTES = 64 * 1024**3
+# The only checkpoint compatibility exceptions are the in-flight Gemma
+# self-Fisher run produced by ef5dac90 and its score-equivalent performance
+# diagnostics/fixes.  None changed formulas, seeds, reductions, or observation
+# order.
+GEMMA4_PRE_TRANSFER_PRIME_RUNNER_SHA256 = (
+    "f82431fc1dc5b19b06b485a6a60a15b51111c2268aaebc661f64536302fc9293"
+)
+GEMMA4_DEFERRED_HOOK_DIAGNOSTIC_RUNNER_SHA256 = (
+    "ef457ff989ed9516c81b8d9ebcd176a1a6018e01ffb1957e8b39837d62ad1f40"
+)
+GEMMA4_POST_HOOK_PRIME_DIAGNOSTIC_RUNNER_SHA256 = (
+    "7f2af0f5ed8dbad56a6500a9319b832da3ca1f8ed58deac3b59856380c3a7bb6"
+)
+GEMMA4_TRANSFER_PRIME_RUNNER_SHA256 = (
+    "bc01aceba612bc4889b8ca85d0f13d850ff39754f7e13a51eff2a73bc8c7d5a6"
+)
+GEMMA4_PINNED_COMBINED_CAST_RUNNER_SHA256 = (
+    "d4a19147d80a0be7a28893de0523cfe963a280561e69ea5f91e519c7c77dbe09"
+)
 
 EMPIRICAL_METHOD_IDS = (
     "C5a_Taylor_deletion_L1",
@@ -493,6 +512,59 @@ def _scalar_stack_to_floats(names: list[str], values: list[torch.Tensor]) -> dic
     return {name: float(value) for name, value in zip(names, packed.tolist(), strict=True)}
 
 
+class PinnedGradientScoreStager:
+    """Stage the three BF16 cache chunks through reusable pinned host buffers."""
+
+    SOURCE_KEY = "source"
+
+    def __init__(self, chunk_elements: int) -> None:
+        if chunk_elements < 1:
+            raise ValueError("chunk_elements must be positive")
+        self.chunk_elements = chunk_elements
+        self.host_buffers = {
+            key: torch.empty(
+                chunk_elements,
+                dtype=torch.bfloat16,
+                pin_memory=True,
+            )
+            for key in (self.SOURCE_KEY, *CANDIDATE_IDS)
+        }
+
+    @property
+    def host_bytes(self) -> int:
+        return sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in self.host_buffers.values()
+        )
+
+    def to_device(
+        self,
+        key: str,
+        source_cpu: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if key not in self.host_buffers:
+            raise ValueError(f"unknown pinned staging key: {key}")
+        flat_source = source_cpu.detach().reshape(-1)
+        if flat_source.device.type != "cpu":
+            raise ValueError("pinned staging source must be a CPU tensor")
+        if flat_source.dtype != torch.bfloat16:
+            raise ValueError("pinned staging source must be BF16")
+        if flat_source.numel() > self.chunk_elements:
+            raise ValueError("pinned staging source exceeds the frozen chunk size")
+        pinned = self.host_buffers[key][: flat_source.numel()]
+        pinned.copy_(flat_source)
+        # Keep the pinned H2D transfer and dtype conversion as two distinct
+        # operations.  On ROCm, combining device transfer and BF16->FP32 cast
+        # can enter a host-side conversion/staging path whose latency degrades
+        # during the long Gemma self-Fisher hook sequence.  A blocking BF16
+        # copy guarantees that the reusable host buffer is no longer in flight
+        # before it can be overwritten; the FP32 cast then happens on-device.
+        device_bf16 = pinned.to(device=device, non_blocking=False)
+        return device_bf16.to(dtype=torch.float32)
+
+
 def reduce_gradient_scores(
     gradient: torch.Tensor,
     source_cpu: torch.Tensor,
@@ -500,6 +572,7 @@ def reduce_gradient_scores(
     *,
     mode: str,
     chunk_elements: int,
+    transfer_stager: PinnedGradientScoreStager | None = None,
 ) -> dict[str, float]:
     """Reduce one full parameter gradient without retaining an elementwise score.
 
@@ -543,7 +616,16 @@ def reduce_gradient_scores(
     for start in range(0, flat_gradient.numel(), chunk_elements):
         end = min(start + chunk_elements, flat_gradient.numel())
         gradient32 = flat_gradient[start:end].to(dtype=torch.float32)
-        source32 = flat_source[start:end].to(device=device, dtype=torch.float32)
+        source_chunk = flat_source[start:end]
+        source32 = (
+            transfer_stager.to_device(
+                PinnedGradientScoreStager.SOURCE_KEY,
+                source_chunk,
+                device=device,
+            )
+            if transfer_stager is not None
+            else source_chunk.to(device=device, dtype=torch.float32)
+        )
         gradient_squared = gradient32.square()
         accumulators["gradient_trace"] += gradient_squared.sum(dtype=torch.float64)
         if mode == "empirical":
@@ -555,8 +637,15 @@ def reduce_gradient_scores(
                 dtype=torch.float64
             )
         for candidate_id in CANDIDATE_IDS:
-            quantized32 = flat_quantized[candidate_id][start:end].to(
-                device=device, dtype=torch.float32
+            quantized_chunk = flat_quantized[candidate_id][start:end]
+            quantized32 = (
+                transfer_stager.to_device(
+                    candidate_id,
+                    quantized_chunk,
+                    device=device,
+                )
+                if transfer_stager is not None
+                else quantized_chunk.to(device=device, dtype=torch.float32)
             )
             # This subtraction is deliberately FP32.  Never cache or cast delta
             # to BF16: doing so would change both Taylor and Fisher scores.
@@ -598,6 +687,8 @@ class PostAccumulateGradientSession:
         mode: str,
         chunk_elements: int,
         progress: Callable[[Mapping[str, Any]], None] | None = None,
+        transfer_stager: PinnedGradientScoreStager | None = None,
+        auto_activate: bool = True,
     ) -> None:
         if set(parameters) != set(caches):
             raise ValueError("parameter/cache roster mismatch")
@@ -608,13 +699,30 @@ class PostAccumulateGradientSession:
         self.mode = mode
         self.chunk_elements = chunk_elements
         self.progress = progress
+        self.transfer_stager = transfer_stager
         self.context: dict[str, Any] | None = None
         self.results: dict[str, dict[str, float]] = {}
         self.hook_seconds: dict[str, float] = {}
+        self.handles: list[Any] = []
+        if auto_activate:
+            self.activate()
+
+    def activate(self) -> None:
+        if self.handles:
+            raise RuntimeError("gradient hooks are already active")
+        if self.context is not None:
+            raise RuntimeError("cannot activate hooks during a gradient observation")
         self.handles = [
             parameter.register_post_accumulate_grad_hook(self._make_hook(name))
             for name, parameter in self.parameters.items()
         ]
+
+    def deactivate(self) -> None:
+        if self.context is not None:
+            raise RuntimeError("cannot deactivate hooks during a gradient observation")
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
 
     def _make_hook(self, tensor_name: str):
         def hook(parameter: torch.nn.Parameter) -> None:
@@ -635,6 +743,7 @@ class PostAccumulateGradientSession:
                     self.caches[tensor_name].quantized_bf16_cpu,
                     mode=self.mode,
                     chunk_elements=self.chunk_elements,
+                    transfer_stager=self.transfer_stager,
                 )
             finally:
                 # This is the principal memory invariant of the runner.
@@ -658,6 +767,8 @@ class PostAccumulateGradientSession:
     def begin(self, context: Mapping[str, Any]) -> None:
         if self.context is not None:
             raise RuntimeError("a gradient observation is already active")
+        if not self.handles:
+            raise RuntimeError("gradient hooks are not active")
         stale = [name for name, parameter in self.parameters.items() if parameter.grad is not None]
         if stale:
             for parameter in self.parameters.values():
@@ -692,9 +803,7 @@ class PostAccumulateGradientSession:
 
     def close(self) -> None:
         self.abort()
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
+        self.deactivate()
 
     def __enter__(self) -> "PostAccumulateGradientSession":
         return self
@@ -1165,6 +1274,8 @@ def input_signature(
     args: argparse.Namespace,
     selection: list[dict[str, Any]],
     shard_metadata: list[dict[str, Any]],
+    *,
+    implementation_sha256: str | None = None,
 ) -> str:
     return canonical_sha(
         {
@@ -1197,7 +1308,11 @@ def input_signature(
             "trust_remote_code": args.trust_remote_code,
             "device_contract": "HIP_VISIBLE_DEVICES=1; one gfx1201 at logical cuda:0",
             "smoke": args.smoke,
-            "implementation_sha256": sha256_file(Path(__file__).resolve()),
+            "implementation_sha256": (
+                implementation_sha256
+                if implementation_sha256 is not None
+                else sha256_file(Path(__file__).resolve())
+            ),
             "perturbation_runner_sha256": sha256_file(
                 Path(__file__).resolve().parent
                 / "run-importance-single-tensor-perturbation.py"
@@ -1239,6 +1354,7 @@ def load_checkpoint(
     *,
     signature: str,
     mode: str,
+    compatible_signatures: Iterable[str] = (),
 ) -> tuple[
     int,
     int,
@@ -1250,7 +1366,11 @@ def load_checkpoint(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise SystemExit("C5 checkpoint has an unexpected schema")
-    if payload.get("input_signature_sha256") != signature or payload.get("mode") != mode:
+    accepted_signatures = {signature, *compatible_signatures}
+    if (
+        payload.get("input_signature_sha256") not in accepted_signatures
+        or payload.get("mode") != mode
+    ):
         raise SystemExit("C5 checkpoint is bound to different frozen inputs")
     cursor = payload.get("cursor", {})
     return (
@@ -1273,6 +1393,10 @@ def add_observation_results(
         raise RuntimeError("gradient result roster is incomplete")
     for tensor_name in sorted(results):
         aggregates[tensor_name].add(shard_index, results[tensor_name], hook_seconds[tensor_name])
+
+
+def requires_pinned_transfer_staging(architecture: str, mode: str) -> bool:
+    return architecture == "gemma4_text" and mode == "self_fisher"
 
 
 def append_inflight(
@@ -1348,6 +1472,7 @@ def run_gradient_passes(
     sample_timings: list[dict[str, Any]],
     valid_next_tokens: dict[str, int],
     device: torch.device,
+    transfer_stager: PinnedGradientScoreStager | None = None,
 ) -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -1361,6 +1486,7 @@ def run_gradient_passes(
         mode=args.mode,
         chunk_elements=args.gradient_chunk_elements,
         progress=emit_progress,
+        transfer_stager=transfer_stager,
     ) as session:
         for sample_index in range(start_sample_index, len(samples)):
             sample = samples[sample_index]
@@ -1705,6 +1831,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--max-tensors", type=int)
     parser.add_argument("--max-records-per-shard", type=int)
+    parser.add_argument(
+        "--full-roster-performance-smoke",
+        action="store_true",
+        help=(
+            "Smoke-only durability check for Gemma self-Fisher transfer staging; "
+            "uses the complete frozen tensor roster with bounded corpus records."
+        ),
+    )
     args = parser.parse_args(argv)
     args.dtype = "bfloat16"
     args.device = "cuda:0"
@@ -1769,9 +1903,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-tensors must be positive")
     if args.max_records_per_shard is not None and args.max_records_per_shard < 1:
         raise SystemExit("--max-records-per-shard must be positive")
-    if args.smoke and (args.max_tensors is None or args.max_records_per_shard is None):
+    if args.full_roster_performance_smoke:
+        if not args.smoke or args.mode != "self_fisher":
+            raise SystemExit("full-roster performance smoke requires self_fisher --smoke")
+        if args.max_tensors is not None or args.max_records_per_shard is None:
+            raise SystemExit(
+                "full-roster performance smoke requires bounded records and no tensor truncation"
+            )
+    elif args.smoke and (args.max_tensors is None or args.max_records_per_shard is None):
         raise SystemExit("smoke mode requires bounded tensors and records")
-    if not args.smoke and (args.max_tensors is not None or args.max_records_per_shard is not None):
+    if not args.smoke and (
+        args.max_tensors is not None
+        or args.max_records_per_shard is not None
+        or args.full_roster_performance_smoke
+    ):
         raise SystemExit("formal C5 cannot silently truncate tensors or records")
 
 
@@ -1836,7 +1981,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     validate_candidate_manifest(args.candidate_manifest)
     validate_fisher_corpus_manifest(args.fisher_corpus_manifest, args.corpus_shard)
+    pinned_transfer_staging_required = requires_pinned_transfer_staging(
+        str(roster_manifest["architecture"]), args.mode
+    )
     signature = input_signature(args, selection, shard_metadata)
+    compatible_checkpoint_signatures: dict[str, str] = {}
+    if pinned_transfer_staging_required:
+        for implementation_sha256 in (
+            GEMMA4_PRE_TRANSFER_PRIME_RUNNER_SHA256,
+            GEMMA4_DEFERRED_HOOK_DIAGNOSTIC_RUNNER_SHA256,
+            GEMMA4_POST_HOOK_PRIME_DIAGNOSTIC_RUNNER_SHA256,
+            GEMMA4_TRANSFER_PRIME_RUNNER_SHA256,
+            GEMMA4_PINNED_COMBINED_CAST_RUNNER_SHA256,
+        ):
+            compatible_signature = input_signature(
+                args,
+                selection,
+                shard_metadata,
+                implementation_sha256=implementation_sha256,
+            )
+            compatible_checkpoint_signatures[compatible_signature] = implementation_sha256
 
     start_sample_index = 0
     start_draw_index = 0
@@ -1844,7 +2008,12 @@ def main(argv: list[str] | None = None) -> int:
     inflight: dict[str, Any] = {}
     sample_timings: list[dict[str, Any]] = []
     valid_next_tokens: dict[str, int] = {}
+    resumed_checkpoint_signature: str | None = None
     if args.resume and args.checkpoint.exists():
+        checkpoint_header = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+        resumed_checkpoint_signature = str(
+            checkpoint_header.get("input_signature_sha256", "")
+        )
         (
             start_sample_index,
             start_draw_index,
@@ -1852,7 +2021,12 @@ def main(argv: list[str] | None = None) -> int:
             inflight,
             sample_timings,
             valid_next_tokens,
-        ) = load_checkpoint(args.checkpoint, signature=signature, mode=args.mode)
+        ) = load_checkpoint(
+            args.checkpoint,
+            signature=signature,
+            mode=args.mode,
+            compatible_signatures=compatible_checkpoint_signatures,
+        )
         if set(aggregates) != {str(row["hf_name"]) for row in selection}:
             raise SystemExit("checkpoint tensor roster differs from frozen active roster")
         emit_progress(
@@ -1863,6 +2037,17 @@ def main(argv: list[str] | None = None) -> int:
                 "checkpoint": str(args.checkpoint),
             }
         )
+        if resumed_checkpoint_signature != signature:
+            if resumed_checkpoint_signature not in compatible_checkpoint_signatures:
+                raise SystemExit("checkpoint compatibility signature was not the Gemma fix lineage")
+            emit_progress(
+                {
+                    "event": "checkpoint_signature_migrated",
+                    "reason": "Gemma self-Fisher pinned H2D staging performance fix",
+                    "from_input_signature_sha256": resumed_checkpoint_signature,
+                    "to_input_signature_sha256": signature,
+                }
+            )
 
     emit_progress(
         {
@@ -1910,6 +2095,11 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         gradient_passes_started_at = time.perf_counter()
+        transfer_stager = (
+            PinnedGradientScoreStager(args.gradient_chunk_elements)
+            if pinned_transfer_staging_required
+            else None
+        )
         run_gradient_passes(
             args,
             tokenizer,
@@ -1926,6 +2116,7 @@ def main(argv: list[str] | None = None) -> int:
             sample_timings=sample_timings,
             valid_next_tokens=valid_next_tokens,
             device=device,
+            transfer_stager=transfer_stager,
         )
         gradient_passes_seconds = elapsed(device, gradient_passes_started_at)
         if inflight:
@@ -1962,6 +2153,38 @@ def main(argv: list[str] | None = None) -> int:
             "gradient_storage": (
                 "post-accumulate parameter hook only; p.grad=None immediately after scalar "
                 "reduction; no per-parameter gradient/Fisher tensor retained"
+            ),
+            "pinned_transfer_staging": (
+                {
+                    "policy": (
+                        "every source/AQ4/AQ5 BF16 cache chunk is copied through one of "
+                        "three reusable pinned host buffers before transfer to R9700"
+                    ),
+                    "purpose": (
+                        "bypass the ROCm pageable H2D path that degrades during long Gemma "
+                        "self-Fisher backward runs"
+                    ),
+                    "host_bytes": transfer_stager.host_bytes,
+                    "score_reduction_unchanged": True,
+                }
+                if transfer_stager is not None
+                else None
+            ),
+            "checkpoint_resume_compatibility": (
+                {
+                    "reason": (
+                        "Gemma self-Fisher pinned H2D staging performance fix; "
+                        "formulas, seeds, gradients, reductions, and observation order unchanged"
+                    ),
+                    "from_input_signature_sha256": resumed_checkpoint_signature,
+                    "to_input_signature_sha256": signature,
+                    "legacy_runner_sha256": compatible_checkpoint_signatures[
+                        resumed_checkpoint_signature
+                    ],
+                }
+                if resumed_checkpoint_signature is not None
+                and resumed_checkpoint_signature != signature
+                else None
             ),
             "weight_cache": host_cache_metadata,
             "shard_aggregation": "four fixed shard means plus the all-record observation mean",
@@ -2091,6 +2314,10 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
                 "seed_schedule_sha256": canonical_sha(seed_rows) if seed_rows else None,
                 "gradient_chunk_elements": args.gradient_chunk_elements,
+                "pinned_transfer_staging": {
+                    "enabled": transfer_stager is not None,
+                    "host_bytes": transfer_stager.host_bytes if transfer_stager else 0,
+                },
                 "sample_timings": sample_timings,
                 "total_elapsed_seconds": elapsed(device, overall_started_at),
                 "fallback_monitor": {
@@ -2118,6 +2345,10 @@ def main(argv: list[str] | None = None) -> int:
                 "mc_selection_note": args.mc_selection_note,
                 "seed": args.seed,
                 "gradient_chunk_elements": args.gradient_chunk_elements,
+                "pinned_transfer_staging": {
+                    "enabled": transfer_stager is not None,
+                    "host_bytes": transfer_stager.host_bytes if transfer_stager else 0,
+                },
                 "max_fit_elements": args.max_fit_elements,
                 "scale_window": args.scale_window,
                 "group_chunk": args.group_chunk,
