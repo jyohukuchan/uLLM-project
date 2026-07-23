@@ -109,6 +109,55 @@ Every exit attempts to publish
 The outcome binds the authorization and claim hashes, stage results, candidate
 observations, campaign manifest/evidence/report hashes when available, exact
 restored AQ4 hash, reverse reconciliation, and final model/health checks.
+Its exact root fields are:
+
+```text
+schema_version
+authorization_id
+authorization_path
+authorization_sha256
+claim_path
+claim_sha256
+started_at
+completed_at
+status
+failure_stage
+stages
+candidate_observations
+campaigns
+restoration
+```
+
+`status` is exactly one of `succeeded_restored`, `failed_restored`, or
+`failed_restore`. `stages` has the exact keys `claim`, `lock`, `preflight`,
+`backup`, `candidate_activation`, `candidate_reconciliation`,
+`candidate_checks`, `sq8_full`, `reasoning_release`, `reasoning_browser`,
+`aq4_restore`, `reverse_reconciliation`, and `final_checks`. Each value is
+`pending`, `passed`, `failed`, or `skipped` while the transaction is in
+memory; a published outcome contains no `pending` value. A successful outcome
+has every stage `passed`; a failed outcome names a stage whose value is
+`failed`.
+
+Each non-null campaign result binds its authorized run ID and path, whether
+the result is a file or directory, the SHA-256 of its canonical file-tree
+inventory, artifact count, total bytes, and selected manifest/evidence/report
+hashes. Candidate observations record an ordered stage name, the freshly read
+active-manifest hash, and the result of exact byte comparison.
+
+`restoration` has the exact fields `expected_manifest_sha256`,
+`observed_manifest_sha256`, `bytes_equal`,
+`reverse_reconciliation_passed`, `final_checks_passed`, `model_id`,
+`format_id`, and `worker_binary_sha256`. Both `succeeded_restored` and
+`failed_restored` must prove exact AQ4 bytes, successful reverse
+reconciliation and final checks, model `ullm-qwen3.5-9b-aq4`, format `AQ4_0`,
+and a non-null worker hash. `failed_restore` means that complete proof could
+not be made; it never authorizes bundle assembly.
+
+The outcome is strict canonical JSON, mode 0444, link count one, and published
+with atomic no-replace semantics at the authorization-derived path. A second
+publication is rejected. A successor authorization validates the referenced
+outcome's complete shape and canonical immutable bytes, not merely its schema
+tag.
 Outcome publication never releases or deletes the claim. A successor
 authorization must bind this immutable outcome through `prior_outcome`.
 

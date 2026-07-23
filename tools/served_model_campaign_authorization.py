@@ -73,6 +73,70 @@ CLAIM_FIELDS = {
     "attempt",
     "max_attempts",
 }
+OUTCOME_FIELDS = {
+    "schema_version",
+    "authorization_id",
+    "authorization_path",
+    "authorization_sha256",
+    "claim_path",
+    "claim_sha256",
+    "started_at",
+    "completed_at",
+    "status",
+    "failure_stage",
+    "stages",
+    "candidate_observations",
+    "campaigns",
+    "restoration",
+}
+OUTCOME_STAGE_FIELDS = {
+    "claim",
+    "lock",
+    "preflight",
+    "backup",
+    "candidate_activation",
+    "candidate_reconciliation",
+    "candidate_checks",
+    "sq8_full",
+    "reasoning_release",
+    "reasoning_browser",
+    "aq4_restore",
+    "reverse_reconciliation",
+    "final_checks",
+}
+OUTCOME_STAGE_STATES = {"pending", "passed", "failed", "skipped"}
+OUTCOME_STATUSES = {
+    "succeeded_restored",
+    "failed_restored",
+    "failed_restore",
+}
+OUTCOME_OBSERVATION_FIELDS = {
+    "stage",
+    "active_manifest_sha256",
+    "bytes_equal",
+}
+OUTCOME_CAMPAIGN_FIELDS = {
+    "run_id",
+    "path",
+    "kind",
+    "sha256",
+    "artifact_count",
+    "total_bytes",
+    "selected_artifacts",
+}
+OUTCOME_RESTORATION_FIELDS = {
+    "expected_manifest_sha256",
+    "observed_manifest_sha256",
+    "bytes_equal",
+    "reverse_reconciliation_passed",
+    "final_checks_passed",
+    "model_id",
+    "format_id",
+    "worker_binary_sha256",
+}
+SAFE_ARTIFACT_NAME_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._/-]{0,511}\Z"
+)
 
 
 class AuthorizationError(ValueError):
@@ -335,6 +399,221 @@ def _absolute_bound_path(value: Any, label: str, *, require_fresh: bool) -> Path
     return path
 
 
+def _nullable_identifier(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return _identifier(value, label)
+
+
+def _validate_outcome_document_shape(document: dict[str, Any]) -> None:
+    _exact_object(document, OUTCOME_FIELDS, "campaign outcome")
+    if document["schema_version"] != OUTCOME_SCHEMA:
+        raise AuthorizationError("campaign outcome schema differs")
+    _identifier(document["authorization_id"], "outcome.authorization_id")
+    if not isinstance(document["authorization_path"], str):
+        raise AuthorizationError("outcome.authorization_path is invalid")
+    _absolute_bound_path(
+        document["authorization_path"],
+        "outcome.authorization_path",
+        require_fresh=False,
+    )
+    _hash(document["authorization_sha256"], "outcome.authorization_sha256")
+    if not isinstance(document["claim_path"], str):
+        raise AuthorizationError("outcome.claim_path is invalid")
+    _absolute_bound_path(
+        document["claim_path"],
+        "outcome.claim_path",
+        require_fresh=False,
+    )
+    _hash(document["claim_sha256"], "outcome.claim_sha256")
+    started_at = _timestamp(document["started_at"], "outcome.started_at")
+    completed_at = _timestamp(document["completed_at"], "outcome.completed_at")
+    if completed_at < started_at:
+        raise AuthorizationError("campaign outcome completion precedes its start")
+    if document["status"] not in OUTCOME_STATUSES:
+        raise AuthorizationError("campaign outcome status differs")
+    failure_stage = document["failure_stage"]
+    if failure_stage is not None and (
+        not isinstance(failure_stage, str)
+        or failure_stage not in OUTCOME_STAGE_FIELDS
+    ):
+        raise AuthorizationError("campaign outcome failure stage differs")
+
+    stages = _exact_object(
+        document["stages"], OUTCOME_STAGE_FIELDS, "outcome.stages"
+    )
+    if any(value not in OUTCOME_STAGE_STATES for value in stages.values()):
+        raise AuthorizationError("campaign outcome stage state differs")
+    if "pending" in stages.values():
+        raise AuthorizationError("campaign outcome retains a pending stage")
+    if stages["claim"] != "passed":
+        raise AuthorizationError("campaign outcome lacks its consumed claim")
+    if document["status"] == "succeeded_restored":
+        if failure_stage is not None or any(value != "passed" for value in stages.values()):
+            raise AuthorizationError("successful campaign outcome has incomplete stages")
+    elif failure_stage is None or stages[failure_stage] != "failed":
+        raise AuthorizationError("failed campaign outcome lacks its failed stage")
+
+    observations = document["candidate_observations"]
+    if (
+        not isinstance(observations, list)
+        or len(observations) > 4_096
+    ):
+        raise AuthorizationError("campaign outcome observations are invalid")
+    for index, value in enumerate(observations):
+        observation = _exact_object(
+            value,
+            OUTCOME_OBSERVATION_FIELDS,
+            f"outcome.candidate_observations[{index}]",
+        )
+        _identifier(
+            observation["stage"],
+            f"outcome.candidate_observations[{index}].stage",
+        )
+        _hash(
+            observation["active_manifest_sha256"],
+            f"outcome.candidate_observations[{index}].active_manifest_sha256",
+        )
+        if type(observation["bytes_equal"]) is not bool:
+            raise AuthorizationError("campaign outcome observation result is invalid")
+
+    campaigns = _exact_object(
+        document["campaigns"], CAMPAIGN_FIELDS, "outcome.campaigns"
+    )
+    for name in sorted(CAMPAIGN_FIELDS):
+        value = campaigns[name]
+        if value is None:
+            continue
+        campaign = _exact_object(
+            value, OUTCOME_CAMPAIGN_FIELDS, f"outcome.campaigns.{name}"
+        )
+        _identifier(campaign["run_id"], f"outcome.campaigns.{name}.run_id")
+        if not isinstance(campaign["path"], str):
+            raise AuthorizationError(f"outcome.campaigns.{name}.path is invalid")
+        _absolute_bound_path(
+            campaign["path"],
+            f"outcome.campaigns.{name}.path",
+            require_fresh=False,
+        )
+        if campaign["kind"] not in {"file", "directory"}:
+            raise AuthorizationError(f"outcome.campaigns.{name}.kind differs")
+        _hash(campaign["sha256"], f"outcome.campaigns.{name}.sha256")
+        for field in ("artifact_count", "total_bytes"):
+            if (
+                type(campaign[field]) is not int
+                or campaign[field] < 1
+                or campaign[field] > (1 << 63) - 1
+            ):
+                raise AuthorizationError(
+                    f"outcome.campaigns.{name}.{field} is invalid"
+                )
+        selected = campaign["selected_artifacts"]
+        if not isinstance(selected, dict) or len(selected) > 64:
+            raise AuthorizationError(
+                f"outcome.campaigns.{name}.selected_artifacts is invalid"
+            )
+        for artifact_name, digest in selected.items():
+            if (
+                not isinstance(artifact_name, str)
+                or SAFE_ARTIFACT_NAME_RE.fullmatch(artifact_name) is None
+                or artifact_name.startswith("/")
+                or ".." in Path(artifact_name).parts
+            ):
+                raise AuthorizationError(
+                    f"outcome.campaigns.{name} selected artifact name is invalid"
+                )
+            _hash(
+                digest,
+                f"outcome.campaigns.{name}.selected_artifacts.{artifact_name}",
+            )
+
+    restoration = _exact_object(
+        document["restoration"],
+        OUTCOME_RESTORATION_FIELDS,
+        "outcome.restoration",
+    )
+    expected = _hash(
+        restoration["expected_manifest_sha256"],
+        "outcome.restoration.expected_manifest_sha256",
+    )
+    observed = restoration["observed_manifest_sha256"]
+    if observed is not None:
+        _hash(observed, "outcome.restoration.observed_manifest_sha256")
+    for field in (
+        "bytes_equal",
+        "reverse_reconciliation_passed",
+        "final_checks_passed",
+    ):
+        if type(restoration[field]) is not bool:
+            raise AuthorizationError(f"outcome.restoration.{field} is invalid")
+    model_id = _nullable_identifier(
+        restoration["model_id"], "outcome.restoration.model_id"
+    )
+    format_id = _nullable_identifier(
+        restoration["format_id"], "outcome.restoration.format_id"
+    )
+    worker_hash = restoration["worker_binary_sha256"]
+    if worker_hash is not None:
+        _hash(worker_hash, "outcome.restoration.worker_binary_sha256")
+    if restoration["bytes_equal"] != (observed == expected):
+        raise AuthorizationError("campaign outcome restoration byte result differs")
+    if document["status"] in {"succeeded_restored", "failed_restored"}:
+        if (
+            not restoration["bytes_equal"]
+            or not restoration["reverse_reconciliation_passed"]
+            or not restoration["final_checks_passed"]
+            or model_id != "ullm-qwen3.5-9b-aq4"
+            or format_id != "AQ4_0"
+            or worker_hash is None
+        ):
+            raise AuthorizationError("campaign outcome does not prove AQ4 restoration")
+    elif (
+        restoration["bytes_equal"]
+        and restoration["reverse_reconciliation_passed"]
+        and restoration["final_checks_passed"]
+    ):
+        raise AuthorizationError("failed-restore outcome reports complete restoration")
+
+
+def validate_outcome_document(
+    document: dict[str, Any],
+    *,
+    claim: ClaimRecord | None = None,
+) -> None:
+    """Validate one outcome and, when supplied, bind it to the consumed claim."""
+
+    _validate_outcome_document_shape(document)
+    if claim is None:
+        return
+    authorization = claim.authorization
+    if (
+        document["authorization_id"]
+        != authorization.document["authorization_id"]
+        or document["authorization_path"]
+        != os.fspath(authorization.snapshot.path)
+        or document["authorization_sha256"] != authorization.snapshot.sha256
+        or document["claim_path"] != os.fspath(claim.snapshot.path)
+        or document["claim_sha256"] != claim.snapshot.sha256
+        or document["restoration"]["expected_manifest_sha256"]
+        != authorization.document["before"]["manifest_sha256"]
+    ):
+        raise AuthorizationError("campaign outcome claim identity differs")
+    if _timestamp(document["started_at"], "outcome.started_at") < _timestamp(
+        claim.document["claimed_at"], "claim.claimed_at"
+    ):
+        raise AuthorizationError("campaign outcome predates its claim")
+    for name in sorted(CAMPAIGN_FIELDS):
+        campaign = document["campaigns"][name]
+        if campaign is None:
+            continue
+        authorized = authorization.document["campaigns"][name]
+        if (
+            campaign["run_id"] != authorized["run_id"]
+            or campaign["path"] != authorized["final_path"]
+        ):
+            raise AuthorizationError("campaign outcome run/output identity differs")
+
+
 def _validate_outcome_reference(
     value: Any, label: str, *, required_uid: int
 ) -> None:
@@ -352,8 +631,12 @@ def _validate_outcome_reference(
     if snapshot.sha256 != expected_hash:
         raise AuthorizationError(f"{label} SHA-256 differs")
     outcome = strict_json_bytes(snapshot.raw, label)
-    if outcome.get("schema_version") != OUTCOME_SCHEMA:
-        raise AuthorizationError(f"{label} schema differs")
+    if canonical_json_bytes(outcome) != snapshot.raw:
+        raise AuthorizationError(f"{label} is not canonical JSON")
+    try:
+        validate_outcome_document(outcome)
+    except AuthorizationError as error:
+        raise AuthorizationError(f"{label} is invalid") from error
 
 
 def validate_authorization_document(
@@ -691,6 +974,71 @@ def load_claim(
     if claimed_at < authorization.issued_at or claimed_at >= authorization.expires_at:
         raise AuthorizationError("campaign authorization claim time is out of range")
     return ClaimRecord(snapshot, document, authorization)
+
+
+def publish_outcome(
+    claim: ClaimRecord,
+    document: dict[str, Any],
+    *,
+    policy: RegistryPolicy = RegistryPolicy(),
+) -> FileSnapshot:
+    """Publish the authorization-derived immutable outcome exactly once."""
+
+    validate_outcome_document(document, claim=claim)
+    raw = canonical_json_bytes(document)
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise AuthorizationError("campaign outcome exceeds its size bound")
+    registry = _validate_registry(
+        policy.outcome_registry,
+        "campaign outcome registry",
+        required_uid=policy.required_uid,
+    )
+    destination = registry / (
+        f"{claim.authorization.snapshot.sha256}.outcome.json"
+    )
+    try:
+        return _publish_no_replace(
+            destination,
+            raw,
+            mode=0o444,
+            required_uid=policy.required_uid,
+            label="campaign outcome",
+        )
+    except FileExistsError as error:
+        raise AuthorizationConsumed(
+            "campaign authorization outcome already exists"
+        ) from error
+
+
+def load_outcome(
+    authorization_path: Path,
+    *,
+    now: datetime,
+    policy: RegistryPolicy = RegistryPolicy(),
+) -> tuple[FileSnapshot, dict[str, Any]]:
+    """Load and fully bind the immutable outcome to its authorization claim."""
+
+    claim = load_claim(
+        authorization_path,
+        now=now,
+        policy=policy,
+    )
+    destination = outcome_path(
+        claim.authorization.snapshot.sha256,
+        policy=policy,
+    )
+    snapshot = _stable_read(
+        destination,
+        "campaign outcome",
+        required_mode=0o444,
+        required_uid=policy.required_uid,
+        required_nlink=1,
+    )
+    document = strict_json_bytes(snapshot.raw, "campaign outcome")
+    if canonical_json_bytes(document) != snapshot.raw:
+        raise AuthorizationError("campaign outcome is not canonical JSON")
+    validate_outcome_document(document, claim=claim)
+    return snapshot, document
 
 
 def require_window_binding(

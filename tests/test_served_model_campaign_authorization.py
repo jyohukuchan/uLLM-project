@@ -103,6 +103,76 @@ def issue(tmp_path: Path) -> tuple[object, Path, dict[str, object]]:
     return selected_policy, path, value
 
 
+def outcome_document(
+    claim: object,
+    *,
+    status: str = "succeeded_restored",
+    failure_stage: str | None = None,
+) -> dict[str, object]:
+    authorization = claim.authorization.document
+    stages = {name: "passed" for name in AUTH.OUTCOME_STAGE_FIELDS}
+    restoration = {
+        "expected_manifest_sha256": authorization["before"]["manifest_sha256"],
+        "observed_manifest_sha256": authorization["before"]["manifest_sha256"],
+        "bytes_equal": True,
+        "reverse_reconciliation_passed": True,
+        "final_checks_passed": True,
+        "model_id": "ullm-qwen3.5-9b-aq4",
+        "format_id": "AQ4_0",
+        "worker_binary_sha256": authorization["before"]["worker_binary_sha256"],
+    }
+    if failure_stage is not None:
+        stages[failure_stage] = "failed"
+    if status == "failed_restore":
+        stages["aq4_restore"] = "failed"
+        stages["reverse_reconciliation"] = "skipped"
+        stages["final_checks"] = "skipped"
+        restoration.update(
+            observed_manifest_sha256=None,
+            bytes_equal=False,
+            reverse_reconciliation_passed=False,
+            final_checks_passed=False,
+            model_id=None,
+            format_id=None,
+            worker_binary_sha256=None,
+        )
+    campaigns = {}
+    for name, value in authorization["campaigns"].items():
+        campaigns[name] = {
+            "run_id": value["run_id"],
+            "path": value["final_path"],
+            "kind": "directory",
+            "sha256": "8" * 64,
+            "artifact_count": 1,
+            "total_bytes": 2,
+            "selected_artifacts": {"SHA256SUMS": "9" * 64},
+        }
+    return {
+        "schema_version": AUTH.OUTCOME_SCHEMA,
+        "authorization_id": authorization["authorization_id"],
+        "authorization_path": str(claim.authorization.snapshot.path),
+        "authorization_sha256": claim.authorization.snapshot.sha256,
+        "claim_path": str(claim.snapshot.path),
+        "claim_sha256": claim.snapshot.sha256,
+        "started_at": claim.document["claimed_at"],
+        "completed_at": AUTH.utc_timestamp(NOW + timedelta(minutes=1)),
+        "status": status,
+        "failure_stage": failure_stage,
+        "stages": stages,
+        "candidate_observations": [
+            {
+                "stage": "candidate_checks",
+                "active_manifest_sha256": authorization["candidate"][
+                    "manifest_sha256"
+                ],
+                "bytes_equal": True,
+            }
+        ],
+        "campaigns": campaigns,
+        "restoration": restoration,
+    }
+
+
 def test_issue_and_claim_are_canonical_immutable_and_replay_safe(
     tmp_path: Path,
 ) -> None:
@@ -278,14 +348,19 @@ def test_window_and_campaign_bindings_are_exact(tmp_path: Path) -> None:
 def test_prior_outcome_must_be_live_immutable_and_hash_bound(
     tmp_path: Path,
 ) -> None:
-    value = document(tmp_path)
+    prior_policy, prior_authorization, _ = issue(tmp_path)
+    claim = AUTH.claim_authorization(
+        prior_authorization,
+        now=NOW,
+        policy=prior_policy,
+    )
     outcome = tmp_path / "previous-outcome.json"
-    outcome_value = {
-        "schema_version": AUTH.OUTCOME_SCHEMA,
-        "authorization_sha256": "9" * 64,
-    }
+    outcome_value = outcome_document(claim)
     outcome.write_bytes(AUTH.canonical_json_bytes(outcome_value))
     outcome.chmod(0o444)
+    successor_root = tmp_path / "successor"
+    successor_root.mkdir()
+    value = document(successor_root)
     value["prior_outcome"] = {
         "path": str(outcome),
         "sha256": AUTH.hashlib.sha256(outcome.read_bytes()).hexdigest(),
@@ -302,3 +377,85 @@ def test_prior_outcome_must_be_live_immutable_and_hash_bound(
             now=NOW,
             required_uid=os.geteuid(),
         )
+
+
+def test_publish_and_load_outcome_are_exact_claim_bound_and_no_replace(
+    tmp_path: Path,
+) -> None:
+    selected_policy, path, _ = issue(tmp_path)
+    claim = AUTH.claim_authorization(path, now=NOW, policy=selected_policy)
+    value = outcome_document(claim)
+
+    snapshot = AUTH.publish_outcome(
+        claim,
+        value,
+        policy=selected_policy,
+    )
+
+    assert snapshot.path == AUTH.outcome_path(
+        claim.authorization.snapshot.sha256,
+        policy=selected_policy,
+    ).resolve()
+    assert snapshot.mode == 0o444
+    assert snapshot.nlink == 1
+    loaded_snapshot, loaded = AUTH.load_outcome(
+        path,
+        now=NOW,
+        policy=selected_policy,
+    )
+    assert loaded_snapshot.sha256 == snapshot.sha256
+    assert loaded == value
+    with pytest.raises(AUTH.AuthorizationConsumed, match="already exists"):
+        AUTH.publish_outcome(claim, value, policy=selected_policy)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda value: value.update(authorization_sha256="0" * 64),
+            "claim identity",
+        ),
+        (
+            lambda value: value["campaigns"]["sq8_full"].update(run_id="wrong"),
+            "run/output",
+        ),
+        (
+            lambda value: value["restoration"].update(bytes_equal=False),
+            "byte result",
+        ),
+        (
+            lambda value: value["stages"].update(sq8_full="pending"),
+            "pending",
+        ),
+    ],
+)
+def test_outcome_mutations_are_rejected(
+    tmp_path: Path, mutate: object, match: str
+) -> None:
+    selected_policy, path, _ = issue(tmp_path)
+    claim = AUTH.claim_authorization(path, now=NOW, policy=selected_policy)
+    value = outcome_document(claim)
+    mutate(value)
+    with pytest.raises(AUTH.AuthorizationError, match=match):
+        AUTH.validate_outcome_document(value, claim=claim)
+
+
+def test_failed_restored_and_failed_restore_outcomes_are_distinct(
+    tmp_path: Path,
+) -> None:
+    selected_policy, path, _ = issue(tmp_path)
+    claim = AUTH.claim_authorization(path, now=NOW, policy=selected_policy)
+    failed_campaign = outcome_document(
+        claim,
+        status="failed_restored",
+        failure_stage="sq8_full",
+    )
+    AUTH.validate_outcome_document(failed_campaign, claim=claim)
+
+    failed_restore = outcome_document(
+        claim,
+        status="failed_restore",
+        failure_stage="aq4_restore",
+    )
+    AUTH.validate_outcome_document(failed_restore, claim=claim)
