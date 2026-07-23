@@ -34,6 +34,8 @@ def load_tool():
 
 TOOL = load_tool()
 
+SESSION_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.signature"
+
 
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -584,7 +586,7 @@ class BrowserContractTests(unittest.TestCase):
                 image="browser@sha256:" + "a" * 64,
                 name="gate-container",
                 script=script,
-                token_file=token,
+                session_token_file=token,
                 browser_output=output,
                 control_dir=control,
                 openwebui_url="http://127.0.0.1:3000",
@@ -606,6 +608,21 @@ class BrowserContractTests(unittest.TestCase):
 
 
 class IdentitySecretAndAtomicTests(unittest.TestCase):
+    def test_openwebui_session_token_rejects_gateway_api_key(self):
+        TOOL.validate_openwebui_session_token(
+            SESSION_JWT, minimum_validity_seconds=30, now_seconds=1
+        )
+        with self.assertRaisesRegex(TOOL.StopGateError, "not a JWT"):
+            TOOL.validate_openwebui_session_token(
+                "gateway-api-key", minimum_validity_seconds=30, now_seconds=1
+            )
+        with self.assertRaisesRegex(TOOL.StopGateError, "expires"):
+            TOOL.validate_openwebui_session_token(
+                "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.signature",
+                minimum_validity_seconds=30,
+                now_seconds=1,
+            )
+
     def test_service_identity_requires_active_main_pid_and_resolves_user(self):
         account = pwd.getpwuid(os.geteuid())
         raw = (

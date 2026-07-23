@@ -434,7 +434,7 @@ def args_for(bundle: Path) -> argparse.Namespace:
     return argparse.Namespace(
         failure_gate=TOOL_PATH,
         failure_bundle=bundle,
-        token_file=Path("/private/release-token"),
+        openwebui_session_token_file=Path("/private/release-token"),
         browser_script=ROOT / "deploy" / "openwebui" / "browser-failure-smoke.cjs",
         browser_image="sha256:" + "a" * 64,
         probe_image="sha256:" + "b" * 64,
@@ -736,7 +736,7 @@ class FailureHookExecutionTests(unittest.TestCase):
             os.fspath(TOOL_PATH),
             "--failure-bundle",
             "/tmp/not-created-failure-bundle",
-            "--token-file",
+            "--openwebui-session-token-file",
             "/private/token",
             "--browser-script",
             os.fspath(ROOT / "deploy/openwebui/browser-failure-smoke.cjs"),
@@ -803,7 +803,7 @@ class FailureHookExecutionTests(unittest.TestCase):
             "relative.py",
             "--failure-bundle",
             "/tmp/bundle",
-            "--token-file",
+            "--openwebui-session-token-file",
             "/tmp/token",
             "--browser-script",
             "/tmp/browser.cjs",
@@ -840,7 +840,7 @@ class FailureHookExecutionTests(unittest.TestCase):
         command = TOOL.build_failure_gate_command(args)
         for flag in (
             "--output-dir",
-            "--token-file",
+            "--openwebui-session-token-file",
             "--browser-script",
             "--browser-image",
             "--probe-image",

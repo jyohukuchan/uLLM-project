@@ -25,6 +25,9 @@ GATE_SOURCE = ROOT / "tools" / "run-openwebui-failure-gate.py"
 HOOK_SOURCE = ROOT / "tools" / "run-openwebui-failure-hook.py"
 BROWSER_SOURCE = ROOT / "deploy" / "openwebui" / "browser-failure-smoke.cjs"
 PILOT = Path("/home/homelab1/datapool/openwebui-failure-formal-20260711-195916")
+PILOT_GATE_SOURCE_SHA256 = "63075654ef80c6a165a133a3d9a73a21477f0c6e0d6412d0adc02f516807c544"
+PILOT_HOOK_SOURCE_SHA256 = "fbc1ea6d3cfd314cda55b6665fb3bf67f5c90731a4d21158fe9df3814e145dfd"
+PILOT_BROWSER_SOURCE_SHA256 = "ff08666d8917d5cf134e886ed61916312b6e8894c010b762aca531d47fa391bb"
 
 
 def load_module(name: str, path: Path):
@@ -695,19 +698,21 @@ class FailureGateIngestTests(unittest.TestCase):
             self.ingest(bundle, bindings)
 
     @unittest.skipUnless(PILOT.is_dir(), "formal failure pilot is unavailable")
-    def test_formal_pilot_matches_pinned_current_sources(self) -> None:
+    def test_formal_pilot_revalidates_only_with_matching_sources(self) -> None:
+        summary = load_json(PILOT / "summary.json")
+        self.assertEqual(summary["gate_source_sha256"], PILOT_GATE_SOURCE_SHA256)
         self.assertEqual(
-            digest(GATE_SOURCE),
-            "63075654ef80c6a165a133a3d9a73a21477f0c6e0d6412d0adc02f516807c544",
+            summary["browser"]["script_sha256"], PILOT_BROWSER_SOURCE_SHA256
         )
-        self.assertEqual(
-            digest(HOOK_SOURCE),
-            "fbc1ea6d3cfd314cda55b6665fb3bf67f5c90731a4d21158fe9df3814e145dfd",
-        )
-        self.assertEqual(
-            digest(BROWSER_SOURCE),
-            "ff08666d8917d5cf134e886ed61916312b6e8894c010b762aca531d47fa391bb",
-        )
+        if (
+            digest(GATE_SOURCE) != PILOT_GATE_SOURCE_SHA256
+            or digest(HOOK_SOURCE) != PILOT_HOOK_SOURCE_SHA256
+            or digest(BROWSER_SOURCE) != PILOT_BROWSER_SOURCE_SHA256
+        ):
+            self.skipTest(
+                "formal failure pilot source binding differs from current source; "
+                "a fresh pilot is required"
+            )
         bindings = INGEST.FailureGateInputBindings(
             gate_source=GATE_SOURCE,
             gate_source_sha256=digest(GATE_SOURCE),

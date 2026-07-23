@@ -152,7 +152,7 @@ function loadConfig() {
     process.env.OPENWEBUI_URL || "http://192.168.0.66:3000/",
   );
   const tokenFile =
-    process.env.OPENWEBUI_TOKEN_FILE || "/run/secrets/openwebui-token";
+    process.env.OPENWEBUI_SESSION_TOKEN_FILE || "/run/secrets/openwebui-session-token";
   const summaryFile =
     process.env.OPENWEBUI_SOAK_SUMMARY || "/output/openwebui-soak-summary.json";
   const mode =

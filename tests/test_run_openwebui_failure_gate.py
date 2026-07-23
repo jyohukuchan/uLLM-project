@@ -32,6 +32,8 @@ def load_tool():
 
 TOOL = load_tool()
 
+SESSION_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.signature"
+
 
 def digest(value: str | bytes) -> str:
     raw = value.encode() if isinstance(value, str) else value
@@ -705,6 +707,15 @@ def dataclass_replace(value, **changes):
 
 
 class IdentityCommandAndAtomicTests(unittest.TestCase):
+    def test_openwebui_session_token_rejects_gateway_api_key(self):
+        TOOL.validate_openwebui_session_token(
+            SESSION_JWT, minimum_validity_seconds=30, now_seconds=1
+        )
+        with self.assertRaisesRegex(TOOL.FailureGateError, "not a JWT"):
+            TOOL.validate_openwebui_session_token(
+                "gateway-api-key", minimum_validity_seconds=30, now_seconds=1
+            )
+
     def test_gate_and_browser_scripts_are_executable(self):
         self.assertTrue(os.access(TOOL_PATH, os.X_OK))
         self.assertTrue(
@@ -740,7 +751,7 @@ class IdentityCommandAndAtomicTests(unittest.TestCase):
                 image=image,
                 name="failure-browser",
                 script=script,
-                token_file=token,
+                session_token_file=token,
                 browser_output=output,
                 control_dir=control,
                 openwebui_url="http://127.0.0.1:3000/",

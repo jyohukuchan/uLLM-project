@@ -25,6 +25,8 @@ def load_tool() -> ModuleType:
 
 TOOL = load_tool()
 
+SESSION_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.signature"
+
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -96,7 +98,7 @@ def test_runner_publishes_valid_hash_only_evidence_and_binds_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     token = tmp_path / "token"
-    token.write_text("secret-token\n", encoding="ascii")
+    token.write_text(SESSION_JWT + "\n", encoding="ascii")
     script = tmp_path / "smoke.cjs"
     script.write_text("console.log('{}')\n", encoding="ascii")
     output = tmp_path / "browser.json"
@@ -119,7 +121,7 @@ def test_runner_publishes_valid_hash_only_evidence_and_binds_command(
     result = TOOL.execute(
         output=output,
         manifest=tmp_path / "manifest.json",
-        token_file=token,
+        openwebui_session_token_file=token,
         browser_image="sha256:" + "a" * 64,
         openwebui_url="http://127.0.0.1:3000/",
         model_id=model_id,
@@ -144,7 +146,7 @@ def test_runner_publishes_gate_eligible_evidence_without_a_provider_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     token = tmp_path / "token"
-    token.write_text("secret-token\n", encoding="ascii")
+    token.write_text(SESSION_JWT + "\n", encoding="ascii")
     script = tmp_path / "smoke.cjs"
     script.write_text("console.log('{}')\n", encoding="ascii")
     output = tmp_path / "browser.json"
@@ -166,7 +168,7 @@ def test_runner_publishes_gate_eligible_evidence_without_a_provider_switch(
     result = TOOL.execute(
         output=output,
         manifest=tmp_path / "manifest.json",
-        token_file=token,
+        openwebui_session_token_file=token,
         browser_image="sha256:" + "a" * 64,
         openwebui_url="http://127.0.0.1:3000/",
         model_id=model_id,
@@ -188,7 +190,7 @@ def test_runner_cli_allows_switch_arguments_to_be_omitted(tmp_path: Path) -> Non
             str(tmp_path / "browser.json"),
             "--manifest",
             str(tmp_path / "active.json"),
-            "--token-file",
+            "--openwebui-session-token-file",
             str(tmp_path / "token"),
             "--browser-image",
             "sha256:" + "a" * 64,
@@ -209,7 +211,7 @@ def test_runner_rejects_external_model_binding_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     token = tmp_path / "token"
-    token.write_text("secret-token", encoding="ascii")
+    token.write_text(SESSION_JWT, encoding="ascii")
     script = tmp_path / "smoke.cjs"
     script.write_text("console.log('{}')\n", encoding="ascii")
     output = tmp_path / "browser.json"
@@ -229,7 +231,7 @@ def test_runner_rejects_external_model_binding_mismatch(
         TOOL.execute(
             output=output,
             manifest=tmp_path / "manifest.json",
-            token_file=token,
+            openwebui_session_token_file=token,
             browser_image="sha256:" + "a" * 64,
             openwebui_url="http://127.0.0.1:3000",
             model_id="different",
@@ -260,6 +262,16 @@ def test_runner_validates_explicit_browser_container_user() -> None:
     assert TOOL._validate_container_user("1000:1000") == (1000, 1000)
     with pytest.raises(TOOL.SmokeError, match="UID:GID"):
         TOOL._validate_container_user("root")
+
+
+def test_runner_rejects_gateway_api_key_as_openwebui_session() -> None:
+    with pytest.raises(TOOL.SmokeError, match="not a JWT"):
+        TOOL._validate_openwebui_session_token(
+            b"gateway-api-key", minimum_validity_seconds=30, now_seconds=1
+        )
+    TOOL._validate_openwebui_session_token(
+        SESSION_JWT.encode("ascii"), minimum_validity_seconds=30, now_seconds=1
+    )
 
 
 def test_alternating_r9700_coordinator_serializes_provider_ownership(

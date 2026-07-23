@@ -652,6 +652,9 @@ class FakeValidator:
 class ProductionSafetyPrimitiveTests(unittest.TestCase):
     API_SECRET = b"api-secret-0123456789abcdef"
     OPENWEBUI_TOKEN = b"openwebui-token-0123456789abcdef"
+    OPENWEBUI_SESSION_JWT = (
+        b"eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.signature"
+    )
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -678,7 +681,7 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
 
     def test_secret_snapshots_accept_exact_api_and_token_contracts(self):
         api = self.write_secret("api-key", self.API_SECRET + b"\n", 0o640)
-        token = self.write_secret("token", self.OPENWEBUI_TOKEN, 0o600)
+        token = self.write_secret("token", self.OPENWEBUI_SESSION_JWT, 0o600)
         real_identity = ORCHESTRATOR._StableFileIdentity.from_stat
 
         def root_owned(value):
@@ -691,7 +694,8 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
         ):
             self.assertEqual(ORCHESTRATOR.snapshot_api_secret(api), self.API_SECRET)
         self.assertEqual(
-            ORCHESTRATOR.snapshot_openwebui_token(token), self.OPENWEBUI_TOKEN
+            ORCHESTRATOR.snapshot_openwebui_session_token(token),
+            self.OPENWEBUI_SESSION_JWT,
         )
 
     def test_secret_snapshot_rejects_symlink_mode_owner_and_multiple_lines(self):
@@ -724,7 +728,12 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
             "token", self.OPENWEBUI_TOKEN + b"\nsecond-line", 0o600
         )
         with self.assertRaisesRegex(ORCHESTRATOR.FullCampaignError, "one bounded"):
-            ORCHESTRATOR.snapshot_openwebui_token(token)
+            ORCHESTRATOR.snapshot_openwebui_session_token(token)
+
+    def test_session_snapshot_rejects_gateway_api_key_shape(self):
+        token = self.write_secret("token", self.OPENWEBUI_TOKEN, 0o600)
+        with self.assertRaisesRegex(ORCHESTRATOR.FullCampaignError, "not a JWT"):
+            ORCHESTRATOR.snapshot_openwebui_session_token(token)
 
     def test_secret_snapshot_rejects_path_replacement_during_read(self):
         api = self.write_secret("api-key", self.API_SECRET, 0o640)
@@ -754,7 +763,7 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ORCHESTRATOR.FullCampaignError, "owner, mode, or size"
         ):
-            ORCHESTRATOR.snapshot_openwebui_token(token)
+            ORCHESTRATOR.snapshot_openwebui_session_token(token)
 
         token.chmod(0o600)
         hardlink = self.root / "token-hardlink"
@@ -762,7 +771,7 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ORCHESTRATOR.FullCampaignError, "owner, mode, or size"
         ):
-            ORCHESTRATOR.snapshot_openwebui_token(token)
+            ORCHESTRATOR.snapshot_openwebui_session_token(token)
         hardlink.unlink()
 
         real_identity = ORCHESTRATOR._StableFileIdentity.from_stat
@@ -778,7 +787,7 @@ class ProductionSafetyPrimitiveTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(ORCHESTRATOR.FullCampaignError, "owner"),
         ):
-            ORCHESTRATOR.snapshot_openwebui_token(token)
+            ORCHESTRATOR.snapshot_openwebui_session_token(token)
 
     def test_secret_snapshot_rejects_fifo_without_blocking(self):
         fifo = self.root / "api-key-fifo"
@@ -1402,7 +1411,7 @@ class FakePreparationRuntime:
         self.step("api-secret")
         return self.API
 
-    def snapshot_token(self, path):
+    def snapshot_session_token(self, path):
         self.step("token-secret")
         return self.TOKEN
 
@@ -1471,7 +1480,7 @@ class ProductionPreparationCliTests(unittest.TestCase):
             os.fspath(self.root / "campaign"),
             "--api-key-file",
             os.fspath(self.root / "api"),
-            "--openwebui-token-file",
+            "--openwebui-session-token-file",
             os.fspath(self.root / "token"),
         ]
 

@@ -11,18 +11,19 @@ evidence collection. The fidelity fix is genuinely deployed and serving.
 What is NOT done: the formal Section 9/10 bundle-gated activation. Assembling
 a `--status complete` release bundle requires `--browser-evidence` /
 `--browser-validator`, which requires a working OpenWebUI browser-automation
-session. That session is currently broken by a pre-existing infrastructure
-gap unrelated to this fix (the browser gates inject the gateway's backend
-bearer key into `localStorage.token`, but OpenWebUI's frontend uses its own
-separate session/JWT auth, so every browser gate redirects to `/auth` and
-fails; see the follow-up task "Fix OpenWebUI browser-gate session
-authentication"). Section 8.4's HTTP/SSE release campaign (no browser
-required) succeeded: 10 cases across all 5 reasoning modes, correct
-candidate identity and R9700 exclusivity confirmed.
+session. The browser-gate credential bug is now fixed in code: browser gates
+accept only `--openwebui-session-token-file`, reject the gateway backend key,
+and require a non-expiring-for-the-gate OpenWebUI frontend JWT. The operator
+must still provision that separate private session-token file and rerun the
+real gates; no live browser evidence has been claimed by this documentation
+update. Section 8.4's HTTP/SSE release campaign (no browser required)
+succeeded: 10 cases across all 5 reasoning modes, correct candidate identity
+and R9700 exclusivity confirmed.
 
 **Do not run Section 9's "restore current active bytes" step until the
-browser-gate auth fix lands and a complete bundle can actually be
-assembled.** Restoring now without a working path back through Section 10
+browser gates have passed with a real frontend session JWT and a complete
+bundle can actually be assembled.** Restoring now without a working path back
+through Section 10
 would revert production to the pre-fix build with no way to
 re-promote via the documented bundle-gated route. The candidate stays active
 as its own de facto rollback-safe state (health-checked dozens of times
@@ -204,7 +205,10 @@ update if any of them are no longer locally available.
     ENVIRONMENT=/etc/ullm/openai-gateway-manifest.env
     SERVICE=ullm-openai.service
     LLAMA_SERVICE=llama-qwen35-udq4.service
-    TOKEN_FILE=/etc/ullm/openai-api-key
+    GATEWAY_TOKEN_FILE=/etc/ullm/openai-api-key
+    # A private 0600 OpenWebUI frontend session JWT, provisioned by the parent.
+    # Never set this to GATEWAY_TOKEN_FILE.
+    OPENWEBUI_SESSION_TOKEN_FILE=/run/user/$(id -u)/ullm-openwebui-session.jwt
     BROWSER_IMAGE=sha256:0bd709ea36ffa7204cd60da0fe9707be38eb73c97c7a9d45911ff0e8b7c1e3ea
     PROBE_IMAGE=sha256:5dce198cca467ce79994ed65e01d03882238f9efdd16a8c6f4bc55151c8a4a54
     OPENWEBUI_IMAGE=ullm/open-webui@sha256:ef5ae4fbc06abb662eeefe87e584ea7c69e55838f5f08f637057b9108048b409
@@ -447,26 +451,30 @@ needs it, run the `baseline-v0.5-candidate-active-*` sequence above and then:
     cd "$SOURCE_TREE"
     ULLM_OPENWEBUI_SOAK_COUNT=100 uv run --project services/openai-gateway python \
       tools/run-openwebui-soak-gate.py \
-      --output-dir "$OUT/soak-100" --token-file "$TOKEN_FILE" \
+      --output-dir "$OUT/soak-100" \
+      --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
       --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
       --service "$SERVICE" --include-smoke
 
     sudo systemctl restart "$SERVICE"
     ULLM_OPENWEBUI_SOAK_COUNT=20 uv run --project services/openai-gateway python \
       tools/run-openwebui-soak-gate.py \
-      --output-dir "$OUT/soak-restart-20" --token-file "$TOKEN_FILE" \
+      --output-dir "$OUT/soak-restart-20" \
+      --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
       --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
       --service "$SERVICE" --include-smoke
 
     uv run --project services/openai-gateway python \
       tools/run-openwebui-stop-gate.py \
-      --output-dir "$OUT/stop" --token-file "$TOKEN_FILE" \
+      --output-dir "$OUT/stop" \
+      --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
       --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
       --service "$SERVICE"
 
     uv run --project services/openai-gateway python \
       tools/run-openwebui-failure-gate.py \
-      --output-dir "$OUT/failure" --token-file "$TOKEN_FILE" \
+      --output-dir "$OUT/failure" \
+      --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
       --browser-image "$BROWSER_IMAGE" --probe-image "$PROBE_IMAGE" \
       --openwebui-url "$OPENWEBUI_URL" --service "$SERVICE"
 
@@ -482,7 +490,8 @@ option affects uLLM and the R9700 llama service only; it never targets V620.
     uv run --project services/openai-gateway python \
       tools/run-openwebui-reasoning-browser-smoke.py \
       --output "$OUT/browser-reasoning-f1a3cf4c.json" \
-      --manifest "$ACTIVE" --token-file "$TOKEN_FILE" \
+      --manifest "$ACTIVE" \
+      --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
       --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
       --model-id "$ULLM_MODEL_ID" --model-name "$ULLM_MODEL_NAME" \
       --switch-model-id llama-qwen3.5-9b-ud-q4 \
@@ -505,7 +514,7 @@ returned uLLM ownership to the R9700.
       tools/run-generic-reasoning-release-campaign.py \
       --output-dir "$OUT/http-sse-campaign" --manifest "$ACTIVE" \
       --fixture-suite tests/fixtures/generic-reasoning-release-v0.1/prompts.json \
-      --token-file "$TOKEN_FILE" --http-image "$PROBE_IMAGE" \
+      --token-file "$GATEWAY_TOKEN_FILE" --http-image "$PROBE_IMAGE" \
       --endpoint http://172.20.0.1:8000/v1/chat/completions \
       --network open-webui-network --observer-socket /run/ullm/lifecycle-observer.sock \
       --service "$SERVICE" --timeout-seconds 900

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import hashlib
 import json
@@ -53,6 +54,7 @@ CONTENT_IMAGE_RE = re.compile(
 SERVICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\.service\Z")
 NETWORK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+JWT_SEGMENT_RE = re.compile(r"[A-Za-z0-9_-]{1,16384}\Z")
 REASONING_RELEASE_FIELDS = {"reasoning_tokens", "forced_end_tokens"}
 
 FAILURE_PROMPT = " ".join(
@@ -220,6 +222,69 @@ def nonempty_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value or "\0" in value:
         fail(f"{label} is not a nonempty string")
     return value
+
+
+def _decode_session_jwt_object(segment: str, label: str) -> dict[str, Any]:
+    if JWT_SEGMENT_RE.fullmatch(segment) is None:
+        fail(f"OpenWebUI session token {label} segment is invalid")
+    padded = segment + ("=" * (-len(segment) % 4))
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> NoReturn:
+        raise ValueError("non-finite JSON value")
+
+    try:
+        raw = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
+        fail(f"OpenWebUI session token {label} segment is not strict JSON")
+    if not isinstance(value, dict):
+        fail(f"OpenWebUI session token {label} segment is not an object")
+    return value
+
+
+def validate_openwebui_session_token(
+    token: str,
+    *,
+    minimum_validity_seconds: int,
+    now_seconds: int | None = None,
+) -> None:
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token.encode("utf-8")) > 65_536
+        or any(character in token for character in "\r\n\0")
+        or token.strip() != token
+    ):
+        fail("OpenWebUI session token is not one strict line")
+    if not isinstance(minimum_validity_seconds, int) or minimum_validity_seconds < 0:
+        fail("OpenWebUI session token validity requirement is invalid")
+    parts = token.split(".")
+    if len(parts) != 3:
+        fail("OpenWebUI session token is not a JWT")
+    header = _decode_session_jwt_object(parts[0], "header")
+    payload = _decode_session_jwt_object(parts[1], "payload")
+    if not isinstance(header.get("alg"), str) or not header["alg"]:
+        fail("OpenWebUI session token header lacks an algorithm")
+    expiration = payload.get("exp")
+    if isinstance(expiration, bool) or not isinstance(expiration, int):
+        fail("OpenWebUI session token lacks an integer expiration")
+    now = int(time.time()) if now_seconds is None else now_seconds
+    if not isinstance(now, int) or expiration <= now + minimum_validity_seconds:
+        fail("OpenWebUI session token expires before the browser gate can finish")
 
 
 def sha256_value(value: Any, label: str) -> str:
@@ -1286,7 +1351,7 @@ def build_browser_command(
     image: str,
     name: str,
     script: Path,
-    token_file: Path,
+    session_token_file: Path,
     browser_output: Path,
     control_dir: Path,
     openwebui_url: str,
@@ -1297,7 +1362,7 @@ def build_browser_command(
     image, _digest = normalized_content_image(image)
     mounts = (
         f"type=bind,src={_safe_mount_path(script, 'browser script')},dst={BROWSER_SCRIPT_CONTAINER_PATH},readonly",
-        f"type=bind,src={_safe_mount_path(token_file, 'token file')},dst=/run/secrets/openwebui-token,readonly",
+        f"type=bind,src={_safe_mount_path(session_token_file, 'OpenWebUI session token file')},dst=/run/secrets/openwebui-session-token,readonly",
         f"type=bind,src={_safe_mount_path(browser_output, 'browser output')},dst=/output",
         f"type=bind,src={_safe_mount_path(control_dir, 'control directory')},dst=/run/control,readonly",
     )
@@ -1318,7 +1383,7 @@ def build_browser_command(
             "--env",
             f"OPENWEBUI_URL={openwebui_url}",
             "--env",
-            "OPENWEBUI_TOKEN_FILE=/run/secrets/openwebui-token",
+            "OPENWEBUI_SESSION_TOKEN_FILE=/run/secrets/openwebui-session-token",
             "--env",
             f"ULLM_MODEL_ID={MODEL_ID}",
             "--env",
@@ -2813,9 +2878,13 @@ def execute(args: argparse.Namespace) -> None:
             args.browser_script, "browser failure script", 2 * 1024 * 1024
         )
         runner_raw = GATE_SOURCE_RAW
-        token = read_regular_exact(args.token_file, "OpenWebUI token file", 65_536)
+        token = read_regular_exact(
+            args.openwebui_session_token_file,
+            "OpenWebUI session token file",
+            65_536,
+        )
         script = output.stage / "runtime" / "browser-failure-smoke.cjs"
-        token_file = output.stage / "runtime" / "openwebui-token"
+        session_token_file = output.stage / "runtime" / "openwebui-session-token"
         browser_container_output = (
             output.stage / "runtime" / BROWSER_CONTAINER_OUTPUT_DIR_NAME
         )
@@ -2824,11 +2893,13 @@ def execute(args: argparse.Namespace) -> None:
         except OSError:
             fail("failed to create isolated browser output staging")
         write_private_snapshot(script, script_raw, "browser failure script")
-        write_private_snapshot(token_file, token, "OpenWebUI token")
+        write_private_snapshot(
+            session_token_file, token, "OpenWebUI session token"
+        )
         try:
             token_text = token.decode("utf-8", errors="strict")
         except UnicodeError:
-            fail("OpenWebUI token is not UTF-8")
+            fail("OpenWebUI session token is not UTF-8")
         if token_text.endswith("\n"):
             token_text = token_text[:-1]
         if (
@@ -2836,7 +2907,11 @@ def execute(args: argparse.Namespace) -> None:
             or token_text.strip() != token_text
             or any(character in token_text for character in "\r\n\0")
         ):
-            fail("OpenWebUI token is not one strict line")
+            fail("OpenWebUI session token is not one strict line")
+        validate_openwebui_session_token(
+            token_text,
+            minimum_validity_seconds=args.timeout_seconds + 30,
+        )
         openwebui_url = normalized_openwebui_url(args.openwebui_url)
         ready_url = normalized_ready_url(args.ready_url)
         browser_image, browser_digest = normalized_content_image(args.browser_image)
@@ -2909,7 +2984,7 @@ def execute(args: argparse.Namespace) -> None:
             image=browser_image,
             name=browser_name,
             script=script,
-            token_file=token_file,
+            session_token_file=session_token_file,
             browser_output=browser_container_output,
             control_dir=output.stage / "control",
             openwebui_url=openwebui_url,
@@ -3135,7 +3210,7 @@ def execute(args: argparse.Namespace) -> None:
             (browser_container_output / BROWSER_SUMMARY_NAME).unlink()
             browser_container_output.rmdir()
             script.unlink()
-            token_file.unlink()
+            session_token_file.unlink()
             (output.stage / "runtime").rmdir()
         except OSError:
             fail("failed to remove private failure-gate staging")
@@ -3284,7 +3359,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Run the formal OpenWebUI post-header worker-failure gate."
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument(
+        "--openwebui-session-token-file",
+        type=Path,
+        required=True,
+        help="private OpenWebUI frontend session JWT; not the gateway API key",
+    )
     parser.add_argument(
         "--browser-script",
         type=Path,

@@ -11,7 +11,8 @@ const MODEL_LABEL = process.env.ULLM_MODEL_NAME || "uLLM Qwen3.5 9B AQ4";
 const SWITCH_MODEL_ID = process.env.OPENWEBUI_SWITCH_MODEL_ID || "";
 const SWITCH_MODEL_LABEL = process.env.OPENWEBUI_SWITCH_MODEL_NAME || "";
 const SWITCH_ENABLED = Boolean(SWITCH_MODEL_ID || SWITCH_MODEL_LABEL);
-const TOKEN_FILE = process.env.OPENWEBUI_TOKEN_FILE || "/run/secrets/openwebui-token";
+const TOKEN_FILE =
+  process.env.OPENWEBUI_SESSION_TOKEN_FILE || "/run/secrets/openwebui-session-token";
 const FIRST_MARKER = process.env.OPENWEBUI_REASONING_ANSWER || "REASONING_BROWSER_OK";
 const SECOND_MARKER =
   process.env.OPENWEBUI_REASONING_SECOND_ANSWER || "REASONING_HISTORY_OK";

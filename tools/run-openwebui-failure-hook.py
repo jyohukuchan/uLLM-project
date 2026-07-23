@@ -1569,8 +1569,8 @@ def build_failure_gate_command(args: argparse.Namespace) -> list[str]:
         os.fspath(args.failure_gate),
         "--output-dir",
         os.fspath(args.failure_bundle),
-        "--token-file",
-        os.fspath(args.token_file),
+        "--openwebui-session-token-file",
+        os.fspath(args.openwebui_session_token_file),
         "--browser-script",
         os.fspath(args.browser_script),
         "--browser-image",
@@ -1663,7 +1663,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--failure-gate", type=Path, required=True)
     parser.add_argument("--failure-bundle", type=Path, required=True)
-    parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument("--openwebui-session-token-file", type=Path, required=True)
     parser.add_argument("--browser-script", type=Path, required=True)
     parser.add_argument("--browser-image", required=True)
     parser.add_argument("--probe-image", required=True)
@@ -1678,7 +1678,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-timeout-ms", type=int, required=True)
     parser.add_argument("--recovery-probe-timeout-seconds", type=int, required=True)
     args = parser.parse_args(argv)
-    for name in ("failure_gate", "failure_bundle", "token_file", "browser_script"):
+    for name in (
+        "failure_gate",
+        "failure_bundle",
+        "openwebui_session_token_file",
+        "browser_script",
+    ):
         if not getattr(args, name).is_absolute():
             parser.error(f"--{name.replace('_', '-')} must be an absolute path")
     if args.timeout_seconds < 60 or args.timeout_seconds > 1800:

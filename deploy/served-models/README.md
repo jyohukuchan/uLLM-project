@@ -128,7 +128,9 @@ fresh identities with `docker image inspect` before a later run.
 ```bash
 export ULLM_MODEL_ID=ullm-qwen3.5-9b-aq4
 export ULLM_MODEL_NAME='uLLM Qwen3.5 9B AQ4'
-export TOKEN_FILE=/etc/ullm/openai-api-key
+export GATEWAY_TOKEN_FILE=/etc/ullm/openai-api-key
+# A private 0600 OpenWebUI frontend session JWT. Never use GATEWAY_TOKEN_FILE.
+export OPENWEBUI_SESSION_TOKEN_FILE=/run/user/$(id -u)/ullm-openwebui-session.jwt
 export BROWSER_IMAGE=sha256:dbd552f6c831816050a1381a54cdb8d37df56df7f6559c82aba451d2ea93e0aa
 export PROBE_IMAGE=sha256:5dce198cca467ce79994ed65e01d03882238f9efdd16a8c6f4bc55151c8a4a54
 export OPENWEBUI_IMAGE=ullm/open-webui@sha256:ef5ae4fbc06abb662eeefe87e584ea7c69e55838f5f08f637057b9108048b409
@@ -153,7 +155,7 @@ uv run --project services/openai-gateway python \
   --output-dir "$OUT/http-sse-campaign" \
   --manifest /etc/ullm/served-models/active.json \
   --fixture-suite tests/fixtures/generic-reasoning-release-v0.1/prompts.json \
-  --token-file "$TOKEN_FILE" --http-image "$PROBE_IMAGE" \
+  --token-file "$GATEWAY_TOKEN_FILE" --http-image "$PROBE_IMAGE" \
   --service "$SERVICE"
 
 uv run --project services/openai-gateway python \
@@ -179,24 +181,28 @@ be refreshed with `docker image inspect` before a later run. Run the normal
 ```bash
 ULLM_OPENWEBUI_SOAK_COUNT=100 uv run --project services/openai-gateway python \
   tools/run-openwebui-soak-gate.py \
-  --output-dir "$OUT/soak-100" --token-file "$TOKEN_FILE" \
+  --output-dir "$OUT/soak-100" \
+  --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
   --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
   --service "$SERVICE" --include-smoke
 
 systemctl restart "$SERVICE"
 ULLM_OPENWEBUI_SOAK_COUNT=20 uv run --project services/openai-gateway python \
   tools/run-openwebui-soak-gate.py \
-  --output-dir "$OUT/soak-restart-20" --token-file "$TOKEN_FILE" \
+  --output-dir "$OUT/soak-restart-20" \
+  --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
   --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
   --service "$SERVICE" --include-smoke
 
 uv run --project services/openai-gateway python tools/run-openwebui-stop-gate.py \
-  --output-dir "$OUT/stop" --token-file "$TOKEN_FILE" \
+  --output-dir "$OUT/stop" \
+  --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
   --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
   --service "$SERVICE"
 
 uv run --project services/openai-gateway python tools/run-openwebui-failure-gate.py \
-  --output-dir "$OUT/failure" --token-file "$TOKEN_FILE" \
+  --output-dir "$OUT/failure" \
+  --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
   --browser-image "$BROWSER_IMAGE" --probe-image "$PROBE_IMAGE" \
   --openwebui-url "$OPENWEBUI_URL" --service "$SERVICE"
 ```
@@ -211,7 +217,7 @@ uv run --project services/openai-gateway python \
   tools/run-openwebui-reasoning-browser-smoke.py \
   --output "$OUT/browser-reasoning.json" \
   --manifest /etc/ullm/served-models/active.json \
-  --token-file "$TOKEN_FILE" \
+  --openwebui-session-token-file "$OPENWEBUI_SESSION_TOKEN_FILE" \
   --browser-image "$BROWSER_IMAGE" --openwebui-url "$OPENWEBUI_URL" \
   --model-id "$ULLM_MODEL_ID" --model-name "$ULLM_MODEL_NAME" \
   --switch-model-id llama-qwen3.5-9b-ud-q4 \

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import dataclasses
 import fcntl
@@ -64,6 +65,9 @@ SECRET_READ_MAX_BYTES = SECRET_MAX_BYTES + 1
 SECRET_SCAN_JSON_MAX_BYTES = 16 << 20
 SECRET_SCAN_MAX_NODES = 100_000
 SECRET_COPY_CHUNK_BYTES = 64 << 10
+JWT_SEGMENT_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
 
 
 class FullCampaignError(RuntimeError):
@@ -224,16 +228,71 @@ def snapshot_api_secret(path: Path) -> bytes:
     )
 
 
-def snapshot_openwebui_token(path: Path) -> bytes:
-    """Snapshot the private OpenWebUI bearer token owned by the execution user."""
+def _decode_openwebui_session_jwt_object(segment: str, label: str) -> dict[str, Any]:
+    if not segment or len(segment) > 16_384 or any(
+        character not in JWT_SEGMENT_ALPHABET for character in segment
+    ):
+        fail(f"OpenWebUI session token {label} segment is invalid")
+    padded = segment + ("=" * (-len(segment) % 4))
 
-    return _snapshot_secret_file(
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> NoReturn:
+        raise ValueError("non-finite JSON value")
+
+    try:
+        raw = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
+        fail(f"OpenWebUI session token {label} segment is not strict JSON")
+    if not isinstance(value, dict):
+        fail(f"OpenWebUI session token {label} segment is not an object")
+    return value
+
+
+def _validate_openwebui_session_jwt(value: bytes) -> None:
+    try:
+        token = value.decode("utf-8", errors="strict")
+    except UnicodeError:
+        fail("OpenWebUI session token is not UTF-8")
+    parts = token.split(".")
+    if len(parts) != 3:
+        fail("OpenWebUI session token is not a JWT")
+    header = _decode_openwebui_session_jwt_object(parts[0], "header")
+    payload = _decode_openwebui_session_jwt_object(parts[1], "payload")
+    if not isinstance(header.get("alg"), str) or not header["alg"]:
+        fail("OpenWebUI session token header lacks an algorithm")
+    expiration = payload.get("exp")
+    if isinstance(expiration, bool) or not isinstance(expiration, int):
+        fail("OpenWebUI session token lacks an integer expiration")
+    if expiration <= int(time.time()) + 30:
+        fail("OpenWebUI session token expires before campaign setup can finish")
+
+
+def snapshot_openwebui_session_token(path: Path) -> bytes:
+    """Snapshot one private OpenWebUI frontend session JWT."""
+
+    value = _snapshot_secret_file(
         path,
         expected_uid=os.geteuid(),
         expected_gid=os.getegid(),
         expected_mode=0o600,
-        label="OpenWebUI token",
+        label="OpenWebUI session token",
     )
+    _validate_openwebui_session_jwt(value)
+    return value
 
 
 def _validate_private_parent(parent: Path, uid: int, gid: int, label: str) -> Path:
@@ -1928,7 +1987,7 @@ class ProductionPreparationRequest:
     run_id: str
     final_path: Path
     api_key_file: Path
-    openwebui_token_file: Path
+    openwebui_session_token_file: Path
 
 
 class ProductionPreparationRuntime(Protocol):
@@ -1946,7 +2005,7 @@ class ProductionPreparationRuntime(Protocol):
 
     def snapshot_api_key(self, path: Path) -> bytes: ...
 
-    def snapshot_token(self, path: Path) -> bytes: ...
+    def snapshot_session_token(self, path: Path) -> bytes: ...
 
     def create_secret_owner(
         self, api_key: bytes, token: bytes
@@ -2036,7 +2095,9 @@ class PreparedProductionCampaign:
             tool_owner = runtime.create_head_tools(anchor)
             promotion = runtime.validate_promotion(anchor, tool_owner)
             api_key = runtime.snapshot_api_key(request.api_key_file)
-            token = runtime.snapshot_token(request.openwebui_token_file)
+            token = runtime.snapshot_session_token(
+                request.openwebui_session_token_file
+            )
             try:
                 secret_owner = runtime.create_secret_owner(api_key, token)
                 guard = CampaignSecretGuard((api_key, token))
@@ -2212,8 +2273,8 @@ class SystemProductionPreparationRuntime:
     def snapshot_api_key(self, path: Path) -> bytes:
         return snapshot_api_secret(path)
 
-    def snapshot_token(self, path: Path) -> bytes:
-        return snapshot_openwebui_token(path)
+    def snapshot_session_token(self, path: Path) -> bytes:
+        return snapshot_openwebui_session_token(path)
 
     def create_secret_owner(self, api_key: bytes, token: bytes) -> CampaignSecretOwner:
         return CampaignSecretOwner.create(
@@ -2353,7 +2414,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--final-path", required=True, type=Path)
     parser.add_argument("--api-key-file", required=True, type=Path)
-    parser.add_argument("--openwebui-token-file", required=True, type=Path)
+    parser.add_argument(
+        "--openwebui-session-token-file",
+        required=True,
+        type=Path,
+        help="private OpenWebUI frontend session JWT; not the gateway API key",
+    )
     return parser
 
 
@@ -2370,7 +2436,7 @@ def main(
         arguments.run_id,
         arguments.final_path,
         arguments.api_key_file,
-        arguments.openwebui_token_file,
+        arguments.openwebui_session_token_file,
     )
     try:
         if arguments.execute and runtime is not None and executor is None:
@@ -2437,5 +2503,5 @@ __all__ = [
     "ViewsRenderer",
     "run_full_campaign",
     "snapshot_api_secret",
-    "snapshot_openwebui_token",
+    "snapshot_openwebui_session_token",
 ]

@@ -10,7 +10,8 @@ const modelName = process.env.ULLM_MODEL_NAME || "uLLM Qwen3 14B SQ8";
 const expectedText = process.env.OPENWEBUI_EXPECTED_TEXT || "BROWSER_OK";
 const prompt =
   process.env.OPENWEBUI_SMOKE_PROMPT || `Reply exactly ${expectedText}.`;
-const tokenFile = process.env.OPENWEBUI_TOKEN_FILE || "/run/secrets/openwebui-token";
+const tokenFile =
+  process.env.OPENWEBUI_SESSION_TOKEN_FILE || "/run/secrets/openwebui-session-token";
 const screenshotPath =
   process.env.OPENWEBUI_SCREENSHOT || "/output/openwebui-browser-smoke.png";
 const token = fs.readFileSync(tokenFile, "utf8").trim();

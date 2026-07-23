@@ -11,6 +11,7 @@ written by this runner.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
@@ -41,6 +42,7 @@ IMAGE_RE = re.compile(
     r"(?:[A-Za-z0-9][A-Za-z0-9._/:+-]*@)?sha256:[0-9a-f]{64}\Z"
 )
 CONTAINER_USER_RE = re.compile(r"[0-9]{1,5}:[0-9]{1,5}\Z")
+JWT_SEGMENT_RE = re.compile(r"[A-Za-z0-9_-]{1,16384}\Z")
 _VALIDATOR_MODULE_NAME = "_ullm_openwebui_reasoning_browser_validator"
 _SERVED_MODEL_MODULE_NAME = "_ullm_reasoning_browser_served_model_validator"
 TARGET_GPU_INDEX = "1"
@@ -120,6 +122,76 @@ def _validate_public_text(value: str, label: str) -> str:
     if any(character in value for character in "\r\n\0"):
         raise SmokeError(f"{label} contains a forbidden control character")
     return value
+
+
+def _decode_session_jwt_object(segment: str, label: str) -> dict[str, Any]:
+    if JWT_SEGMENT_RE.fullmatch(segment) is None:
+        raise SmokeError(f"OpenWebUI session token {label} segment is invalid")
+    padded = segment + ("=" * (-len(segment) % 4))
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite JSON value")
+
+    try:
+        raw = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
+        raise SmokeError(
+            f"OpenWebUI session token {label} segment is not strict JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise SmokeError(f"OpenWebUI session token {label} segment is not an object")
+    return value
+
+
+def _validate_openwebui_session_token(
+    token: bytes,
+    *,
+    minimum_validity_seconds: int,
+    now_seconds: int | None = None,
+) -> None:
+    try:
+        value = token.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise SmokeError("OpenWebUI session token is not UTF-8") from error
+    if value.endswith("\n"):
+        value = value[:-1]
+    if (
+        not value
+        or len(value.encode("utf-8")) > MAX_TOKEN_FILE_BYTES
+        or any(character in value for character in "\r\n\0")
+        or value.strip() != value
+    ):
+        raise SmokeError("OpenWebUI session token is not one strict line")
+    if not isinstance(minimum_validity_seconds, int) or minimum_validity_seconds < 0:
+        raise SmokeError("OpenWebUI session token validity requirement is invalid")
+    parts = value.split(".")
+    if len(parts) != 3:
+        raise SmokeError("OpenWebUI session token is not a JWT")
+    header = _decode_session_jwt_object(parts[0], "header")
+    payload = _decode_session_jwt_object(parts[1], "payload")
+    if not isinstance(header.get("alg"), str) or not header["alg"]:
+        raise SmokeError("OpenWebUI session token header lacks an algorithm")
+    expiration = payload.get("exp")
+    if isinstance(expiration, bool) or not isinstance(expiration, int):
+        raise SmokeError("OpenWebUI session token lacks an integer expiration")
+    now = int(time.time()) if now_seconds is None else now_seconds
+    if not isinstance(now, int) or expiration <= now + minimum_validity_seconds:
+        raise SmokeError("OpenWebUI session token expires before the browser gate can finish")
 
 
 def _load_validator() -> ModuleType:
@@ -539,7 +611,7 @@ def execute(
     *,
     output: Path,
     manifest: Path,
-    token_file: Path,
+    openwebui_session_token_file: Path,
     browser_image: str,
     openwebui_url: str,
     model_id: str,
@@ -559,10 +631,16 @@ def execute(
     if output.exists() or output.is_symlink():
         raise SmokeError("browser evidence output already exists or is a symlink")
     manifest_summary = _validate_manifest_identity(manifest, model_id)
-    token = _read_regular(token_file, "OpenWebUI token file", MAX_TOKEN_FILE_BYTES)
+    token = _read_regular(
+        openwebui_session_token_file,
+        "OpenWebUI session token file",
+        MAX_TOKEN_FILE_BYTES,
+    )
     script = _read_regular(browser_script, "browser smoke script", MAX_SCRIPT_BYTES)
-    if not token:
-        raise SmokeError("OpenWebUI token file is empty")
+    _validate_openwebui_session_token(
+        token,
+        minimum_validity_seconds=int(timeout_seconds) + 30,
+    )
     url = _validate_url(openwebui_url)
     image = _validate_image(browser_image)
     model_id = _validate_public_text(model_id, "model ID")
@@ -604,7 +682,7 @@ def execute(
 
     container_name = f"ullm-reasoning-browser-{uuid.uuid4().hex[:16]}"
     script_path = browser_script.resolve(strict=True)
-    token_path = token_file.resolve(strict=True)
+    token_path = openwebui_session_token_file.resolve(strict=True)
     command = [
         docker,
         "run",
@@ -617,11 +695,11 @@ def execute(
         "--mount",
         f"type=bind,src={script_path},dst=/run/ullm-browser-reasoning-smoke.cjs,readonly",
         "--mount",
-        f"type=bind,src={token_path},dst=/run/secrets/openwebui-token,readonly",
+        f"type=bind,src={token_path},dst=/run/secrets/openwebui-session-token,readonly",
         "--env",
         f"OPENWEBUI_URL={url}",
         "--env",
-        "OPENWEBUI_TOKEN_FILE=/run/secrets/openwebui-token",
+        "OPENWEBUI_SESSION_TOKEN_FILE=/run/secrets/openwebui-session-token",
         "--env",
         "NODE_PATH=/usr/src/app/node_modules",
         "--env",
@@ -737,7 +815,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument(
+        "--openwebui-session-token-file",
+        type=Path,
+        required=True,
+        help="private OpenWebUI frontend session JWT; not the gateway API key",
+    )
     parser.add_argument("--browser-image", required=True)
     parser.add_argument("--openwebui-url", required=True)
     parser.add_argument("--model-id", required=True)
@@ -762,7 +845,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = execute(
             output=args.output,
             manifest=args.manifest,
-            token_file=args.token_file,
+            openwebui_session_token_file=args.openwebui_session_token_file,
             browser_image=args.browser_image,
             openwebui_url=args.openwebui_url,
             model_id=args.model_id,

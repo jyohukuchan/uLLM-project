@@ -177,7 +177,7 @@ def build_gate_argv(
         ]
     elif gate == "combined":
         command += [
-            "--token-file",
+            "--openwebui-session-token-file",
             os.fspath(secrets.openwebui_token),
             "--browser-image",
             deployment.browser_image,
@@ -189,7 +189,7 @@ def build_gate_argv(
         ]
     elif gate == "stop":
         command += [
-            "--token-file",
+            "--openwebui-session-token-file",
             os.fspath(secrets.openwebui_token),
             "--browser-image",
             deployment.browser_image,
@@ -200,7 +200,7 @@ def build_gate_argv(
         ]
     elif gate == "failure":
         command += [
-            "--token-file",
+            "--openwebui-session-token-file",
             os.fspath(secrets.openwebui_token),
             "--browser-image",
             deployment.browser_image,
@@ -387,7 +387,7 @@ def _is_allowed_command(command: tuple[str, ...]) -> bool:
         ),
         "combined": (
             "--output-dir",
-            "--token-file",
+            "--openwebui-session-token-file",
             "--browser-image",
             "--openwebui-url",
             "--service",
@@ -401,14 +401,14 @@ def _is_allowed_command(command: tuple[str, ...]) -> bool:
         ),
         "stop": (
             "--output-dir",
-            "--token-file",
+            "--openwebui-session-token-file",
             "--browser-image",
             "--openwebui-url",
             "--service",
         ),
         "failure": (
             "--output-dir",
-            "--token-file",
+            "--openwebui-session-token-file",
             "--browser-image",
             "--probe-image",
             "--openwebui-url",

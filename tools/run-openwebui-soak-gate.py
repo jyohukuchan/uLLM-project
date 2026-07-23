@@ -619,7 +619,7 @@ def build_browser_command(
     image: str,
     name: str,
     script: Path,
-    token_file: Path,
+    session_token_file: Path,
     browser_output: Path,
     openwebui_url: str,
     uid: int,
@@ -629,7 +629,7 @@ def build_browser_command(
     image, _content_digest = normalized_browser_image(image)
     mounts = (
         f"type=bind,src={_safe_mount_path(script, 'browser script')},dst={BROWSER_SCRIPT_CONTAINER_PATH},readonly",
-        f"type=bind,src={_safe_mount_path(token_file, 'token file')},dst=/run/secrets/openwebui-token,readonly",
+        f"type=bind,src={_safe_mount_path(session_token_file, 'OpenWebUI session token file')},dst=/run/secrets/openwebui-session-token,readonly",
         f"type=bind,src={_safe_mount_path(browser_output, 'browser output')},dst=/output",
     )
     command = [
@@ -649,7 +649,7 @@ def build_browser_command(
             "--env",
             f"OPENWEBUI_URL={openwebui_url}",
             "--env",
-            "OPENWEBUI_TOKEN_FILE=/run/secrets/openwebui-token",
+            "OPENWEBUI_SESSION_TOKEN_FILE=/run/secrets/openwebui-session-token",
             "--env",
             f"ULLM_MODEL_ID={MODEL_ID}",
             "--env",
@@ -1336,9 +1336,13 @@ def execute(args: argparse.Namespace) -> None:
         )
         runner_raw = GATE_SOURCE_RAW
         support_raw = SUPPORT_SOURCE_RAW
-        token = stable_regular_snapshot(args.token_file, "OpenWebUI token file", 65_536)
+        token = stable_regular_snapshot(
+            args.openwebui_session_token_file,
+            "OpenWebUI session token file",
+            65_536,
+        )
         script = output.stage / "runtime" / "browser-soak.cjs"
-        token_file = output.stage / "runtime" / "openwebui-token"
+        session_token_file = output.stage / "runtime" / "openwebui-session-token"
         browser_container_output = (
             output.stage / "runtime" / BROWSER_CONTAINER_OUTPUT_DIR_NAME
         )
@@ -1347,11 +1351,13 @@ def execute(args: argparse.Namespace) -> None:
         except OSError:
             fail("failed to create isolated browser soak output staging")
         write_private_snapshot(script, script_raw, "browser soak script")
-        write_private_snapshot(token_file, token, "OpenWebUI token")
+        write_private_snapshot(
+            session_token_file, token, "OpenWebUI session token"
+        )
         try:
             token_text = token.decode("utf-8", errors="strict")
         except UnicodeError:
-            fail("OpenWebUI token is not UTF-8")
+            fail("OpenWebUI session token is not UTF-8")
         if token_text.endswith("\n"):
             token_text = token_text[:-1]
         if (
@@ -1360,7 +1366,11 @@ def execute(args: argparse.Namespace) -> None:
             or token_text.strip() != token_text
             or any(character in token_text for character in "\r\n\0")
         ):
-            fail("OpenWebUI token is not one strict line")
+            fail("OpenWebUI session token is not one strict line")
+        SUPPORT.validate_openwebui_session_token(
+            token_text,
+            minimum_validity_seconds=args.timeout_seconds + 30,
+        )
         url = normalized_url(args.openwebui_url)
         browser_image, browser_content_digest = normalized_browser_image(
             args.browser_image
@@ -1423,7 +1433,7 @@ def execute(args: argparse.Namespace) -> None:
             image=browser_image,
             name=container_name,
             script=script,
-            token_file=token_file,
+            session_token_file=session_token_file,
             browser_output=browser_container_output,
             openwebui_url=url,
             uid=os.geteuid(),
@@ -1505,7 +1515,7 @@ def execute(args: argparse.Namespace) -> None:
             browser_summary_source.unlink()
             browser_container_output.rmdir()
             script.unlink()
-            token_file.unlink()
+            session_token_file.unlink()
             (output.stage / "runtime").rmdir()
             (output.stage / "control").rmdir()
         except OSError:
@@ -1638,7 +1648,12 @@ def execute(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--token-file", type=Path, required=True)
+    parser.add_argument(
+        "--openwebui-session-token-file",
+        type=Path,
+        required=True,
+        help="private OpenWebUI frontend session JWT; not the gateway API key",
+    )
     parser.add_argument(
         "--browser-image",
         required=True,
