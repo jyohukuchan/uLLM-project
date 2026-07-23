@@ -1145,7 +1145,12 @@ class FullCampaignOrchestratorTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def run_campaign(
-        self, *, fail_phase=None, validator_fail=False, adapter_close_fail=False
+        self,
+        *,
+        fail_phase=None,
+        validator_fail=False,
+        adapter_close_fail=False,
+        active_binding=None,
     ):
         backend = FakeBackend(
             self.root,
@@ -1163,7 +1168,13 @@ class FullCampaignOrchestratorTests(unittest.TestCase):
         )
         renderer = FakeRenderer(backend.calls)
         validator = FakeValidator(backend.calls, fail=validator_fail)
-        result = ORCHESTRATOR.run_full_campaign(config, backend, renderer, validator)
+        result = ORCHESTRATOR.run_full_campaign(
+            config,
+            backend,
+            renderer,
+            validator,
+            active_binding=active_binding,
+        )
         return backend, final, result
 
     def test_happy_path_uses_one_continuous_journal_and_publishes_last(self):
@@ -1208,6 +1219,7 @@ class FullCampaignOrchestratorTests(unittest.TestCase):
             for record in records
             if record["record_type"] == "lifecycle_quiet_check"
         ]
+
         self.assertEqual(len(quiet), 1)
         self.assertEqual(quiet[0]["journal_cursor"], "anchor-cursor")
         api_journal = [
@@ -1273,6 +1285,38 @@ class FullCampaignOrchestratorTests(unittest.TestCase):
             (final / "browser/post-header-failure.png").read_bytes(),
             backend.failure_png.read_bytes(),
         )
+
+    def test_v2_campaign_observes_exact_active_bytes_at_every_phase(self):
+        candidate = self.root / "candidate.json"
+        active = self.root / "active.json"
+        raw = b'{"schema_version":"ullm.served_model.v2"}\n'
+        candidate.write_bytes(raw)
+        active.write_bytes(raw)
+        binding = ORCHESTRATOR.ActiveManifestBinding(
+            candidate_path=candidate,
+            active_path=active,
+            expected_sha256=hashlib.sha256(raw).hexdigest(),
+            expected_stages=ORCHESTRATOR.PHASE_ORDER,
+        )
+
+        _backend, final, _result = self.run_campaign(
+            active_binding=binding
+        )
+
+        self.assertEqual(
+            (final / "candidate-served-model.json").read_bytes(), raw
+        )
+        observations = [
+            json.loads(line)
+            for line in (
+                final / "active-manifest-observations.jsonl"
+            ).read_text(encoding="ascii").splitlines()
+        ]
+        self.assertEqual(
+            [row["stage"] for row in observations],
+            list(ORCHESTRATOR.PHASE_ORDER),
+        )
+        self.assertTrue(all(row["bytes_equal"] is True for row in observations))
 
     def test_resource_result_requires_explicit_sampling_cases(self):
         result = types.SimpleNamespace(
@@ -1421,7 +1465,8 @@ class FakePreparationRuntime:
             raise AssertionError("secret values differ")
         return self.secret
 
-    def build_identity(self, request, anchor, promotion, guard):
+    def build_identity(self, request, anchor, promotion, guard, active_binding):
+        assert active_binding is None
         self.step("identity")
         self.guard = guard
         return types.SimpleNamespace(name="identity")
@@ -1454,6 +1499,7 @@ class FakePreparationRuntime:
             prepared.git_anchor,
             prepared.promotion,
             prepared.secret_guard,
+            prepared.active_binding,
         )
         container = self.discover_container()
         self.run_operational(identity, container)

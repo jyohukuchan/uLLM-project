@@ -20,7 +20,7 @@ MAX_INLINE_BYTES = 16 << 20
 COMPONENT_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
-PREVALIDATION_ROOT_FILES = frozenset(
+PREVALIDATION_ROOT_FILES_V1 = frozenset(
     {
         "environment.json",
         "model-identity.json",
@@ -42,6 +42,15 @@ PREVALIDATION_ROOT_FILES = frozenset(
         "SHA256SUMS",
     }
 )
+PREVALIDATION_ROOT_FILES_V2 = PREVALIDATION_ROOT_FILES_V1 | frozenset(
+    {
+        "candidate-served-model.json",
+        "active-manifest-observations.jsonl",
+    }
+)
+# Compatibility alias.  Historical callers and archived v1 validators must keep
+# seeing the byte-for-byte v1 layout unless they explicitly select v2.
+PREVALIDATION_ROOT_FILES = PREVALIDATION_ROOT_FILES_V1
 BROWSER_FILES = frozenset({"openwebui-stop-before.png", "post-header-failure.png"})
 VALIDATION_FILE = "release-validation.json"
 RENAME_NOREPLACE = 1
@@ -171,7 +180,17 @@ def _write_all(descriptor: int, raw: bytes) -> None:
         fail("failed to write a campaign artifact")
 
 
-def _relative_target(relative: str) -> tuple[bool, str]:
+def _layout_root_files(version: str) -> frozenset[str]:
+    if version == "v1":
+        return PREVALIDATION_ROOT_FILES_V1
+    if version == "v2":
+        return PREVALIDATION_ROOT_FILES_V2
+    fail("campaign bundle layout version differs")
+
+
+def _relative_target(
+    relative: str, root_files: frozenset[str]
+) -> tuple[bool, str]:
     if type(relative) is not str or not relative:
         fail("campaign artifact path is empty")
     pure = PurePosixPath(relative)
@@ -182,7 +201,7 @@ def _relative_target(relative: str) -> tuple[bool, str]:
         or any(part in {"", ".", ".."} for part in relative.split("/"))
     ):
         fail("campaign artifact path is unsafe")
-    if len(pure.parts) == 1 and relative in PREVALIDATION_ROOT_FILES:
+    if len(pure.parts) == 1 and relative in root_files:
         return False, relative
     if (
         len(pure.parts) == 2
@@ -196,7 +215,14 @@ def _relative_target(relative: str) -> tuple[bool, str]:
 class AtomicCampaignDirectory:
     """Keep work outside evidence and publish only a validator-complete bundle."""
 
-    def __init__(self, final_path: Path, *, uid: int, gid: int):
+    def __init__(
+        self,
+        final_path: Path,
+        *,
+        uid: int,
+        gid: int,
+        layout_version: str = "v1",
+    ):
         if type(uid) is not int or uid < 0 or type(gid) is not int or gid < 0:
             fail("campaign owner binding is invalid")
         absolute_final = Path(os.path.abspath(final_path))
@@ -213,6 +239,8 @@ class AtomicCampaignDirectory:
         self.parent_path = absolute_parent
         self.uid = uid
         self.gid = gid
+        self.layout_version = layout_version
+        self.root_files = _layout_root_files(layout_version)
         self.parent_fd = -1
         self.stage_fd = -1
         self.browser_fd = -1
@@ -370,7 +398,7 @@ class AtomicCampaignDirectory:
             fail("campaign directory is no longer writable")
 
     def artifact_path(self, relative: str) -> Path:
-        browser, name = _relative_target(relative)
+        browser, name = _relative_target(relative, self.root_files)
         return self.stage_path / "browser" / name if browser else self.stage_path / name
 
     def component_directory(self, label: str) -> Path:
@@ -400,7 +428,7 @@ class AtomicCampaignDirectory:
         self._require_open()
         if type(raw) is not bytes or len(raw) > MAX_INLINE_BYTES or not callable(scan):
             fail("campaign artifact bytes or scanner type differs")
-        browser, name = _relative_target(relative)
+        browser, name = _relative_target(relative, self.root_files)
         parent_fd = self.browser_fd if browser else self.stage_fd
         label = f"campaign artifact {relative}"
         scan(raw, label)
@@ -483,7 +511,7 @@ class AtomicCampaignDirectory:
         source_fd = -1
         destination_fd = -1
         published = False
-        browser, name = _relative_target(relative)
+        browser, name = _relative_target(relative, self.root_files)
         destination_parent_fd = self.browser_fd if browser else self.stage_fd
         temporary = f".{name}.incomplete-{secrets.token_hex(8)}"
         label = f"campaign copied artifact {relative}"
@@ -599,7 +627,7 @@ class AtomicCampaignDirectory:
         stage_entry_name: str | None = None,
     ) -> None:
         self._validate_anchor(stage_entry_name=stage_entry_name)
-        expected_root = set(PREVALIDATION_ROOT_FILES) | {"browser"}
+        expected_root = set(self.root_files) | {"browser"}
         if include_validation:
             expected_root.add(VALIDATION_FILE)
         try:
@@ -610,7 +638,7 @@ class AtomicCampaignDirectory:
             for parent_fd, names in (
                 (
                     self.stage_fd,
-                    set(PREVALIDATION_ROOT_FILES)
+                    set(self.root_files)
                     | ({VALIDATION_FILE} if include_validation else set()),
                 ),
                 (self.browser_fd, set(BROWSER_FILES)),
@@ -693,8 +721,8 @@ class AtomicCampaignDirectory:
             stage_entry_name=stage_entry_name,
         )
         snapshots: list[tuple[str, _ImmutableFileSeal]] = []
-        for relative in expected_prevalidation_paths():
-            browser, name = _relative_target(relative)
+        for relative in expected_prevalidation_paths(self.layout_version):
+            browser, name = _relative_target(relative, self.root_files)
             parent_fd = self.browser_fd if browser else self.stage_fd
             snapshots.append(
                 (
@@ -926,10 +954,11 @@ class AtomicCampaignDirectory:
             raise pending
 
 
-def expected_prevalidation_paths() -> tuple[str, ...]:
+def expected_prevalidation_paths(layout_version: str = "v1") -> tuple[str, ...]:
+    root_files = _layout_root_files(layout_version)
     return tuple(
         sorted(
-            set(PREVALIDATION_ROOT_FILES)
+            set(root_files)
             | {f"browser/{name}" for name in BROWSER_FILES},
             key=lambda item: item.encode("utf-8"),
         )
@@ -942,6 +971,8 @@ __all__ = [
     "CampaignBundleError",
     "FileEvidence",
     "PREVALIDATION_ROOT_FILES",
+    "PREVALIDATION_ROOT_FILES_V1",
+    "PREVALIDATION_ROOT_FILES_V2",
     "VALIDATION_FILE",
     "expected_prevalidation_paths",
 ]

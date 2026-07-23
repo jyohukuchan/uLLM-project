@@ -189,6 +189,9 @@ class IndependentIdentityValidator(Protocol):
         *,
         expected_commit: str,
         expected_worker_binary_sha256: str,
+        expected_served_model_manifest_sha256: str | None = None,
+        expected_authorization_claim_sha256: str | None = None,
+        expected_authorization_sha256: str | None = None,
     ) -> Any: ...
 
     def validate_campaign_source_checkout(
@@ -465,6 +468,7 @@ def _run_independent_identity_validation(
     expected_commit: str,
     expected_worker_binary_sha256: str,
     repo_root: Path,
+    served_model_binding: identity.ServedModelCampaignBinding | None = None,
 ) -> tuple[Any, Any]:
     try:
         with tempfile.TemporaryDirectory(prefix="ullm-sq8-identity-") as raw_directory:
@@ -476,10 +480,27 @@ def _run_independent_identity_validation(
             _write_temporary_artifact(
                 directory, "model-identity.json", artifacts.model_identity_bytes
             )
+            validation_arguments: dict[str, Any] = {
+                "expected_commit": expected_commit,
+                "expected_worker_binary_sha256": (
+                    expected_worker_binary_sha256
+                ),
+            }
+            if served_model_binding is not None:
+                validation_arguments.update(
+                    expected_served_model_manifest_sha256=(
+                        served_model_binding.candidate_sha256
+                    ),
+                    expected_authorization_claim_sha256=(
+                        served_model_binding.claim_sha256
+                    ),
+                    expected_authorization_sha256=(
+                        served_model_binding.authorization_sha256
+                    ),
+                )
             independent_identity = validator.validate_campaign_identity(
                 directory,
-                expected_commit=expected_commit,
-                expected_worker_binary_sha256=expected_worker_binary_sha256,
+                **validation_arguments,
             )
             source_checkout = validator.validate_campaign_source_checkout(
                 independent_identity, repo_root=repo_root
@@ -522,6 +543,7 @@ def build_production_identity_preflight(
     forbidden_values: tuple[bytes, ...],
     identity_probe: identity.IdentityProbe,
     independent_validator: IndependentIdentityValidator,
+    served_model_binding: identity.ServedModelCampaignBinding | None = None,
 ) -> ProductionIdentityPreflight:
     """Build and independently verify one secret-free production identity cache."""
 
@@ -570,6 +592,7 @@ def build_production_identity_preflight(
                 captured_utc=captured_utc,
                 source_specs=source_specs,
                 forbidden_values=forbidden_values,
+                served_model_binding=served_model_binding,
             ),
             live,
         )
@@ -586,6 +609,7 @@ def build_production_identity_preflight(
             expected_commit=expected_commit,
             expected_worker_binary_sha256=expected_worker_binary_sha256,
             repo_root=settings.repo_root,
+            served_model_binding=served_model_binding,
         )
         _validate_independent_result(
             independent_identity,

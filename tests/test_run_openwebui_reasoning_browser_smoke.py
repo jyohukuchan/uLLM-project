@@ -28,6 +28,39 @@ TOOL = load_tool()
 SESSION_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.signature"
 
 
+def test_v2_dispatch_binds_reasoning_browser_run_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "candidate.json"
+    observed: dict[str, object] = {}
+
+    def construct(**arguments: object) -> object:
+        observed.update(arguments)
+        return type(
+            "Binding",
+            (),
+            {"candidate": type("Candidate", (), {"path": candidate})()},
+        )()
+
+    monkeypatch.setattr(TOOL, "optional_v2_binding", construct)
+    manifest, binding = TOOL._select_manifest_and_binding(
+        active_binding_mode="v2",
+        manifest=None,
+        candidate_served_model_manifest=candidate,
+        active_served_model_manifest=tmp_path / "active.json",
+        expected_served_model_manifest_sha256="a" * 64,
+        campaign_authorization=tmp_path / "authorization.json",
+        run_id="reasoning-browser-run",
+        output=tmp_path / "browser-output.json",
+    )
+
+    assert binding is not None
+    assert manifest == candidate
+    assert observed["campaign_name"] == "reasoning_browser"
+    assert observed["run_id"] == "reasoning-browser-run"
+    assert observed["final_path"] == tmp_path / "browser-output.json"
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

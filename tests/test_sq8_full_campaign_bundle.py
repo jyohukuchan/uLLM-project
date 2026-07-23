@@ -110,6 +110,35 @@ class FullCampaignBundleTests(unittest.TestCase):
                 mode = stat.S_IMODE(path.lstat().st_mode)
                 self.assertEqual(mode, 0o700 if path.is_dir() else 0o600)
 
+    def test_v2_layout_is_explicit_and_v1_default_remains_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            final = parent / "campaign-v2"
+            bundle = BUNDLE.AtomicCampaignDirectory(
+                final,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                layout_version="v2",
+            )
+            try:
+                self.assertEqual(
+                    set(BUNDLE.expected_prevalidation_paths("v2")),
+                    set(BUNDLE.expected_prevalidation_paths())
+                    | {
+                        "candidate-served-model.json",
+                        "active-manifest-observations.jsonl",
+                    },
+                )
+                for relative in BUNDLE.expected_prevalidation_paths("v2"):
+                    bundle.write_bytes(relative, b"evidence\n", scan=permit)
+                bundle.validate_before_independent_validator()
+            finally:
+                bundle.abort()
+            self.assertEqual(
+                BUNDLE.PREVALIDATION_ROOT_FILES,
+                BUNDLE.PREVALIDATION_ROOT_FILES_V1,
+            )
+
     def test_publish_requires_independent_validation_file(self) -> None:
         with BundleFixture() as fixture:
             fixture.populate()

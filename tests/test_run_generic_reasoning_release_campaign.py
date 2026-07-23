@@ -40,6 +40,39 @@ def load_validator() -> ModuleType:
 VALIDATOR = load_validator()
 
 
+def test_v2_dispatch_binds_reasoning_release_run_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "candidate.json"
+    observed: dict[str, object] = {}
+
+    def construct(**arguments: object) -> object:
+        observed.update(arguments)
+        return type(
+            "Binding",
+            (),
+            {"candidate": type("Candidate", (), {"path": candidate})()},
+        )()
+
+    monkeypatch.setattr(TOOL, "optional_v2_binding", construct)
+    manifest, binding = TOOL._select_manifest_and_binding(
+        active_binding_mode="v2",
+        manifest=None,
+        candidate_served_model_manifest=candidate,
+        active_served_model_manifest=tmp_path / "active.json",
+        expected_served_model_manifest_sha256="a" * 64,
+        campaign_authorization=tmp_path / "authorization.json",
+        run_id="reasoning-release-run",
+        output_dir=tmp_path / "release-output",
+    )
+
+    assert binding is not None
+    assert manifest == candidate
+    assert observed["campaign_name"] == "reasoning_release"
+    assert observed["run_id"] == "reasoning-release-run"
+    assert observed["final_path"] == tmp_path / "release-output"
+
+
 def test_modes_and_request_body_are_explicit_and_bounded() -> None:
     fixture = TOOL.Fixture("fixture", "hello", "ok")
 

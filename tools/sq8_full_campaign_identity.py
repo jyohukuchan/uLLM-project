@@ -23,10 +23,12 @@ from typing import Any, NamedTuple, NoReturn, Protocol, Sequence, cast
 
 ENVIRONMENT_SCHEMA = "ullm.sq8.full_campaign.environment.v1"
 MODEL_IDENTITY_SCHEMA = "ullm.sq8.full_campaign.model_identity.v1"
+MODEL_IDENTITY_SCHEMA_V2 = "ullm.sq8.full_campaign.model_identity.v2"
 PROMOTION_SCHEMA = "ullm.sq8_product_promotion.v1"
 ARTIFACT_SCHEMA = "sq-fp8-artifact-v0.2"
 PACKAGE_SCHEMA = "ullm-prototype-manifest-v0.1"
 WORKER_PROTOCOL_SCHEMA = "ullm.worker.v1"
+WORKER_PROTOCOL_SCHEMA_V2 = "ullm.worker.v2"
 
 UPSTREAM_MODEL_ID = "Qwen/Qwen3-14B-FP8"
 SERVED_MODEL_ID = "ullm-qwen3-14b-sq8"
@@ -766,6 +768,17 @@ class IdentityBuildInputs:
     captured_utc: str
     source_specs: tuple[SourceFileSpec, ...]
     forbidden_values: tuple[bytes, ...] = ()
+    served_model_binding: "ServedModelCampaignBinding | None" = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ServedModelCampaignBinding:
+    candidate_path: Path
+    candidate_sha256: str
+    claim_path: Path
+    claim_sha256: str
+    authorization_path: Path
+    authorization_sha256: str
 
 
 class IdentityArtifacts(NamedTuple):
@@ -2220,6 +2233,95 @@ def _environment_document(
     }
 
 
+def _served_model_binding_documents(
+    binding: ServedModelCampaignBinding | None,
+    pins: _PinSet,
+    worker_binary: _PinnedFile,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if binding is None:
+        return None, None
+    if (
+        not isinstance(binding, ServedModelCampaignBinding)
+        or SHA256_RE.fullmatch(binding.candidate_sha256) is None
+        or SHA256_RE.fullmatch(binding.claim_sha256) is None
+        or SHA256_RE.fullmatch(binding.authorization_sha256) is None
+    ):
+        fail("served-model campaign binding differs")
+    candidate = pins.open(
+        binding.candidate_path,
+        maximum=MAX_DOCUMENT_BYTES,
+        forbidden_values=(),
+        retain=True,
+        expected_sha256=binding.candidate_sha256,
+    )
+    claim = pins.open(
+        binding.claim_path,
+        maximum=MAX_DOCUMENT_BYTES,
+        forbidden_values=(),
+        retain=True,
+        expected_sha256=binding.claim_sha256,
+    )
+    assert candidate.raw is not None and claim.raw is not None
+    candidate_value = _json_object(
+        candidate.raw, "candidate served-model manifest"
+    )
+    public = candidate_value.get("public")
+    format_value = candidate_value.get("format")
+    worker = candidate_value.get("worker")
+    promotion = candidate_value.get("promotion")
+    if (
+        candidate_value.get("schema_version") != "ullm.served_model.v2"
+        or type(public) is not dict
+        or type(format_value) is not dict
+        or type(worker) is not dict
+        or type(promotion) is not dict
+        or public.get("id") != SERVED_MODEL_ID
+        or public.get("revision") != MODEL_REVISION
+        or format_value.get("format_id") != "SQ8_0"
+        or worker.get("protocol") != WORKER_PROTOCOL_SCHEMA_V2
+        or worker.get("binary_sha256") != worker_binary.sha256
+        or SHA256_RE.fullmatch(str(promotion.get("receipt_sha256"))) is None
+        or not isinstance(promotion.get("source_commit"), str)
+        or not promotion["source_commit"]
+    ):
+        fail("candidate served-model manifest contract differs")
+    claim_value = _json_object(claim.raw, "campaign authorization claim")
+    if (
+        claim_value.get("schema_version")
+        != "ullm.served_model.v2_cross_model_campaign_claim.v1"
+        or claim_value.get("authorization_path")
+        != os.fspath(binding.authorization_path)
+        or claim_value.get("authorization_sha256")
+        != binding.authorization_sha256
+    ):
+        fail("campaign authorization claim binding differs")
+    return (
+        {
+            "artifact": "candidate-served-model.json",
+            "source_path": os.fspath(Path(os.path.abspath(binding.candidate_path))),
+            "bytes": candidate.bytes,
+            "sha256": candidate.sha256,
+            "schema_version": "ullm.served_model.v2",
+            "model_id": public["id"],
+            "model_revision": public["revision"],
+            "format_id": format_value["format_id"],
+            "worker_protocol": worker["protocol"],
+            "worker_binary_sha256": worker["binary_sha256"],
+            "promotion_source_commit": promotion["source_commit"],
+            "promotion_receipt_sha256": promotion["receipt_sha256"],
+        },
+        {
+            "path": os.fspath(Path(os.path.abspath(binding.claim_path))),
+            "bytes": claim.bytes,
+            "sha256": claim.sha256,
+            "authorization_path": os.fspath(
+                Path(os.path.abspath(binding.authorization_path))
+            ),
+            "authorization_sha256": binding.authorization_sha256,
+        },
+    )
+
+
 def _model_document(
     inputs: IdentityBuildInputs,
     receipt_raw: bytes,
@@ -2233,11 +2335,17 @@ def _model_document(
     worker_binary: _PinnedFile,
     source_entries_by_role: dict[str, dict[str, Any]],
     source_sets: dict[str, str],
+    served_model_manifest: dict[str, Any] | None,
+    campaign_authorization_claim: dict[str, Any] | None,
 ) -> dict[str, Any]:
     artifact = promotion_identity["artifact"]
     package = promotion_identity["package"]
-    return {
-        "schema_version": MODEL_IDENTITY_SCHEMA,
+    document = {
+        "schema_version": (
+            MODEL_IDENTITY_SCHEMA_V2
+            if served_model_manifest is not None
+            else MODEL_IDENTITY_SCHEMA
+        ),
         "record_type": "model_identity",
         "model": {
             "upstream_id": UPSTREAM_MODEL_ID,
@@ -2301,7 +2409,11 @@ def _model_document(
             "binary_bytes": worker_binary.bytes,
             "binary_sha256": worker_binary.sha256,
             "source_sha256": source_sets["worker"],
-            "protocol_schema": WORKER_PROTOCOL_SCHEMA,
+            "protocol_schema": (
+                WORKER_PROTOCOL_SCHEMA_V2
+                if served_model_manifest is not None
+                else WORKER_PROTOCOL_SCHEMA
+            ),
             "device_architecture": DEVICE_ARCHITECTURE,
             "execution_profile": EXECUTION_PROFILE,
             "context_length": CONTEXT_LENGTH,
@@ -2312,6 +2424,14 @@ def _model_document(
             "package_manifest_sha256": package_manifest.sha256,
         },
     }
+    if (served_model_manifest is None) != (
+        campaign_authorization_claim is None
+    ):
+        fail("served-model manifest/authorization identity is incomplete")
+    if served_model_manifest is not None:
+        document["served_model_manifest"] = served_model_manifest
+        document["campaign_authorization_claim"] = campaign_authorization_claim
+    return document
 
 
 def build_identity_artifacts(
@@ -2473,6 +2593,13 @@ def build_identity_artifacts(
         if live.patch_sha256 != source_entries_by_role["openwebui_patch"]["sha256"]:
             fail("live OpenWebUI patch label differs from the tracked patch")
 
+        served_model_manifest, campaign_authorization_claim = (
+            _served_model_binding_documents(
+                inputs.served_model_binding,
+                pins,
+                worker_binary,
+            )
+        )
         environment = _environment_document(
             inputs,
             live,
@@ -2495,6 +2622,8 @@ def build_identity_artifacts(
             worker_binary,
             source_entries_by_role,
             source_sets,
+            served_model_manifest,
+            campaign_authorization_claim,
         )
         validate_environment_document(environment)
         validate_model_identity_document(model_identity)
@@ -2874,7 +3003,7 @@ def validate_environment_document(value: Any) -> dict[str, Any]:
     return document
 
 
-def validate_model_identity_document(value: Any) -> dict[str, Any]:
+def _validate_model_identity_document_v1(value: Any) -> dict[str, Any]:
     document = _exact(
         value,
         {
@@ -3166,6 +3295,119 @@ def validate_model_identity_document(value: Any) -> dict[str, Any]:
     return document
 
 
+def validate_model_identity_document(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        fail("model identity document root differs")
+    schema = value.get("schema_version")
+    if schema == MODEL_IDENTITY_SCHEMA:
+        return _validate_model_identity_document_v1(value)
+    if schema != MODEL_IDENTITY_SCHEMA_V2:
+        fail("model identity schema differs")
+    document = _exact(
+        value,
+        {
+            "schema_version",
+            "record_type",
+            "model",
+            "promotion_validation",
+            "product",
+            "tokenizer",
+            "oracle",
+            "worker",
+            "served_model_manifest",
+            "campaign_authorization_claim",
+        },
+        "model identity v2 document",
+    )
+    legacy = copy.deepcopy(document)
+    manifest = legacy.pop("served_model_manifest")
+    claim = legacy.pop("campaign_authorization_claim")
+    legacy["schema_version"] = MODEL_IDENTITY_SCHEMA
+    if type(legacy.get("worker")) is not dict:
+        fail("model identity v2 worker differs")
+    legacy["worker"]["protocol_schema"] = WORKER_PROTOCOL_SCHEMA
+    _validate_model_identity_document_v1(legacy)
+    served = _exact(
+        manifest,
+        {
+            "artifact",
+            "source_path",
+            "bytes",
+            "sha256",
+            "schema_version",
+            "model_id",
+            "model_revision",
+            "format_id",
+            "worker_protocol",
+            "worker_binary_sha256",
+            "promotion_source_commit",
+            "promotion_receipt_sha256",
+        },
+        "served-model manifest identity",
+    )
+    source_path = _safe_text(
+        served["source_path"], "served-model manifest source path"
+    )
+    if (
+        served["artifact"] != "candidate-served-model.json"
+        or not Path(source_path).is_absolute()
+        or served["schema_version"] != "ullm.served_model.v2"
+        or served["model_id"] != SERVED_MODEL_ID
+        or served["model_revision"] != MODEL_REVISION
+        or served["format_id"] != "SQ8_0"
+        or served["worker_protocol"] != WORKER_PROTOCOL_SCHEMA_V2
+        or document["worker"]["protocol_schema"] != WORKER_PROTOCOL_SCHEMA_V2
+        or served["worker_binary_sha256"]
+        != document["worker"]["binary_sha256"]
+    ):
+        fail("served-model manifest v2 contract differs")
+    _integer(served["bytes"], "served-model manifest bytes", minimum=1)
+    _sha(served["sha256"], "served-model manifest SHA-256")
+    _sha(
+        served["worker_binary_sha256"],
+        "served-model manifest worker SHA-256",
+    )
+    _safe_text(
+        served["promotion_source_commit"],
+        "served-model manifest promotion source commit",
+    )
+    _sha(
+        served["promotion_receipt_sha256"],
+        "served-model manifest promotion receipt SHA-256",
+    )
+    authorization = _exact(
+        claim,
+        {
+            "path",
+            "bytes",
+            "sha256",
+            "authorization_path",
+            "authorization_sha256",
+        },
+        "campaign authorization claim identity",
+    )
+    for field in ("path", "authorization_path"):
+        path = _safe_text(
+            authorization[field], f"campaign authorization claim {field}"
+        )
+        if not Path(path).is_absolute():
+            fail("campaign authorization claim path is not absolute")
+    _integer(
+        authorization["bytes"],
+        "campaign authorization claim bytes",
+        minimum=1,
+    )
+    _sha(
+        authorization["sha256"],
+        "campaign authorization claim SHA-256",
+    )
+    _sha(
+        authorization["authorization_sha256"],
+        "campaign authorization SHA-256",
+    )
+    return document
+
+
 def serialize_environment_document(value: Any) -> bytes:
     return _canonical(validate_environment_document(value))
 
@@ -3269,6 +3511,7 @@ def write_identity_artifacts(
 __all__ = [
     "ENVIRONMENT_SCHEMA",
     "MODEL_IDENTITY_SCHEMA",
+    "MODEL_IDENTITY_SCHEMA_V2",
     "HardwareExpectation",
     "IdentityArtifacts",
     "IdentityBuildInputs",
@@ -3279,6 +3522,7 @@ __all__ = [
     "OpenWebUIExpectation",
     "ProcessSnapshot",
     "RuntimeConfiguration",
+    "ServedModelCampaignBinding",
     "SourceFileSpec",
     "SystemIdentityProbe",
     "build_identity_artifacts",

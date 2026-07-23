@@ -25,6 +25,7 @@ import tempfile
 import time
 import uuid
 import socket
+import shutil
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Sequence
@@ -32,6 +33,17 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from served_model_active_binding import (  # noqa: E402
+    ActiveBindingArtifacts,
+    ActiveManifestBinding,
+    optional_v2_binding,
+)
+
+
 DEFAULT_SCRIPT = ROOT / "deploy/openwebui/browser-reasoning-smoke.cjs"
 VALIDATOR_PATH = ROOT / "tools/validate-openwebui-reasoning-browser-smoke.py"
 SERVED_MODEL_VALIDATOR_PATH = ROOT / "tools/validate-served-model.py"
@@ -54,6 +66,13 @@ SWITCH_EVIDENCE_FIELDS = {
     "provider_return_model_id_sha256",
     "provider_return_answer",
 }
+ACTIVE_BINDING_STAGES = (
+    "preflight",
+    "browser-launch",
+    "browser-complete",
+    "validation",
+    "publication",
+)
 
 
 class SmokeError(RuntimeError):
@@ -352,6 +371,108 @@ def _atomic_publish(output: Path, raw: bytes) -> None:
         incomplete.unlink(missing_ok=True)
 
 
+def _publish_active_binding_directory(
+    output: Path,
+    artifacts: ActiveBindingArtifacts,
+) -> Path:
+    final = output.with_name(f"{output.name}.active-binding")
+    if final.exists() or final.is_symlink():
+        raise SmokeError("browser active-binding output already exists")
+    try:
+        parent = output.parent.resolve(strict=True)
+    except OSError as error:
+        raise SmokeError("browser active-binding parent is unavailable") from error
+    stage = parent / f".{final.name}.incomplete-{uuid.uuid4().hex}"
+    stage.mkdir(mode=0o700)
+    published = False
+    try:
+        for name, raw in artifacts.by_name().items():
+            descriptor = os.open(
+                stage / name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                view = memoryview(raw)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise SmokeError(
+                            "browser active-binding artifact write failed"
+                        )
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        stage_descriptor = os.open(
+            stage, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(stage_descriptor)
+        finally:
+            os.close(stage_descriptor)
+        os.rename(stage, final)
+        published = True
+        parent_descriptor = os.open(
+            parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+        return final
+    except (OSError, SmokeError) as error:
+        if isinstance(error, SmokeError):
+            raise
+        raise SmokeError("browser active-binding output could not be published") from error
+    finally:
+        if not published:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _select_manifest_and_binding(
+    *,
+    active_binding_mode: str,
+    manifest: Path | None,
+    candidate_served_model_manifest: Path | None,
+    active_served_model_manifest: Path | None,
+    expected_served_model_manifest_sha256: str | None,
+    campaign_authorization: Path | None,
+    run_id: str | None,
+    output: Path,
+) -> tuple[Path, ActiveManifestBinding | None]:
+    if active_binding_mode == "legacy":
+        if manifest is None:
+            raise SmokeError("legacy browser smoke requires --manifest")
+        binding = optional_v2_binding(
+            mode="legacy",
+            candidate_path=candidate_served_model_manifest,
+            active_path=active_served_model_manifest,
+            expected_sha256=expected_served_model_manifest_sha256,
+            expected_stages=ACTIVE_BINDING_STAGES,
+            authorization_path=campaign_authorization,
+            campaign_name=None,
+            run_id=None,
+            final_path=None,
+        )
+        return manifest, binding
+    if manifest is not None:
+        raise SmokeError("v2 active binding forbids the legacy --manifest input")
+    binding = optional_v2_binding(
+        mode=active_binding_mode,
+        candidate_path=candidate_served_model_manifest,
+        active_path=active_served_model_manifest,
+        expected_sha256=expected_served_model_manifest_sha256,
+        expected_stages=ACTIVE_BINDING_STAGES,
+        authorization_path=campaign_authorization,
+        campaign_name="reasoning_browser",
+        run_id=run_id,
+        final_path=output,
+    )
+    assert binding is not None
+    return binding.candidate.path, binding
+
+
 def _stop_container(docker: str, name: str) -> None:
     try:
         subprocess.run(
@@ -610,7 +731,7 @@ def _wait_for_browser_with_transitions(
 def execute(
     *,
     output: Path,
-    manifest: Path,
+    manifest: Path | None,
     openwebui_session_token_file: Path,
     browser_image: str,
     openwebui_url: str,
@@ -627,10 +748,30 @@ def execute(
     systemctl: str = "systemctl",
     rocm_smi: str = "rocm-smi",
     browser_user: str | None = None,
+    active_binding_mode: str = "legacy",
+    candidate_served_model_manifest: Path | None = None,
+    active_served_model_manifest: Path | None = None,
+    expected_served_model_manifest_sha256: str | None = None,
+    campaign_authorization: Path | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     if output.exists() or output.is_symlink():
         raise SmokeError("browser evidence output already exists or is a symlink")
-    manifest_summary = _validate_manifest_identity(manifest, model_id)
+    selected_manifest, active_binding = _select_manifest_and_binding(
+        active_binding_mode=active_binding_mode,
+        manifest=manifest,
+        candidate_served_model_manifest=candidate_served_model_manifest,
+        active_served_model_manifest=active_served_model_manifest,
+        expected_served_model_manifest_sha256=(
+            expected_served_model_manifest_sha256
+        ),
+        campaign_authorization=campaign_authorization,
+        run_id=run_id,
+        output=output,
+    )
+    if active_binding is not None:
+        active_binding.observe("preflight")
+    manifest_summary = _validate_manifest_identity(selected_manifest, model_id)
     token = _read_regular(
         openwebui_session_token_file,
         "OpenWebUI session token file",
@@ -735,6 +876,8 @@ def execute(
     )
     deadline = time.monotonic() + timeout_seconds
     try:
+        if active_binding is not None:
+            active_binding.observe("browser-launch")
         with tempfile.TemporaryFile() as stdout:
             process = subprocess.Popen(
                 command,
@@ -785,6 +928,8 @@ def execute(
             control_directory.cleanup()
     if not raw or len(raw) > MAX_EVIDENCE_BYTES:
         raise SmokeError("browser smoke output exceeds its size bound")
+    if active_binding is not None:
+        active_binding.observe("browser-complete")
     document = _strict_json(raw.strip())
     _bind_model_identity(
         document,
@@ -793,6 +938,8 @@ def execute(
     )
     temporary = output.parent / f".{output.name}.validate-{uuid.uuid4().hex}"
     try:
+        if active_binding is not None:
+            active_binding.observe("validation")
         _atomic_publish(temporary, raw.strip() + b"\n")
         report = _load_validator().validate(temporary)
         if report.get("gate_eligible") is not True:
@@ -801,20 +948,49 @@ def execute(
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
-    _atomic_publish(output, raw.strip() + b"\n")
+    binding_output: Path | None = None
+    if active_binding is not None:
+        active_binding.observe("publication")
+        binding_output = _publish_active_binding_directory(
+            output, active_binding.artifacts()
+        )
+    try:
+        _atomic_publish(output, raw.strip() + b"\n")
+    except BaseException:
+        if binding_output is not None:
+            shutil.rmtree(binding_output, ignore_errors=True)
+        raise
     return {
         "schema_version": document["schema_version"],
         "output": os.fspath(output.resolve()),
         "model_id_sha256": document["model_id_sha256"],
         "provider_request_count": document["provider_request_count"],
         "manifest_sha256": manifest_summary["manifest_sha256"],
+        **(
+            {}
+            if binding_output is None
+            else {
+                "active_binding_output": os.fspath(binding_output.resolve()),
+                "run_id": run_id,
+            }
+        ),
     }
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--active-binding-mode",
+        choices=("legacy", "v2"),
+        default="legacy",
+    )
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--candidate-served-model-manifest", type=Path)
+    parser.add_argument("--active-served-model-manifest", type=Path)
+    parser.add_argument("--expected-served-model-manifest-sha256")
+    parser.add_argument("--campaign-authorization", type=Path)
+    parser.add_argument("--run-id")
     parser.add_argument(
         "--openwebui-session-token-file",
         type=Path,
@@ -861,6 +1037,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             systemctl=args.systemctl,
             rocm_smi=args.rocm_smi,
             browser_user=args.browser_user,
+            active_binding_mode=args.active_binding_mode,
+            candidate_served_model_manifest=args.candidate_served_model_manifest,
+            active_served_model_manifest=args.active_served_model_manifest,
+            expected_served_model_manifest_sha256=(
+                args.expected_served_model_manifest_sha256
+            ),
+            campaign_authorization=args.campaign_authorization,
+            run_id=args.run_id,
         )
     except Exception as error:
         print(f"OpenWebUI reasoning browser smoke failed: {error}", file=sys.stderr)

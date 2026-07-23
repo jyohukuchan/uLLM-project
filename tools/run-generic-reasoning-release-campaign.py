@@ -31,6 +31,17 @@ from typing import Any, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from served_model_active_binding import (  # noqa: E402
+    ActiveBindingArtifacts,
+    ActiveManifestBinding,
+    optional_v2_binding,
+)
+
+
 SERVED_MODEL_VALIDATOR_PATH = ROOT / "tools/validate-served-model.py"
 DEFAULT_FIXTURES = ROOT / "tests/fixtures/generic-reasoning-release-v0.1/prompts.json"
 DEFAULT_OBSERVER = Path("/run/ullm/lifecycle-observer.sock")
@@ -46,7 +57,17 @@ IMAGE_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._/:+-]*@)?sha256:[0-9a-f]{64}\Z
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 LIFECYCLE_SCHEMA = "ullm.gateway.lifecycle.v1"
 CAMPAIGN_SCHEMA = "ullm.generic_reasoning_release_campaign.v1"
+CAMPAIGN_SCHEMA_V2 = "ullm.generic_reasoning_release_campaign.v2"
 MODES = ("disabled", "budget-32", "budget-128", "budget-256", "unbounded")
+ACTIVE_BINDING_STAGES = (
+    "preflight",
+    *(
+        stage
+        for mode in MODES
+        for stage in (f"{mode}:stream", f"{mode}:nonstream")
+    ),
+    "final",
+)
 MODE_BUDGETS: dict[str, int | None] = {
     "disabled": 0,
     "budget-32": 32,
@@ -842,11 +863,80 @@ def _write_json(path: Path, value: Any) -> None:
         os.fsync(destination.fileno())
 
 
+def _write_bytes(path: Path, raw: bytes) -> None:
+    if not raw:
+        raise CampaignError("active-manifest binding artifact is empty")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise CampaignError("active-manifest binding artifact write failed")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _select_manifest_and_binding(
+    *,
+    active_binding_mode: str,
+    manifest: Path | None,
+    candidate_served_model_manifest: Path | None,
+    active_served_model_manifest: Path | None,
+    expected_served_model_manifest_sha256: str | None,
+    campaign_authorization: Path | None,
+    run_id: str | None,
+    output_dir: Path,
+) -> tuple[Path, ActiveManifestBinding | None]:
+    if active_binding_mode == "legacy":
+        if manifest is None:
+            raise CampaignError("legacy campaign requires --manifest")
+        binding = optional_v2_binding(
+            mode="legacy",
+            candidate_path=candidate_served_model_manifest,
+            active_path=active_served_model_manifest,
+            expected_sha256=expected_served_model_manifest_sha256,
+            expected_stages=ACTIVE_BINDING_STAGES,
+            authorization_path=campaign_authorization,
+            campaign_name=None,
+            run_id=None,
+            final_path=None,
+        )
+        return manifest, binding
+    if manifest is not None:
+        raise CampaignError("v2 active binding forbids the legacy --manifest input")
+    binding = optional_v2_binding(
+        mode=active_binding_mode,
+        candidate_path=candidate_served_model_manifest,
+        active_path=active_served_model_manifest,
+        expected_sha256=expected_served_model_manifest_sha256,
+        expected_stages=ACTIVE_BINDING_STAGES,
+        authorization_path=campaign_authorization,
+        campaign_name="reasoning_release",
+        run_id=run_id,
+        final_path=output_dir,
+    )
+    assert binding is not None
+    return binding.candidate.path, binding
+
+
 def execute(
-    *, output_dir: Path, manifest: Path, fixture_suite: Path, token_file: Path, http_image: str,
+    *, output_dir: Path, manifest: Path | None, fixture_suite: Path, token_file: Path, http_image: str,
     endpoint: str = DEFAULT_ENDPOINT, network: str = "open-webui-network", service: str = "ullm-openai.service",
     observer_socket: Path = DEFAULT_OBSERVER, docker: str = "docker", rocm_smi: str = "rocm-smi",
     systemctl: str = "systemctl", timeout_seconds: float = 900.0,
+    active_binding_mode: str = "legacy",
+    candidate_served_model_manifest: Path | None = None,
+    active_served_model_manifest: Path | None = None,
+    expected_served_model_manifest_sha256: str | None = None,
+    campaign_authorization: Path | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     if output_dir.exists() or output_dir.is_symlink():
         raise CampaignError("campaign output directory already exists")
@@ -854,7 +944,21 @@ def execute(
         raise CampaignError("HTTP image must be an immutable Docker SHA-256 identity")
     token = _read_regular(token_file, "OpenWebUI API key file", 65_536)
     del token
-    manifest_summary = _validate_manifest(manifest)
+    selected_manifest, active_binding = _select_manifest_and_binding(
+        active_binding_mode=active_binding_mode,
+        manifest=manifest,
+        candidate_served_model_manifest=candidate_served_model_manifest,
+        active_served_model_manifest=active_served_model_manifest,
+        expected_served_model_manifest_sha256=(
+            expected_served_model_manifest_sha256
+        ),
+        campaign_authorization=campaign_authorization,
+        run_id=run_id,
+        output_dir=output_dir,
+    )
+    if active_binding is not None:
+        active_binding.observe("preflight")
+    manifest_summary = _validate_manifest(selected_manifest)
     fixtures = _load_fixtures(fixture_suite)
     missing = [mode for mode in MODES if f"generic-reasoning-{mode}" not in fixtures]
     if missing:
@@ -888,6 +992,8 @@ def execute(
         observer.open()
         for mode in MODES:
             fixture = fixtures[f"generic-reasoning-{mode}"]
+            if active_binding is not None:
+                active_binding.observe(f"{mode}:stream")
             before = _resource_sample(service, rocm_smi, systemctl)
             stream_result = _stream_request(
                 _request_body(manifest_summary["model_id"], mode, fixture),
@@ -902,6 +1008,8 @@ def execute(
             cases.append(case)
             lifecycle.append(event)
             samples.append(sample)
+            if active_binding is not None:
+                active_binding.observe(f"{mode}:nonstream")
             before = _resource_sample(service, rocm_smi, systemctl)
             nonstream_result = _nonstream_request(
                 _request_body(manifest_summary["model_id"], mode, fixture, stream=False),
@@ -917,6 +1025,8 @@ def execute(
             cases.append(case)
             lifecycle.append(event)
             samples.append(sample)
+        if active_binding is not None:
+            active_binding.observe("final")
         _write_json(stage / "cases.json", cases)
         _write_json(stage / "lifecycle.json", {"schema_version": "ullm.generic_reasoning_lifecycle_evidence.v1", "events": lifecycle})
         with (stage / "resource-samples.jsonl").open("w", encoding="ascii") as output:
@@ -924,8 +1034,15 @@ def execute(
                 output.write(json.dumps(sample, ensure_ascii=True, sort_keys=True) + "\n")
             output.flush()
             os.fsync(output.fileno())
-        _write_json(stage / "summary.json", {
-            "schema_version": CAMPAIGN_SCHEMA,
+        active_artifacts: ActiveBindingArtifacts | None = (
+            active_binding.artifacts() if active_binding is not None else None
+        )
+        summary = {
+            "schema_version": (
+                CAMPAIGN_SCHEMA_V2
+                if active_artifacts is not None
+                else CAMPAIGN_SCHEMA
+            ),
             "status": "incomplete",
             "raw_bodies_stored": False,
             "case_count": len(cases),
@@ -936,7 +1053,15 @@ def execute(
             "model_id": manifest_summary["model_id"],
             "worker_binary_sha256": manifest_summary["worker"]["binary_sha256"],
             "gpu_exclusive_preflight": gpu_preflight,
-        })
+        }
+        if active_artifacts is not None:
+            for name, raw in active_artifacts.by_name().items():
+                _write_bytes(stage / name, raw)
+            summary["active_manifest_binding"] = json.loads(
+                active_artifacts.binding_json
+            )
+            summary["run_id"] = run_id
+        _write_json(stage / "summary.json", summary)
         stage.chmod(0o700)
         os.replace(stage, output_dir)
     except BaseException:
@@ -946,13 +1071,31 @@ def execute(
         raise
     finally:
         observer.close()
-    return {"schema_version": CAMPAIGN_SCHEMA, "output_dir": os.fspath(output_dir.resolve()), "case_count": len(cases), "modes": list(MODES)}
+    return {
+        "schema_version": (
+            CAMPAIGN_SCHEMA_V2 if active_binding is not None else CAMPAIGN_SCHEMA
+        ),
+        "output_dir": os.fspath(output_dir.resolve()),
+        "case_count": len(cases),
+        "modes": list(MODES),
+        **({"run_id": run_id} if active_binding is not None else {}),
+    }
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--active-binding-mode",
+        choices=("legacy", "v2"),
+        default="legacy",
+    )
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--candidate-served-model-manifest", type=Path)
+    parser.add_argument("--active-served-model-manifest", type=Path)
+    parser.add_argument("--expected-served-model-manifest-sha256")
+    parser.add_argument("--campaign-authorization", type=Path)
+    parser.add_argument("--run-id")
     parser.add_argument("--fixture-suite", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--http-image", required=True)
@@ -976,6 +1119,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             network=args.network, service=args.service, observer_socket=args.observer_socket,
             docker=args.docker, rocm_smi=args.rocm_smi, systemctl=args.systemctl,
             timeout_seconds=args.timeout_seconds,
+            active_binding_mode=args.active_binding_mode,
+            candidate_served_model_manifest=args.candidate_served_model_manifest,
+            active_served_model_manifest=args.active_served_model_manifest,
+            expected_served_model_manifest_sha256=(
+                args.expected_served_model_manifest_sha256
+            ),
+            campaign_authorization=args.campaign_authorization,
+            run_id=args.run_id,
         )
     except Exception as error:
         print(f"Generic reasoning release campaign failed: {error}", file=sys.stderr)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import os
@@ -53,12 +54,15 @@ LIFECYCLE_SCHEMA = "ullm.gateway.lifecycle.v1"
 MATRIX_SCHEMA = "ullm.sq8.openwebui_release.matrix.v1"
 PHASE1_REPORT_SCHEMA = "ullm.sq8.openwebui_release.validation.phase1.v1"
 FULL_REPORT_SCHEMA = "ullm.sq8.openwebui_release.validation.v1"
+FULL_REPORT_SCHEMA_V2 = "ullm.sq8.openwebui_release.validation.v2"
 ENVIRONMENT_SCHEMA = "ullm.sq8.full_campaign.environment.v1"
 MODEL_IDENTITY_SCHEMA = "ullm.sq8.full_campaign.model_identity.v1"
+MODEL_IDENTITY_SCHEMA_V2 = "ullm.sq8.full_campaign.model_identity.v2"
 PROMOTION_SCHEMA = "ullm.sq8_product_promotion.v1"
 ARTIFACT_SCHEMA = "sq-fp8-artifact-v0.2"
 PACKAGE_SCHEMA = "ullm-prototype-manifest-v0.1"
 WORKER_PROTOCOL_SCHEMA = "ullm.worker.v1"
+WORKER_PROTOCOL_SCHEMA_V2 = "ullm.worker.v2"
 API_CONTRACT_MODEL_ID = "ullm-qwen3-14b-sq8"
 API_CONTRACT_MAX_RESPONSE_BYTES = 1024 * 1024
 API_CONTRACT_INVALID_KEY_MESSAGE = "The supplied API key is invalid."
@@ -615,11 +619,17 @@ MATRIX_EXCLUDED = {
     "summary.md",
     "SHA256SUMS",
 }
-BUNDLE_FILES = set(EXPECTED_ROLES) | {
+BUNDLE_FILES_V1 = set(EXPECTED_ROLES) | {
     "release-matrix.json",
     "summary.md",
     "SHA256SUMS",
 }
+BUNDLE_FILES_V2 = BUNDLE_FILES_V1 | {
+    "candidate-served-model.json",
+    "active-manifest-observations.jsonl",
+}
+# Historical public constant remains the exact v1 contract.
+BUNDLE_FILES = BUNDLE_FILES_V1
 
 COMMON_SESSION_FIELDS = {
     "schema_version",
@@ -1879,7 +1889,7 @@ def _validate_environment_identity(
     return by_role, source_sets, configuration, service, openwebui
 
 
-def _validate_model_identity(
+def _validate_model_identity_v1(
     document: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     exact_fields(
@@ -2110,6 +2120,123 @@ def _validate_model_identity(
     return product, tokenizer, oracle, worker
 
 
+def _validate_model_identity(
+    document: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    schema = document.get("schema_version")
+    if schema == MODEL_IDENTITY_SCHEMA:
+        return _validate_model_identity_v1(document)
+    if schema != MODEL_IDENTITY_SCHEMA_V2:
+        fail("model-identity.json schema differs")
+    exact_fields(
+        document,
+        {
+            "schema_version",
+            "record_type",
+            "model",
+            "promotion_validation",
+            "product",
+            "tokenizer",
+            "oracle",
+            "worker",
+            "served_model_manifest",
+            "campaign_authorization_claim",
+        },
+        "model-identity.json v2",
+    )
+    legacy = copy.deepcopy(document)
+    served = legacy.pop("served_model_manifest")
+    claim = legacy.pop("campaign_authorization_claim")
+    legacy["schema_version"] = MODEL_IDENTITY_SCHEMA
+    if type(legacy.get("worker")) is not dict:
+        fail("model-identity.json v2 worker differs")
+    legacy["worker"]["protocol_schema"] = WORKER_PROTOCOL_SCHEMA
+    product, tokenizer, oracle, worker = _validate_model_identity_v1(legacy)
+    served = exact_fields(
+        served,
+        {
+            "artifact",
+            "source_path",
+            "bytes",
+            "sha256",
+            "schema_version",
+            "model_id",
+            "model_revision",
+            "format_id",
+            "worker_protocol",
+            "worker_binary_sha256",
+            "promotion_source_commit",
+            "promotion_receipt_sha256",
+        },
+        "model-identity.json served-model manifest",
+    )
+    if (
+        served["artifact"] != "candidate-served-model.json"
+        or not Path(
+            string(
+                served["source_path"],
+                "model-identity.json served-model source path",
+            )
+        ).is_absolute()
+        or served["schema_version"] != "ullm.served_model.v2"
+        or served["model_id"] != SERVED_MODEL_ID
+        or served["model_revision"] != MODEL_REVISION
+        or served["format_id"] != "SQ8_0"
+        or served["worker_protocol"] != WORKER_PROTOCOL_SCHEMA_V2
+        or document["worker"].get("protocol_schema")
+        != WORKER_PROTOCOL_SCHEMA_V2
+        or served["worker_binary_sha256"] != worker["binary_sha256"]
+    ):
+        fail("model-identity.json served-model v2 contract differs")
+    integer(
+        served["bytes"],
+        "model-identity.json served-model bytes",
+        minimum=1,
+    )
+    for field in (
+        "sha256",
+        "worker_binary_sha256",
+        "promotion_receipt_sha256",
+    ):
+        sha256_value(
+            served[field], f"model-identity.json served-model {field}"
+        )
+    string(
+        served["promotion_source_commit"],
+        "model-identity.json served-model promotion source commit",
+    )
+    claim = exact_fields(
+        claim,
+        {
+            "path",
+            "bytes",
+            "sha256",
+            "authorization_path",
+            "authorization_sha256",
+        },
+        "model-identity.json authorization claim",
+    )
+    for field in ("path", "authorization_path"):
+        if not Path(
+            string(claim[field], f"model-identity.json claim {field}")
+        ).is_absolute():
+            fail("model-identity.json authorization claim path is not absolute")
+    integer(
+        claim["bytes"],
+        "model-identity.json authorization claim bytes",
+        minimum=1,
+    )
+    sha256_value(
+        claim["sha256"],
+        "model-identity.json authorization claim SHA-256",
+    )
+    sha256_value(
+        claim["authorization_sha256"],
+        "model-identity.json authorization SHA-256",
+    )
+    return product, tokenizer, oracle, document["worker"]
+
+
 @dataclass(frozen=True)
 class IdentityData:
     environment: dict[str, Any]
@@ -2254,6 +2381,9 @@ def validate_campaign_identity(
     *,
     expected_commit: str,
     expected_worker_binary_sha256: str,
+    expected_served_model_manifest_sha256: str | None = None,
+    expected_authorization_claim_sha256: str | None = None,
+    expected_authorization_sha256: str | None = None,
 ) -> IdentityData:
     trusted_commit = git_commit(expected_commit, "expected campaign Git commit")
     trusted_worker_sha = sha256_value(
@@ -2270,6 +2400,42 @@ def validate_campaign_identity(
         _validate_environment_identity(environment, trusted_commit)
     )
     product, tokenizer, oracle, model_worker = _validate_model_identity(model_identity)
+    if model_identity["schema_version"] == MODEL_IDENTITY_SCHEMA_V2:
+        if (
+            expected_served_model_manifest_sha256 is None
+            or expected_authorization_claim_sha256 is None
+            or expected_authorization_sha256 is None
+        ):
+            fail("v2 campaign identity lacks trusted manifest/claim anchors")
+        served = model_identity["served_model_manifest"]
+        claim = model_identity["campaign_authorization_claim"]
+        if (
+            served["sha256"]
+            != sha256_value(
+                expected_served_model_manifest_sha256,
+                "expected served-model manifest SHA-256",
+            )
+            or claim["sha256"]
+            != sha256_value(
+                expected_authorization_claim_sha256,
+                "expected authorization claim SHA-256",
+            )
+            or claim["authorization_sha256"]
+            != sha256_value(
+                expected_authorization_sha256,
+                "expected authorization SHA-256",
+            )
+        ):
+            fail("v2 campaign identity trusted anchors differ")
+    elif any(
+        value is not None
+        for value in (
+            expected_served_model_manifest_sha256,
+            expected_authorization_claim_sha256,
+            expected_authorization_sha256,
+        )
+    ):
+        fail("v2 trusted anchors cannot validate a v1 campaign identity")
 
     service_worker = service["worker"]
     if (
@@ -2313,6 +2479,197 @@ def validate_campaign_identity(
         openwebui=openwebui,
         model_worker=model_worker,
     )
+
+
+ACTIVE_BINDING_PHASE_ORDER = (
+    "preflight",
+    "api_contract",
+    "openwebui",
+    "cancellation",
+    "resource_normal",
+    "post_header_failure",
+    "resource_restart",
+    "latency",
+    "final",
+)
+
+
+def validate_v2_active_manifest_evidence(
+    root: Path,
+    identity: IdentityData,
+) -> dict[str, Any]:
+    """Independently bind the copied candidate and ordered stage observations."""
+
+    if identity.model_identity.get("schema_version") != MODEL_IDENTITY_SCHEMA_V2:
+        fail("v2 active-manifest evidence requires model identity v2")
+    served = identity.model_identity["served_model_manifest"]
+    claim = identity.model_identity["campaign_authorization_claim"]
+    candidate_path = safe_relative_file(
+        root,
+        "candidate-served-model.json",
+        "candidate-served-model.json",
+    )
+    try:
+        candidate_raw = candidate_path.read_bytes()
+    except OSError as error:
+        fail(f"failed to read candidate-served-model.json: {error}")
+    if (
+        len(candidate_raw) != served["bytes"]
+        or hashlib.sha256(candidate_raw).hexdigest() != served["sha256"]
+    ):
+        fail("candidate-served-model.json bytes differ from model identity")
+    candidate = decode_json_bytes(
+        candidate_raw,
+        "candidate-served-model.json",
+        allow_outer_whitespace=True,
+    )
+    public = candidate.get("public")
+    format_value = candidate.get("format")
+    worker = candidate.get("worker")
+    promotion = candidate.get("promotion")
+    if (
+        candidate.get("schema_version") != served["schema_version"]
+        or type(public) is not dict
+        or type(format_value) is not dict
+        or type(worker) is not dict
+        or type(promotion) is not dict
+        or public.get("id") != served["model_id"]
+        or public.get("revision") != served["model_revision"]
+        or format_value.get("format_id") != served["format_id"]
+        or worker.get("protocol") != served["worker_protocol"]
+        or worker.get("binary_sha256") != served["worker_binary_sha256"]
+        or promotion.get("source_commit")
+        != served["promotion_source_commit"]
+        or promotion.get("receipt_sha256")
+        != served["promotion_receipt_sha256"]
+    ):
+        fail("candidate-served-model.json identity differs")
+
+    rows = list(
+        iter_jsonl(
+            safe_relative_file(
+                root,
+                "active-manifest-observations.jsonl",
+                "active-manifest-observations.jsonl",
+            ),
+            "active-manifest-observations.jsonl",
+        )
+    )
+    if len(rows) != len(ACTIVE_BINDING_PHASE_ORDER):
+        fail("active-manifest observation count differs")
+    expected_claim = {
+        "path": claim["path"],
+        "sha256": claim["sha256"],
+        "bytes": claim["bytes"],
+        "authorization_path": claim["authorization_path"],
+        "authorization_sha256": claim["authorization_sha256"],
+    }
+    candidate_identity: dict[str, Any] | None = None
+    active_path: str | None = None
+    prior_wall = -1
+    prior_monotonic = -1
+    for sequence, ((line_number, row), phase) in enumerate(
+        zip(rows, ACTIVE_BINDING_PHASE_ORDER, strict=True)
+    ):
+        exact_fields(
+            row,
+            {
+                "schema_version",
+                "sequence",
+                "stage",
+                "observed_unix_ns",
+                "observed_monotonic_ns",
+                "candidate",
+                "active",
+                "bytes_equal",
+                "claim",
+            },
+            f"active-manifest observation line {line_number}",
+        )
+        candidate_row = exact_fields(
+            row["candidate"],
+            {"path", "sha256", "identity"},
+            f"active-manifest candidate line {line_number}",
+        )
+        active_row = exact_fields(
+            row["active"],
+            {"path", "sha256", "identity"},
+            f"active-manifest active line {line_number}",
+        )
+        for label, file_row in (
+            ("candidate", candidate_row),
+            ("active", active_row),
+        ):
+            file_path = string(
+                file_row["path"],
+                f"active-manifest {label} path line {line_number}",
+            )
+            if not Path(file_path).is_absolute():
+                fail("active-manifest observation path is not absolute")
+            if file_row["sha256"] != served["sha256"]:
+                fail("active-manifest observation SHA-256 differs")
+            file_identity = exact_fields(
+                file_row["identity"],
+                {
+                    "device",
+                    "inode",
+                    "mode",
+                    "links",
+                    "uid",
+                    "gid",
+                    "bytes",
+                    "mtime_ns",
+                    "ctime_ns",
+                },
+                f"active-manifest {label} identity line {line_number}",
+            )
+            for field in file_identity:
+                integer(
+                    file_identity[field],
+                    f"active-manifest {label}.{field} line {line_number}",
+                )
+            if file_identity["bytes"] != served["bytes"]:
+                fail("active-manifest observation byte count differs")
+        wall = integer(
+            row["observed_unix_ns"],
+            f"active-manifest observed_unix_ns line {line_number}",
+        )
+        monotonic = integer(
+            row["observed_monotonic_ns"],
+            f"active-manifest observed_monotonic_ns line {line_number}",
+        )
+        if (
+            row["schema_version"]
+            != "ullm.served_model.active_manifest_observation.v1"
+            or row["sequence"] != sequence
+            or row["stage"] != phase
+            or row["bytes_equal"] is not True
+            or not json_equal(row["claim"], expected_claim)
+            or wall < prior_wall
+            or monotonic < prior_monotonic
+        ):
+            fail("active-manifest observation order/binding differs")
+        if candidate_row["path"] != served["source_path"]:
+            fail("active-manifest candidate source path differs")
+        if candidate_identity is None:
+            candidate_identity = candidate_row["identity"]
+        elif not json_equal(candidate_row["identity"], candidate_identity):
+            fail("candidate manifest file identity changed across observations")
+        if active_path is None:
+            active_path = active_row["path"]
+        elif active_row["path"] != active_path:
+            fail("actual active manifest path changed across observations")
+        if active_path == served["source_path"]:
+            fail("candidate and actual active paths are identical")
+        prior_wall = wall
+        prior_monotonic = monotonic
+    return {
+        "candidate_manifest_sha256": served["sha256"],
+        "authorization_claim_sha256": claim["sha256"],
+        "authorization_sha256": claim["authorization_sha256"],
+        "observation_count": len(rows),
+        "stages": list(ACTIVE_BINDING_PHASE_ORDER),
+    }
 
 
 @dataclass(frozen=True)
@@ -2514,7 +2871,9 @@ class MatrixData:
     thresholds: dict[str, Any]
 
 
-def validate_bundle_layout(root: Path) -> None:
+def validate_bundle_layout(
+    root: Path, *, bundle_files: set[str] = BUNDLE_FILES
+) -> None:
     actual_files: set[str] = set()
     saw_browser = False
     try:
@@ -2535,7 +2894,7 @@ def validate_bundle_layout(root: Path) -> None:
                                 fail(
                                     f"bundle contains a non-regular file or symlink: {relative}"
                                 )
-                            if relative not in BUNDLE_FILES:
+                            if relative not in bundle_files:
                                 fail(
                                     f"bundle contains an extra evidence file: {relative}"
                                 )
@@ -2543,7 +2902,7 @@ def validate_bundle_layout(root: Path) -> None:
                     continue
                 if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                     fail(f"bundle contains a non-regular file or symlink: {entry.name}")
-                if entry.name not in BUNDLE_FILES:
+                if entry.name not in bundle_files:
                     fail(f"bundle contains an extra evidence file: {entry.name}")
                 actual_files.add(entry.name)
     except ValidationError:
@@ -2552,10 +2911,10 @@ def validate_bundle_layout(root: Path) -> None:
         fail(f"failed to enumerate bundle layout: {error}")
     if not saw_browser:
         fail("bundle lacks the browser evidence directory")
-    if actual_files != BUNDLE_FILES:
+    if actual_files != bundle_files:
         fail(
-            f"bundle file set differs: missing={sorted(BUNDLE_FILES - actual_files)} "
-            f"extra={sorted(actual_files - BUNDLE_FILES)}"
+            f"bundle file set differs: missing={sorted(bundle_files - actual_files)} "
+            f"extra={sorted(actual_files - bundle_files)}"
         )
     if (root / "release-validation.json").exists() or (
         root / "release-validation.json"
@@ -2563,7 +2922,9 @@ def validate_bundle_layout(root: Path) -> None:
         fail("release-validation.json must be absent before validation")
 
 
-def validate_sha256sums(root: Path) -> str:
+def validate_sha256sums(
+    root: Path, *, bundle_files: set[str] = BUNDLE_FILES
+) -> str:
     path = safe_relative_file(root, "SHA256SUMS", "SHA256SUMS")
     try:
         raw = path.read_bytes()
@@ -2573,7 +2934,7 @@ def validate_sha256sums(root: Path) -> str:
     if not text or not text.endswith("\n") or "\r" in text:
         fail("SHA256SUMS must be non-empty LF-terminated ASCII")
     expected_paths = sorted(
-        BUNDLE_FILES - {"SHA256SUMS"}, key=lambda item: item.encode("utf-8")
+        bundle_files - {"SHA256SUMS"}, key=lambda item: item.encode("utf-8")
     )
     lines = text.splitlines()
     if len(lines) != len(expected_paths):
@@ -6605,11 +6966,12 @@ def _independent_summary(
     schedule: dict[str, Any],
     *,
     forbidden_values: tuple[bytes, ...],
+    bundle_files: set[str] = BUNDLE_FILES,
 ) -> bytes:
     schedule_raw = independent_canonical_json_bytes(
         schedule, forbidden_values=forbidden_values
     )
-    paths = sorted(BUNDLE_FILES, key=lambda item: item.encode("utf-8"))
+    paths = sorted(bundle_files, key=lambda item: item.encode("utf-8"))
     lines = [
         "# SQ8 OpenWebUI full campaign",
         "",
@@ -6698,13 +7060,18 @@ def _full_validation_report(
     latency: dict[str, Any],
     reconstructed_resource: dict[str, Any],
     sums_sha256: str,
+    active_manifest_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     order = session.full_campaign_order
     api = session.api_contract
     if order is None or api is None:
         fail("raw evidence does not contain one complete full campaign")
-    return {
-        "schema_version": FULL_REPORT_SCHEMA,
+    report = {
+        "schema_version": (
+            FULL_REPORT_SCHEMA_V2
+            if active_manifest_binding is not None
+            else FULL_REPORT_SCHEMA
+        ),
         "release_status": "complete",
         "full_campaign_validated": True,
         "run_id": matrix.run_id,
@@ -6760,6 +7127,11 @@ def _full_validation_report(
             ],
         },
     }
+    if active_manifest_binding is not None:
+        report["gate_details"]["active_manifest_binding"] = (
+            active_manifest_binding
+        )
+    return report
 
 
 def _write_release_validation(root: Path, raw: bytes) -> FileEvidence:
@@ -6850,22 +7222,46 @@ def _write_release_validation(root: Path, raw: bytes) -> FileEvidence:
             os.close(root_fd)
 
 
-def validate_full_release(
+def _validate_full_release_bytes(
     bundle: Path,
     *,
     expected_commit: str,
     expected_worker_binary_sha256: str,
     repo_root: Path,
     forbidden_values: tuple[bytes, ...] = (),
-) -> FileEvidence:
+    expected_served_model_manifest_sha256: str | None = None,
+    expected_authorization_claim_sha256: str | None = None,
+    expected_authorization_sha256: str | None = None,
+) -> tuple[Path, bytes]:
+    v2_anchors = (
+        expected_served_model_manifest_sha256,
+        expected_authorization_claim_sha256,
+        expected_authorization_sha256,
+    )
+    if any(value is not None for value in v2_anchors) and any(
+        value is None for value in v2_anchors
+    ):
+        fail("v2 full-campaign trusted anchors are incomplete")
+    v2 = all(value is not None for value in v2_anchors)
+    bundle_files = BUNDLE_FILES_V2 if v2 else BUNDLE_FILES
     root = safe_bundle_root(bundle)
-    validate_bundle_layout(root)
-    sums_sha256 = validate_sha256sums(root)
+    validate_bundle_layout(root, bundle_files=bundle_files)
+    sums_sha256 = validate_sha256sums(root, bundle_files=bundle_files)
     matrix = validate_matrix(root)
     identity = validate_campaign_identity(
         root,
         expected_commit=expected_commit,
         expected_worker_binary_sha256=expected_worker_binary_sha256,
+        expected_served_model_manifest_sha256=(
+            expected_served_model_manifest_sha256
+        ),
+        expected_authorization_claim_sha256=(
+            expected_authorization_claim_sha256
+        ),
+        expected_authorization_sha256=expected_authorization_sha256,
+    )
+    active_manifest_binding = (
+        validate_v2_active_manifest_evidence(root, identity) if v2 else None
     )
     source = validate_campaign_source_checkout(identity, repo_root=repo_root)
     session = validate_session(
@@ -6882,7 +7278,10 @@ def validate_full_release(
         root, session, forbidden_values=forbidden_values
     )
     expected_summary = _independent_summary(
-        matrix.run_id, matrix.schedule, forbidden_values=forbidden_values
+        matrix.run_id,
+        matrix.schedule,
+        forbidden_values=forbidden_values,
+        bundle_files=bundle_files,
     )
     if _read_bounded_root_file(root, "summary.md", "summary.md") != expected_summary:
         fail("summary.md differs from independent reconstruction")
@@ -6896,6 +7295,7 @@ def validate_full_release(
         latency=latency,
         reconstructed_resource=reconstructed_resource,
         sums_sha256=sums_sha256,
+        active_manifest_binding=active_manifest_binding,
     )
     try:
         raw = independent_canonical_json_bytes(
@@ -6904,7 +7304,65 @@ def validate_full_release(
     except IndependentViewError as error:
         fail(f"release validation report serialization failed: {error}")
         raise AssertionError("unreachable")
+    return root, raw
+
+
+def validate_full_release(
+    bundle: Path,
+    *,
+    expected_commit: str,
+    expected_worker_binary_sha256: str,
+    repo_root: Path,
+    forbidden_values: tuple[bytes, ...] = (),
+    expected_served_model_manifest_sha256: str | None = None,
+    expected_authorization_claim_sha256: str | None = None,
+    expected_authorization_sha256: str | None = None,
+) -> FileEvidence:
+    root, raw = _validate_full_release_bytes(
+        bundle,
+        expected_commit=expected_commit,
+        expected_worker_binary_sha256=expected_worker_binary_sha256,
+        repo_root=repo_root,
+        forbidden_values=forbidden_values,
+        expected_served_model_manifest_sha256=(
+            expected_served_model_manifest_sha256
+        ),
+        expected_authorization_claim_sha256=(
+            expected_authorization_claim_sha256
+        ),
+        expected_authorization_sha256=expected_authorization_sha256,
+    )
     return _write_release_validation(root, raw)
+
+
+def validate_full_release_no_publish(
+    bundle: Path,
+    *,
+    expected_commit: str,
+    expected_worker_binary_sha256: str,
+    repo_root: Path,
+    forbidden_values: tuple[bytes, ...] = (),
+    expected_served_model_manifest_sha256: str | None = None,
+    expected_authorization_claim_sha256: str | None = None,
+    expected_authorization_sha256: str | None = None,
+) -> bytes:
+    """Validate and recompute the canonical report without creating any file."""
+
+    _root, raw = _validate_full_release_bytes(
+        bundle,
+        expected_commit=expected_commit,
+        expected_worker_binary_sha256=expected_worker_binary_sha256,
+        repo_root=repo_root,
+        forbidden_values=forbidden_values,
+        expected_served_model_manifest_sha256=(
+            expected_served_model_manifest_sha256
+        ),
+        expected_authorization_claim_sha256=(
+            expected_authorization_claim_sha256
+        ),
+        expected_authorization_sha256=expected_authorization_sha256,
+    )
+    return raw
 
 
 class FullCampaignIndependentValidator:
@@ -6917,6 +7375,9 @@ class FullCampaignIndependentValidator:
         expected_worker_binary_sha256: str,
         repo_root: Path | None = None,
         forbidden_values: tuple[bytes, ...] = (),
+        expected_served_model_manifest_sha256: str | None = None,
+        expected_authorization_claim_sha256: str | None = None,
+        expected_authorization_sha256: str | None = None,
     ) -> None:
         self.expected_commit = git_commit(
             expected_commit, "expected campaign Git commit"
@@ -6935,15 +7396,62 @@ class FullCampaignIndependentValidator:
         except IndependentViewError as error:
             fail(f"validator forbidden cleartext contract differs: {error}")
         self.forbidden_values = forbidden_values
+        anchors = (
+            expected_served_model_manifest_sha256,
+            expected_authorization_claim_sha256,
+            expected_authorization_sha256,
+        )
+        if any(value is not None for value in anchors) and any(
+            value is None for value in anchors
+        ):
+            fail("v2 validator trusted anchors are incomplete")
+        self.expected_served_model_manifest_sha256 = (
+            None
+            if expected_served_model_manifest_sha256 is None
+            else sha256_value(
+                expected_served_model_manifest_sha256,
+                "expected served-model manifest SHA-256",
+            )
+        )
+        self.expected_authorization_claim_sha256 = (
+            None
+            if expected_authorization_claim_sha256 is None
+            else sha256_value(
+                expected_authorization_claim_sha256,
+                "expected authorization claim SHA-256",
+            )
+        )
+        self.expected_authorization_sha256 = (
+            None
+            if expected_authorization_sha256 is None
+            else sha256_value(
+                expected_authorization_sha256,
+                "expected authorization SHA-256",
+            )
+        )
 
     def validate(self, stage_path: Path) -> FileEvidence:
-        return validate_full_release(
-            stage_path,
-            expected_commit=self.expected_commit,
-            expected_worker_binary_sha256=self.expected_worker_binary_sha256,
-            repo_root=self.repo_root,
-            forbidden_values=self.forbidden_values,
-        )
+        arguments: dict[str, Any] = {
+            "expected_commit": self.expected_commit,
+            "expected_worker_binary_sha256": (
+                self.expected_worker_binary_sha256
+            ),
+            "repo_root": self.repo_root,
+            "forbidden_values": self.forbidden_values,
+        }
+        if self.expected_served_model_manifest_sha256 is not None:
+            arguments.update(
+                expected_served_model_manifest_sha256=(
+                    self.expected_served_model_manifest_sha256
+                ),
+                expected_authorization_claim_sha256=(
+                    self.expected_authorization_claim_sha256
+                ),
+                expected_authorization_sha256=(
+                    self.expected_authorization_sha256
+                ),
+            )
+        return validate_full_release(stage_path, **arguments)
 
 
 def validate_phase1(
@@ -6997,6 +7505,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-worker-binary-sha256", required=True)
+    parser.add_argument("--expected-served-model-manifest-sha256")
+    parser.add_argument("--expected-authorization-claim-sha256")
+    parser.add_argument("--expected-authorization-sha256")
     parser.add_argument(
         "--repo-root",
         type=Path,
@@ -7032,6 +7543,15 @@ def main(argv: list[str] | None = None) -> int:
                 expected_commit=args.expected_commit,
                 expected_worker_binary_sha256=args.expected_worker_binary_sha256,
                 repo_root=args.repo_root,
+                expected_served_model_manifest_sha256=(
+                    args.expected_served_model_manifest_sha256
+                ),
+                expected_authorization_claim_sha256=(
+                    args.expected_authorization_claim_sha256
+                ),
+                expected_authorization_sha256=(
+                    args.expected_authorization_sha256
+                ),
             )
             validator.validate(args.bundle)
             root = safe_bundle_root(args.bundle)

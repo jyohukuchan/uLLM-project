@@ -30,8 +30,15 @@ from sq8_full_campaign_bundle import (  # noqa: E402
     AtomicCampaignDirectory,
     FileEvidence,
     PREVALIDATION_ROOT_FILES,
+    PREVALIDATION_ROOT_FILES_V2,
 )
 from sq8_openwebui_campaign import PidEpoch  # noqa: E402
+from served_model_active_binding import (  # noqa: E402
+    ActiveManifestBinding,
+    CANDIDATE_ARTIFACT_NAME,
+    OBSERVATIONS_ARTIFACT_NAME,
+    optional_v2_binding,
+)
 
 
 PHASE_ORDER = (
@@ -1216,6 +1223,7 @@ class CampaignEvidence:
 class RenderContext:
     stage_path: Path
     evidence: CampaignEvidence
+    bundle_layout_version: str = "v1"
 
 
 class ViewsRenderer(Protocol):
@@ -1706,17 +1714,33 @@ def run_full_campaign(
     validator: IndependentValidator,
     *,
     bundle_factory: BundleFactory = AtomicCampaignDirectory,
+    active_binding: ActiveManifestBinding | None = None,
 ) -> Path:
     """Run one serial campaign and publish only independently validated evidence."""
 
     cleanup = _CampaignRuntimeGuard(backend)
     try:
-        with (
+        bundle_layout_version = "v2" if active_binding is not None else "v1"
+        if active_binding is not None and tuple(
+            active_binding.expected_stages
+        ) != PHASE_ORDER:
+            fail("SQ8 active-manifest binding stage contract differs")
+        bundle_owner = (
             bundle_factory(
                 config.final_path,
                 uid=config.uid,
                 gid=config.gid,
-            ) as bundle,
+                layout_version="v2",
+            )
+            if active_binding is not None
+            else bundle_factory(
+                config.final_path,
+                uid=config.uid,
+                gid=config.gid,
+            )
+        )
+        with (
+            bundle_owner as bundle,
             cleanup,
         ):
             session = backend.make_session_writer(
@@ -1735,6 +1759,8 @@ def run_full_campaign(
             cleanup.journal = journal
             journal.start()
 
+            if active_binding is not None:
+                active_binding.observe("preflight")
             preflight = backend.preflight(bundle.component_directory("preflight"))
             if not isinstance(preflight, PreflightPhaseResult):
                 fail("preflight result type differs")
@@ -1748,10 +1774,18 @@ def run_full_campaign(
                 preflight.model_identity_bytes,
                 scan=backend.scan_evidence,
             )
+            if active_binding is not None:
+                bundle.write_bytes(
+                    CANDIDATE_ARTIFACT_NAME,
+                    active_binding.candidate.raw,
+                    scan=backend.scan_evidence,
+                )
             session.append("header", "preflight", None, **preflight.header_fields)
             resource.write_value(preflight.resource_header)
             _checkpoint(journal, backend, config, "preflight")
 
+            if active_binding is not None:
+                active_binding.observe("api_contract")
             api = backend.api_contract(bundle.component_directory("api-contract"))
             for record in api.http_records:
                 _append_hook_record(session, record, expected_phase="api_contract")
@@ -1773,6 +1807,8 @@ def run_full_campaign(
             if api.final_journal_cursor != api_cursor:
                 fail("API contract journal boundary differs from the global campaign")
 
+            if active_binding is not None:
+                active_binding.observe("openwebui")
             combined = backend.combined(bundle.component_directory("combined"))
             for record in combined.browser_action_records:
                 _append_hook_record(session, record, expected_phase="openwebui")
@@ -1785,6 +1821,8 @@ def run_full_campaign(
             )
             _checkpoint(journal, backend, config, "openwebui")
 
+            if active_binding is not None:
+                active_binding.observe("cancellation")
             direct = backend.direct_cancel(bundle.component_directory("direct-cancel"))
             for record in direct.http_records:
                 _append_hook_record(session, record, expected_phase="cancellation")
@@ -1808,6 +1846,8 @@ def run_full_campaign(
             _copy_stop_screenshot(bundle, stop, backend)
             _checkpoint(journal, backend, config, "cancellation")
 
+            if active_binding is not None:
+                active_binding.observe("resource_normal")
             normal_work = bundle.component_directory("resource-normal")
             failure_work = bundle.component_directory("failure")
             restart_work = bundle.component_directory("resource-restart")
@@ -1836,6 +1876,8 @@ def run_full_campaign(
             _checkpoint(journal, backend, config, "resource_normal")
             journal.arm_restart_transition()
 
+            if active_binding is not None:
+                active_binding.observe("post_header_failure")
             failure = backend.failure(failure_work)
             _copy_failure_screenshot(bundle, failure, backend)
             restart_identity = _failure_phase(
@@ -1848,6 +1890,8 @@ def run_full_campaign(
             )
             _checkpoint(journal, backend, config, "post_header_failure")
 
+            if active_binding is not None:
+                active_binding.observe("resource_restart")
             probe_count = session.counts.get("lifecycle_probe", 0)
             restart_resource = resource_adapter.collect_restart(
                 normal_resource.identity,
@@ -1867,6 +1911,8 @@ def run_full_campaign(
             cleanup.resource_adapter = None
             _checkpoint(journal, backend, config, "resource_restart")
 
+            if active_binding is not None:
+                active_binding.observe("latency")
             latency = backend.latency(bundle.component_directory("latency"))
             for record in latency.http_records:
                 _append_hook_record(session, record, expected_phase="latency")
@@ -1879,6 +1925,8 @@ def run_full_campaign(
             )
             _checkpoint(journal, backend, config, "latency")
 
+            if active_binding is not None:
+                active_binding.observe("final")
             final = backend.final(bundle.component_directory("final"))
             final_probe_fields = _validate_ready_probe_record(
                 final.lifecycle_probe_record,
@@ -1958,13 +2006,29 @@ def run_full_campaign(
                 latency,
                 final,
             )
+            if active_binding is not None:
+                binding_artifacts = active_binding.artifacts()
+                bundle.write_bytes(
+                    OBSERVATIONS_ARTIFACT_NAME,
+                    binding_artifacts.observations_jsonl,
+                    scan=backend.scan_evidence,
+                )
             _render_artifacts(
                 bundle,
                 renderer,
-                RenderContext(bundle.stage_path, evidence),
+                RenderContext(
+                    bundle.stage_path,
+                    evidence,
+                    bundle_layout_version,
+                ),
                 backend,
             )
-            if set(PREVALIDATION_ROOT_FILES) - {
+            required_root = (
+                PREVALIDATION_ROOT_FILES_V2
+                if active_binding is not None
+                else PREVALIDATION_ROOT_FILES
+            )
+            if set(required_root) - {
                 path.name for path in bundle.stage_path.iterdir() if path.is_file()
             }:
                 fail("full campaign prevalidation artifacts are incomplete")
@@ -1988,6 +2052,11 @@ class ProductionPreparationRequest:
     final_path: Path
     api_key_file: Path
     openwebui_session_token_file: Path
+    active_binding_mode: str = "legacy"
+    candidate_served_model_manifest: Path | None = None
+    active_served_model_manifest: Path | None = None
+    expected_served_model_manifest_sha256: str | None = None
+    campaign_authorization: Path | None = None
 
 
 class ProductionPreparationRuntime(Protocol):
@@ -2017,6 +2086,7 @@ class ProductionPreparationRuntime(Protocol):
         anchor: Any,
         promotion: dict[str, Any],
         guard: CampaignSecretGuard,
+        active_binding: ActiveManifestBinding | None,
     ) -> Any: ...
 
     def discover_container(self) -> Any: ...
@@ -2077,6 +2147,7 @@ class PreparedProductionCampaign:
     operational: Any
     resource: Any
     config: CampaignConfig
+    active_binding: ActiveManifestBinding | None = None
     closed: bool = False
 
     @classmethod
@@ -2104,7 +2175,47 @@ class PreparedProductionCampaign:
             finally:
                 api_key = b""
                 token = b""
-            identity = runtime.build_identity(request, anchor, promotion, guard)
+            active_binding = optional_v2_binding(
+                mode=request.active_binding_mode,
+                candidate_path=request.candidate_served_model_manifest,
+                active_path=request.active_served_model_manifest,
+                expected_sha256=request.expected_served_model_manifest_sha256,
+                expected_stages=PHASE_ORDER,
+                authorization_path=request.campaign_authorization,
+                campaign_name=(
+                    "sq8_full"
+                    if request.active_binding_mode == "v2"
+                    else None
+                ),
+                run_id=(
+                    request.run_id
+                    if request.active_binding_mode == "v2"
+                    else None
+                ),
+                final_path=(
+                    request.final_path
+                    if request.active_binding_mode == "v2"
+                    else None
+                ),
+                expected_source_commit=(
+                    request.expected_commit
+                    if request.active_binding_mode == "v2"
+                    else None
+                ),
+            )
+            if (
+                request.active_binding_mode == "v2"
+                and active_binding is not None
+                and active_binding.claim is None
+            ):
+                fail("SQ8 v2 full campaign requires an immutable authorization claim")
+            identity = runtime.build_identity(
+                request,
+                anchor,
+                promotion,
+                guard,
+                active_binding,
+            )
             container = runtime.discover_container()
             operational = runtime.run_operational(identity, container)
             resource = runtime.build_resource(request, identity, guard)
@@ -2122,6 +2233,7 @@ class PreparedProductionCampaign:
                 operational,
                 resource,
                 config,
+                active_binding,
             )
         except BaseException as error:
             for owner, note in (
@@ -2144,16 +2256,37 @@ class PreparedProductionCampaign:
         self.secret_owner.revalidate()
         self.tool_owner.revalidate()
         self.git_anchor.revalidate()
+        if self.active_binding is not None:
+            self.active_binding.revalidate_sources()
         _validate_final_destination(self.request.final_path)
         self.runtime.revalidate_prepared(self)
 
     def report(self) -> dict[str, Any]:
         report = {
-            "schema_version": "ullm.sq8.production_preflight.v1",
+            "schema_version": (
+                "ullm.sq8.production_preflight.v2"
+                if self.active_binding is not None
+                else "ullm.sq8.production_preflight.v1"
+            ),
             "status": "ready",
             "run_id": self.request.run_id,
             "git_commit": self.request.expected_commit,
             "worker_binary_sha256": self.request.expected_worker_binary_sha256,
+            "active_manifest_binding": (
+                None
+                if self.active_binding is None
+                else {
+                    "candidate_manifest_sha256": (
+                        self.active_binding.candidate.sha256
+                    ),
+                    "authorization_claim_sha256": (
+                        None
+                        if self.active_binding.claim is None
+                        else self.active_binding.claim.sha256
+                    ),
+                    "stage_count": len(self.active_binding.expected_stages),
+                }
+            ),
             "service_epoch": {
                 "gateway_pid": self.config.normal_epoch.gateway_pid,
                 "worker_pid": self.config.normal_epoch.worker_pid,
@@ -2248,6 +2381,31 @@ class SystemProductionPreparationRuntime:
             or len(request.run_id) > 128
         ):
             fail("production preparation anchor or run ID differs")
+        v2_values = (
+            request.candidate_served_model_manifest,
+            request.active_served_model_manifest,
+            request.expected_served_model_manifest_sha256,
+            request.campaign_authorization,
+        )
+        if request.active_binding_mode == "legacy":
+            if any(value is not None for value in v2_values):
+                fail("v2 active-manifest inputs require active-binding mode v2")
+        elif request.active_binding_mode == "v2":
+            if (
+                any(value is None for value in v2_values)
+                or not isinstance(request.candidate_served_model_manifest, Path)
+                or not isinstance(request.active_served_model_manifest, Path)
+                or not isinstance(request.campaign_authorization, Path)
+                or type(request.expected_served_model_manifest_sha256) is not str
+                or len(request.expected_served_model_manifest_sha256) != 64
+                or any(
+                    value not in "0123456789abcdef"
+                    for value in request.expected_served_model_manifest_sha256
+                )
+            ):
+                fail("v2 active-manifest request binding differs")
+        else:
+            fail("active-manifest binding mode differs")
         _validate_final_destination(request.final_path)
 
     def acquire_lock(self) -> CampaignLockOwner:
@@ -2287,7 +2445,22 @@ class SystemProductionPreparationRuntime:
         anchor: Any,
         promotion: dict[str, Any],
         guard: CampaignSecretGuard,
+        active_binding: ActiveManifestBinding | None,
     ) -> Any:
+        served_model_binding = None
+        if active_binding is not None:
+            if active_binding.claim is None:
+                fail("SQ8 v2 identity lacks an authorization claim")
+            served_model_binding = self.identity_module.ServedModelCampaignBinding(
+                candidate_path=active_binding.candidate.path,
+                candidate_sha256=active_binding.candidate.sha256,
+                claim_path=active_binding.claim.path,
+                claim_sha256=active_binding.claim.sha256,
+                authorization_path=active_binding.claim.authorization_path,
+                authorization_sha256=(
+                    active_binding.claim.authorization_sha256
+                ),
+            )
         return self.prepare_module.build_production_identity_preflight(
             anchor,
             promotion,
@@ -2296,6 +2469,7 @@ class SystemProductionPreparationRuntime:
             forbidden_values=guard.secrets,
             identity_probe=self.identity_module.SystemIdentityProbe(),
             independent_validator=self.validator,
+            served_model_binding=served_model_binding,
         )
 
     def discover_container(self) -> Any:
@@ -2370,6 +2544,22 @@ class SystemProductionPreparationRuntime:
             forbidden_values=prepared.secret_guard.secrets,
             identity_probe=self.identity_module.SystemIdentityProbe(),
             independent_validator=self.validator,
+            served_model_binding=(
+                None
+                if prepared.active_binding is None
+                else self.identity_module.ServedModelCampaignBinding(
+                    candidate_path=prepared.active_binding.candidate.path,
+                    candidate_sha256=prepared.active_binding.candidate.sha256,
+                    claim_path=prepared.active_binding.claim.path,
+                    claim_sha256=prepared.active_binding.claim.sha256,
+                    authorization_path=(
+                        prepared.active_binding.claim.authorization_path
+                    ),
+                    authorization_sha256=(
+                        prepared.active_binding.claim.authorization_sha256
+                    ),
+                )
+            ),
         )
         if rebuilt_identity != prepared.identity:
             fail("production identity preflight changed")
@@ -2420,6 +2610,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="private OpenWebUI frontend session JWT; not the gateway API key",
     )
+    parser.add_argument(
+        "--active-binding-mode",
+        choices=("legacy", "v2"),
+        default="legacy",
+        help="select the archived v1 path or the exact-byte v2 campaign path",
+    )
+    parser.add_argument("--candidate-served-model-manifest", type=Path)
+    parser.add_argument("--active-served-model-manifest", type=Path)
+    parser.add_argument("--expected-served-model-manifest-sha256")
+    parser.add_argument("--campaign-authorization", type=Path)
     return parser
 
 
@@ -2437,6 +2637,11 @@ def main(
         arguments.final_path,
         arguments.api_key_file,
         arguments.openwebui_session_token_file,
+        arguments.active_binding_mode,
+        arguments.candidate_served_model_manifest,
+        arguments.active_served_model_manifest,
+        arguments.expected_served_model_manifest_sha256,
+        arguments.campaign_authorization,
     )
     try:
         if arguments.execute and runtime is not None and executor is None:
@@ -2450,7 +2655,11 @@ def main(
                 if published != request.final_path:
                     fail("production executor publication path differs")
                 report = {
-                    "schema_version": "ullm.sq8.production_execution.v1",
+                    "schema_version": (
+                        "ullm.sq8.production_execution.v2"
+                        if prepared.active_binding is not None
+                        else "ullm.sq8.production_execution.v1"
+                    ),
                     "status": "published",
                     "run_id": request.run_id,
                     "git_commit": request.expected_commit,

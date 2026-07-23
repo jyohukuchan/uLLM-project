@@ -1571,12 +1571,28 @@ def execute_prepared_campaign(prepared: Any, orchestrator: Any) -> Path:
         expected_worker_binary_sha256=(prepared.request.expected_worker_binary_sha256),
         repo_root=production.production_preflight_settings().repo_root,
         forbidden_values=prepared.secret_guard.secrets,
+        expected_served_model_manifest_sha256=(
+            None
+            if prepared.active_binding is None
+            else prepared.active_binding.candidate.sha256
+        ),
+        expected_authorization_claim_sha256=(
+            None
+            if prepared.active_binding is None
+            else prepared.active_binding.claim.sha256
+        ),
+        expected_authorization_sha256=(
+            None
+            if prepared.active_binding is None
+            else prepared.active_binding.claim.authorization_sha256
+        ),
     )
     published = orchestrator.run_full_campaign(
         prepared.config,
         backend,
         renderer_module.FullCampaignRenderer(),
         validator,
+        active_binding=prepared.active_binding,
     )
     if not isinstance(published, os.PathLike):
         fail("production campaign publication path type differs")

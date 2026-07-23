@@ -207,6 +207,40 @@ class FullCampaignRendererTests(unittest.TestCase):
                 )
                 self.assertEqual(digest, sha256(raw))
 
+    def test_v2_checksum_set_adds_exact_candidate_and_stage_observations(
+        self,
+    ) -> None:
+        with CampaignFixture() as fixture:
+            for relative in RENDERER.ACTIVE_BINDING_PATHS:
+                path = fixture.stage / relative
+                path.write_bytes((relative + "\n").encode("ascii"))
+                path.chmod(0o600)
+            fixture.context.bundle_layout_version = "v2"
+
+            rendered = fixture.render()
+
+            lines = rendered["SHA256SUMS"].decode("ascii").splitlines()
+            observed = [line.split("  ", 1)[1] for line in lines]
+            self.assertEqual(
+                observed,
+                sorted(
+                    (
+                        RENDERER.PREVALIDATION_PATHS
+                        | RENDERER.ACTIVE_BINDING_PATHS
+                    )
+                    - {"SHA256SUMS"},
+                    key=lambda item: item.encode("utf-8"),
+                ),
+            )
+            self.assertIn(
+                "`candidate-served-model.json`",
+                rendered["summary.md"].decode("ascii"),
+            )
+            self.assertIn(
+                "`active-manifest-observations.jsonl`",
+                rendered["summary.md"].decode("ascii"),
+            )
+
     def test_orchestrator_context_passes_actual_collector_result_to_renderer(
         self,
     ) -> None:

@@ -64,6 +64,12 @@ EXISTING_ROOT_PATHS = frozenset(
         "amd-smi-metric-restart-after.json",
     }
 )
+ACTIVE_BINDING_PATHS = frozenset(
+    {
+        "candidate-served-model.json",
+        "active-manifest-observations.jsonl",
+    }
+)
 EXISTING_BROWSER_PATHS = frozenset(
     {"openwebui-stop-before.png", "post-header-failure.png"}
 )
@@ -144,6 +150,8 @@ MAXIMUM_BYTES = {
     "amd-smi-metric-restart-after.json": 16 << 20,
     "browser/openwebui-stop-before.png": 128 << 20,
     "browser/post-header-failure.png": 128 << 20,
+    "candidate-served-model.json": 1 << 20,
+    "active-manifest-observations.jsonl": 16 << 20,
 }
 
 
@@ -263,10 +271,21 @@ def _file_flags() -> int:
 
 
 class _StageSnapshot:
-    def __init__(self, stage_path: Path):
+    def __init__(self, stage_path: Path, *, layout_version: str = "v1"):
         if not isinstance(stage_path, os.PathLike):
             fail("campaign stage path type differs")
         self.path = Path(stage_path)
+        if layout_version not in {"v1", "v2"}:
+            fail("campaign renderer layout version differs")
+        self.layout_version = layout_version
+        self.existing_root_paths = (
+            EXISTING_ROOT_PATHS
+            if layout_version == "v1"
+            else EXISTING_ROOT_PATHS | ACTIVE_BINDING_PATHS
+        )
+        self.existing_paths = self.existing_root_paths | frozenset(
+            f"browser/{name}" for name in EXISTING_BROWSER_PATHS
+        )
         if not self.path.is_absolute() or ".." in self.path.parts:
             fail("campaign stage path is not an absolute normalized path")
         self.stage_fd = -1
@@ -360,7 +379,7 @@ class _StageSnapshot:
         return set(names)
 
     def _validate_root_entries(self) -> None:
-        expected = set(EXISTING_ROOT_PATHS) | {"browser"}
+        expected = set(self.existing_root_paths) | {"browser"}
         actual = self._names(self.stage_fd, "campaign stage")
         if actual != expected:
             fail(
@@ -379,7 +398,7 @@ class _StageSnapshot:
 
     def _parent_and_name(self, relative: str) -> tuple[int, str]:
         pure = PurePosixPath(relative)
-        if relative in EXISTING_ROOT_PATHS and len(pure.parts) == 1:
+        if relative in self.existing_root_paths and len(pure.parts) == 1:
             return self.stage_fd, relative
         if (
             len(pure.parts) == 2
@@ -472,7 +491,7 @@ class _StageSnapshot:
             or self._entry_identity(self.stage_fd, "browser") != self.browser_identity
         ):
             fail("campaign stage changed while rendering")
-        if set(self.file_identities) != set(EXISTING_PATHS):
+        if set(self.file_identities) != set(self.existing_paths):
             fail("campaign input identity snapshot is incomplete")
         for relative, expected in self.file_identities.items():
             parent_fd, name = self._parent_and_name(relative)
@@ -501,9 +520,11 @@ def _byte_seal(raw: bytes, label: str) -> FileSeal:
     return FileSeal(len(raw), hashlib.sha256(raw).hexdigest())
 
 
-def _summary(run_id: str, schedule: Mapping[str, Any]) -> bytes:
+def _summary(
+    run_id: str, schedule: Mapping[str, Any], prevalidation_paths: frozenset[str]
+) -> bytes:
     schedule_line = _canonical_json(schedule, "summary schedule")[:-1].decode("ascii")
-    paths = sorted(PREVALIDATION_PATHS, key=lambda item: item.encode("utf-8"))
+    paths = sorted(prevalidation_paths, key=lambda item: item.encode("utf-8"))
     lines = [
         "# SQ8 OpenWebUI full campaign",
         "",
@@ -528,6 +549,25 @@ class FullCampaignRenderer:
         stage_value = _attribute(context, "stage_path", "render context")
         if not isinstance(stage_value, os.PathLike):
             fail("render context stage_path type differs")
+        layout_version = getattr(context, "bundle_layout_version", "v1")
+        if layout_version not in {"v1", "v2"}:
+            fail("render context bundle layout version differs")
+        existing_paths = (
+            EXISTING_PATHS
+            if layout_version == "v1"
+            else EXISTING_PATHS | ACTIVE_BINDING_PATHS
+        )
+        prevalidation_paths = (
+            PREVALIDATION_PATHS
+            if layout_version == "v1"
+            else PREVALIDATION_PATHS | ACTIVE_BINDING_PATHS
+        )
+        checksum_paths = tuple(
+            sorted(
+                prevalidation_paths - {"SHA256SUMS"},
+                key=lambda item: item.encode("utf-8"),
+            )
+        )
         evidence = _attribute(context, "evidence", "render context")
         preflight = _attribute(evidence, "preflight", "campaign evidence")
         header = _mapping_attribute(preflight, "header_fields", "preflight evidence")
@@ -580,11 +620,13 @@ class FullCampaignRenderer:
         ):
             fail("normal resource sampling cases differ")
 
-        with _StageSnapshot(Path(stage_value)) as stage:
+        with _StageSnapshot(
+            Path(stage_value), layout_version=layout_version
+        ) as stage:
             existing = {
                 relative: stage.hash_file(relative)
                 for relative in sorted(
-                    EXISTING_PATHS, key=lambda item: item.encode("utf-8")
+                    existing_paths, key=lambda item: item.encode("utf-8")
                 )
             }
             try:
@@ -630,10 +672,12 @@ class FullCampaignRenderer:
                 "thresholds": thresholds,
             }
             generated["release-matrix.json"] = _canonical_json(matrix, "release matrix")
-            generated["summary.md"] = _summary(run_id, schedule)
+            generated["summary.md"] = _summary(
+                run_id, schedule, prevalidation_paths
+            )
 
             lines: list[str] = []
-            for relative in SHA256SUM_INPUT_PATHS:
+            for relative in checksum_paths:
                 raw = generated.get(relative)
                 if raw is not None:
                     seal = _byte_seal(raw, f"checksum input {relative}")
@@ -654,6 +698,7 @@ class FullCampaignRenderer:
 
 
 __all__ = [
+    "ACTIVE_BINDING_PATHS",
     "DERIVED_VIEW_PATHS",
     "EXISTING_PATHS",
     "FullCampaignRenderer",

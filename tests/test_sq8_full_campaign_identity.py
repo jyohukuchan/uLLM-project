@@ -589,6 +589,83 @@ class FullCampaignIdentityTests(unittest.TestCase):
             "Python 3.12.3",
         )
 
+    def test_v2_identity_binds_served_manifest_worker_and_authorization_claim(
+        self,
+    ) -> None:
+        with IdentityFixture() as fixture:
+            candidate = fixture.root / "candidate-served-model.json"
+            candidate.write_bytes(
+                canonical(
+                    {
+                        "schema_version": "ullm.served_model.v2",
+                        "public": {
+                            "id": IDENTITY.SERVED_MODEL_ID,
+                            "revision": IDENTITY.MODEL_REVISION,
+                        },
+                        "format": {"format_id": "SQ8_0"},
+                        "worker": {
+                            "protocol": IDENTITY.WORKER_PROTOCOL_SCHEMA_V2,
+                            "binary_sha256": (
+                                fixture.live.worker.executable_sha256
+                            ),
+                        },
+                        "promotion": {
+                            "source_commit": "a" * 40,
+                            "receipt_sha256": "b" * 64,
+                        },
+                    }
+                )
+            )
+            authorization = fixture.root / "authorization.json"
+            claim = fixture.root / "claim.json"
+            authorization_sha = "c" * 64
+            claim.write_bytes(
+                canonical(
+                    {
+                        "schema_version": (
+                            "ullm.served_model.v2_cross_model_campaign_claim.v1"
+                        ),
+                        "authorization_path": str(authorization),
+                        "authorization_sha256": authorization_sha,
+                    }
+                )
+            )
+            binding = IDENTITY.ServedModelCampaignBinding(
+                candidate_path=candidate,
+                candidate_sha256=sha256(candidate.read_bytes()),
+                claim_path=claim,
+                claim_sha256=sha256(claim.read_bytes()),
+                authorization_path=authorization,
+                authorization_sha256=authorization_sha,
+            )
+            inputs = dataclasses.replace(
+                fixture.inputs, served_model_binding=binding
+            )
+            artifacts = IDENTITY.build_identity_artifacts(inputs, fixture.live)
+
+        self.assertEqual(
+            artifacts.model_identity["schema_version"],
+            IDENTITY.MODEL_IDENTITY_SCHEMA_V2,
+        )
+        self.assertEqual(
+            artifacts.model_identity["worker"]["protocol_schema"],
+            IDENTITY.WORKER_PROTOCOL_SCHEMA_V2,
+        )
+        self.assertEqual(
+            artifacts.model_identity["served_model_manifest"]["sha256"],
+            binding.candidate_sha256,
+        )
+        self.assertEqual(
+            artifacts.model_identity["campaign_authorization_claim"]["sha256"],
+            binding.claim_sha256,
+        )
+        self.assertEqual(
+            artifacts.model_identity_bytes,
+            IDENTITY.serialize_model_identity_document(
+                artifacts.model_identity
+            ),
+        )
+
     def test_worker_binary_allows_the_cargo_release_hardlink(self) -> None:
         with IdentityFixture() as fixture:
             cargo_artifact = fixture.worker.parent / "worker-build-artifact"
