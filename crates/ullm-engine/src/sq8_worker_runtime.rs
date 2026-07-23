@@ -955,6 +955,9 @@ where
     B: Sq8InferenceBackend + 'static,
     F: FnOnce() -> Result<B, String> + Send + 'static,
 {
+    profile
+        .validate_protocol_contract()
+        .map_err(|error| error.to_string())?;
     let control = Arc::new(Sq8WorkerControl::new());
     let (events, writer) = spawn_sq8_ordered_writer_with_profile(output, profile.clone())?;
     let (commands, command_receiver) = sync_channel(1);
@@ -1144,6 +1147,17 @@ fn dispatch_record_with_profile(
         }
     };
     let inspected_request_id = inspection.request_id().map(str::to_string);
+
+    if inspection.validate_schema_with_profile(profile).is_err() {
+        publish_recoverable(
+            control,
+            events,
+            inspected_request_id,
+            Sq8WorkerErrorCode::InvalidCommand,
+            "worker command schema does not match the loaded worker profile",
+        )?;
+        return Ok(None);
+    }
 
     if inspection.kind == Sq8WorkerCommandKind::Generate {
         match control.precheck_generate() {
@@ -1366,6 +1380,29 @@ mod tests {
         )
     }
 
+    fn v2_profile() -> Sq8WorkerProfile {
+        let mut profile = Sq8WorkerProfile::sq8_defaults();
+        profile.worker_schema = crate::sq8_worker_protocol::SQ8_WORKER_SCHEMA_VERSION_V2.into();
+        profile.reasoning = Some(crate::reasoning::ReasoningDialect {
+            identity: "qwen3-thinking-v1".into(),
+            start_sequence: vec![151_667],
+            end_sequence: vec![151_668],
+            forced_end_sequence: vec![151_668],
+            max_budget_tokens: 256,
+            reserved_answer_tokens: 1,
+            enabled_by_default: false,
+            effort_budgets: vec![
+                ("low".into(), 32),
+                ("medium".into(), 128),
+                ("high".into(), 256),
+            ],
+            history_reasoning_policy: crate::reasoning::HistoryReasoningPolicy::Omit,
+            initial_phase: crate::reasoning::InitialReasoningPhase::Reasoning,
+            eos_policy: crate::reasoning::ReasoningEosPolicy::Close,
+        });
+        profile
+    }
+
     fn start_ready_writer() -> (
         Arc<Sq8WorkerControl>,
         Sq8WorkerEventPublisher,
@@ -1389,6 +1426,52 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn wrong_schema_is_rejected_before_busy_or_control_dispatch() {
+        let profile = v2_profile();
+        let control = Arc::new(Sq8WorkerControl::new());
+        let (events, writer) =
+            spawn_sq8_ordered_writer_with_profile(Vec::new(), profile.clone()).unwrap();
+        let acknowledgement = events
+            .publish_ready(Sq8WorkerEvent::ready_with_profile(&profile))
+            .unwrap();
+        control.mark_ready_after_flush(acknowledgement).unwrap();
+        let active = control.admit("req-active").unwrap();
+        let (commands, receiver) = sync_channel(1);
+
+        for payload in [
+            valid_generate("req-wrong"),
+            r#"{"schema_version":"ullm.worker.v1","type":"cancel","request_id":"req-active","reason":"operator"}"#.into(),
+            r#"{"schema_version":"ullm.worker.v1","type":"shutdown"}"#.into(),
+        ] {
+            assert!(
+                dispatch_record_with_profile(
+                    payload.as_bytes(),
+                    &control,
+                    &events,
+                    &commands,
+                    &profile,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        let snapshot = control.snapshot().unwrap();
+        assert_eq!(snapshot.active_generation, Some(active.generation));
+        assert_eq!(snapshot.active_request_id.as_deref(), Some("req-active"));
+        assert_eq!(snapshot.first_cancel_reason, None);
+        assert_eq!(snapshot.lifecycle, Sq8WorkerLifecycle::Ready);
+
+        let lines = finish_writer(events, writer);
+        assert_eq!(lines[0]["type"], "ready");
+        for line in &lines[1..] {
+            assert_eq!(line["type"], "error");
+            assert_eq!(line["code"], "invalid_command");
+            assert_ne!(line["code"], "busy");
+        }
     }
 
     struct FakeInferenceBackend {

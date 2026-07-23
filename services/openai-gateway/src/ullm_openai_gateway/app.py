@@ -1104,9 +1104,12 @@ def _reconcile_reasoning_usage(
 
     A forced close deliberately emits the dialect end token.  When that token
     is also the natural end token, the gateway cannot distinguish the two from
-    the token ID alone.  For a length-terminated response, the worker release
+    the token ID alone.  For a completed response, the worker release
     accounting is authoritative for that hidden token, provided the reasoning
-    count still matches and at least one answer token remains.
+    count still matches and at least one answer token remains.  This includes
+    the reasoning-EOS path: the worker replaces the sampled EOS with the forced
+    end token, so the sampled EOS is never a visible or billable completion
+    token and the later answer EOS remains the terminal token.
     """
 
     if worker_reasoning_tokens is None and worker_forced_end_tokens is None:
@@ -1116,7 +1119,7 @@ def _reconcile_reasoning_usage(
     if worker_forced_end_tokens == observed_forced_end_tokens:
         return observed_reasoning_tokens, observed_forced_end_tokens
     if (
-        outcome == "length"
+        outcome in {"stop", "length"}
         and isinstance(worker_forced_end_tokens, int)
         and worker_forced_end_tokens > observed_forced_end_tokens
         and worker_forced_end_tokens >= 0

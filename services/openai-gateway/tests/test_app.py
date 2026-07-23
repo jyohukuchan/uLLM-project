@@ -754,6 +754,77 @@ def test_length_reasoning_forced_end_token_is_reconciled(
         assert value["usage"]["completion_tokens_details"] == {"reasoning_tokens": 10}
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_stop_reasoning_eos_replacement_is_reconciled_without_counting_sampled_eos(
+    tmp_path: Path, stream: bool
+) -> None:
+    configured = reasoning_settings(tmp_path)
+    assert configured.reasoning_dialect is not None
+    configured = dataclasses.replace(
+        configured,
+        reasoning_dialect=dataclasses.replace(
+            configured.reasoning_dialect,
+            end_sequence=(20,),
+            forced_end_sequence=(20,),
+        ),
+    )
+    # The worker replaced a reasoning-phase EOS sample with token 20.  Only
+    # committed wire tokens appear here; the final EOS belongs to the answer.
+    token_ids = (201, 20, 101, EOS_TOKEN_IDS[0])
+    fake_worker = FakeWorker(
+        outcome="stop",
+        token_ids=token_ids,
+        reasoning_tokens=1,
+        forced_end_tokens=1,
+    )
+    app = create_app(
+        configured,
+        tokenizer=ReasoningFakeTokenizer(),
+        worker=fake_worker,
+        api_key=API_KEY,
+    )
+    payload = body(
+        max_tokens=16,
+        thinking_budget_tokens=-1,
+        **(
+            {"stream": True, "stream_options": {"include_usage": True}}
+            if stream
+            else {}
+        ),
+    )
+    with TestClient(app) as instance:
+        response = instance.post("/v1/chat/completions", headers=AUTH, json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        records = parse_sse(response.text)
+        assert records[-1] == "[DONE]"
+        chunks = [json.loads(record) for record in records[:-1]]
+        reasoning = "".join(
+            chunk["choices"][0]["delta"]["reasoning_content"]
+            for chunk in chunks
+            if chunk["choices"]
+            if "reasoning_content" in chunk["choices"][0]["delta"]
+        )
+        content = "".join(
+            chunk["choices"][0]["delta"]["content"]
+            for chunk in chunks
+            if chunk["choices"]
+            if "content" in chunk["choices"][0]["delta"]
+            and "role" not in chunk["choices"][0]["delta"]
+        )
+        assert reasoning == "思"
+        assert content == "答"
+        assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[-1]["usage"]["completion_tokens"] == len(token_ids)
+    else:
+        value = response.json()
+        assert value["choices"][0]["message"]["reasoning_content"] == "思"
+        assert value["choices"][0]["message"]["content"] == "答"
+        assert value["choices"][0]["finish_reason"] == "stop"
+        assert value["usage"]["completion_tokens"] == len(token_ids)
+
+
 def test_nonstream_reasoning_usage_mismatch_fails_closed(tmp_path: Path) -> None:
     fake_worker = FakeWorker(
         token_ids=(201, 202, 20, 21, 101, EOS_TOKEN_IDS[0]),

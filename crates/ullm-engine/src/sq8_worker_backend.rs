@@ -35,6 +35,7 @@ pub const SQ8_WORKER_UPLOAD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub struct Qwen3Sq8WorkerBackendConfig {
     artifact: PathBuf,
     package: PathBuf,
+    reasoning_dialect: Option<crate::reasoning::ReasoningDialect>,
 }
 
 impl Qwen3Sq8WorkerBackendConfig {
@@ -42,6 +43,7 @@ impl Qwen3Sq8WorkerBackendConfig {
         let config = Self {
             artifact: artifact.into(),
             package: package.into(),
+            reasoning_dialect: None,
         };
         if config.artifact.as_os_str().is_empty() || config.package.as_os_str().is_empty() {
             return Err("SQ8 worker artifact and package paths must be nonempty".into());
@@ -56,6 +58,19 @@ impl Qwen3Sq8WorkerBackendConfig {
     pub fn package(&self) -> &Path {
         &self.package
     }
+
+    pub fn with_reasoning_dialect(
+        mut self,
+        reasoning_dialect: Option<crate::reasoning::ReasoningDialect>,
+    ) -> Result<Self, String> {
+        if let Some(dialect) = reasoning_dialect.as_ref() {
+            dialect
+                .validate(crate::sq8_model_head_runtime::QWEN3_14B_VOCAB_SIZE)
+                .map_err(|error| format!("SQ8 worker reasoning dialect is invalid: {error:?}"))?;
+        }
+        self.reasoning_dialect = reasoning_dialect;
+        Ok(self)
+    }
 }
 
 pub type Qwen3Sq8WorkerBackend = SessionInferenceBackend<Qwen3Sq8InferenceSession>;
@@ -64,6 +79,7 @@ pub type Qwen3Sq8WorkerBackend = SessionInferenceBackend<Qwen3Sq8InferenceSessio
 #[derive(Debug)]
 pub struct Qwen3Sq8InferenceSession {
     session: Qwen3Sq8ServingSession,
+    reasoning_dialect: Option<crate::reasoning::ReasoningDialect>,
     stream: RuntimeStream,
     _context: RuntimeContext,
 }
@@ -91,6 +107,7 @@ impl SessionInferenceBackend<Qwen3Sq8InferenceSession> {
         .map_err(|error| error.to_string())?;
         let session = Qwen3Sq8InferenceSession {
             session,
+            reasoning_dialect: config.reasoning_dialect,
             stream,
             _context: context,
         };
@@ -115,7 +132,12 @@ impl InferenceSession for Qwen3Sq8InferenceSession {
         cancel: CancellationToken,
     ) -> Result<(), String> {
         self.session
-            .start(request, cancel, &mut self.stream)
+            .start_with_reasoning_dialect(
+                request,
+                cancel,
+                self.reasoning_dialect.as_ref(),
+                &mut self.stream,
+            )
             .map_err(|error| error.to_string())
     }
 

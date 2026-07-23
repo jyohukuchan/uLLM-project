@@ -7,6 +7,7 @@
 //! result schemas remain unchanged while serving gains variable prompt lengths and reusable state.
 
 use crate::decoder::{PagedDecodeShape, PagedDecodeState};
+use crate::inference_api::ReasoningUsage;
 pub use crate::inference_api::{
     CancellationToken as Sq8CancellationToken, FinishReason as Sq8FinishReason,
     InferenceError as Sq8ServingError, InferenceErrorKind as Sq8ServingErrorKind,
@@ -14,6 +15,7 @@ pub use crate::inference_api::{
     ReleaseSummary as Sq8ReleaseSummary, SamplingParams as Sq8SamplingParams,
 };
 use crate::loader::{read_named_passthrough_f32, verify_named_passthrough_payload};
+use crate::reasoning::{ReasoningDialect, ReasoningPhase, ReasoningState};
 use crate::scheduler::{
     KvBlockAllocatorStats, Request, RequestId, SchedulerDecodeRequest, SchedulerState,
 };
@@ -344,23 +346,86 @@ struct ActiveServingRequest {
     cancel: Sq8CancellationToken,
     prompt_tokens_processed: usize,
     generated_tokens: usize,
+    sampled_tokens: usize,
     last_generated_token: Option<usize>,
     finish_reason: Option<Sq8FinishReason>,
     sampler: Sq8CpuSampler,
+    reasoning: Option<ReasoningState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReleaseAccounting {
+    request_id: String,
+    outcome: Sq8ReleaseOutcome,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    reasoning_usage: Option<ReasoningUsage>,
+}
+
+impl PendingReleaseAccounting {
+    fn complete_after_reset(self) -> Sq8ReleaseSummary {
+        Sq8ReleaseSummary {
+            request_id: self.request_id,
+            outcome: self.outcome,
+            prompt_tokens: self.prompt_tokens,
+            generated_tokens: self.generated_tokens,
+            reasoning_usage: self.reasoning_usage,
+            reset_complete: true,
+        }
+    }
 }
 
 impl ActiveServingRequest {
+    #[cfg(test)]
     fn new(request: Sq8ServingRequest, cancel: Sq8CancellationToken) -> Self {
+        Self::new_with_reasoning_dialect(request, cancel, None)
+            .expect("a request without reasoning does not require a loaded dialect")
+    }
+
+    fn new_with_reasoning_dialect(
+        request: Sq8ServingRequest,
+        cancel: Sq8CancellationToken,
+        reasoning_dialect: Option<&ReasoningDialect>,
+    ) -> Result<Self, String> {
+        let reasoning = match (request.reasoning.as_ref(), reasoning_dialect) {
+            (Some(execution), Some(dialect)) => {
+                if execution.dialect_id != dialect.identity
+                    || execution.end_sequence != dialect.end_sequence
+                    || execution.forced_end_sequence != dialect.forced_end_sequence
+                    || execution.reserved_answer_tokens != dialect.reserved_answer_tokens
+                {
+                    return Err("SQ8 reasoning execution is not bound to the loaded dialect".into());
+                }
+                Some(
+                    ReasoningState::new(
+                        dialect.clone(),
+                        execution.enabled,
+                        execution.budget_tokens,
+                        QWEN3_14B_VOCAB_SIZE,
+                    )
+                    .map_err(|error| format!("SQ8 reasoning execution is invalid: {error:?}"))?,
+                )
+            }
+            (Some(_), None) => {
+                return Err("SQ8 reasoning request has no loaded dialect".into());
+            }
+            (None, Some(_)) => {
+                return Err("SQ8 loaded reasoning dialect requires an execution contract".into());
+            }
+            (None, None) => None,
+        };
         let sampler = Sq8CpuSampler::new(request.sampling.seed);
-        Self {
+        Ok(Self {
             request,
             cancel,
             prompt_tokens_processed: 0,
             generated_tokens: 0,
+            sampled_tokens: 0,
             last_generated_token: None,
             finish_reason: None,
             sampler,
-        }
+            reasoning,
+        })
     }
 
     fn expected_cache_len(&self) -> Result<usize, String> {
@@ -374,14 +439,112 @@ impl ActiveServingRequest {
             .ok_or_else(|| "serving expected cache length overflows".to_string())
     }
 
-    fn terminal_reason(&self, token_id: usize) -> Option<Sq8FinishReason> {
-        if !self.request.test_only_ignores_eos() && self.request.eos_token_ids.contains(&token_id) {
+    fn reasoning_usage(&self) -> Option<ReasoningUsage> {
+        self.reasoning.as_ref().map(|reasoning| ReasoningUsage {
+            reasoning_tokens: reasoning.reasoning_tokens,
+            forced_end_tokens: reasoning.forced_end_tokens,
+        })
+    }
+
+    fn snapshot_release_accounting(&self, outcome: Sq8ReleaseOutcome) -> PendingReleaseAccounting {
+        PendingReleaseAccounting {
+            request_id: self.request.request_id.clone(),
+            outcome,
+            prompt_tokens: self.request.prompt_token_ids.len(),
+            generated_tokens: self.generated_tokens,
+            reasoning_usage: self.reasoning_usage(),
+        }
+    }
+
+    fn forced_reasoning_transition(&self) -> Result<Option<(usize, ReasoningState)>, String> {
+        let Some(mut reasoning) = self.reasoning.clone() else {
+            return Ok(None);
+        };
+        if reasoning.phase == ReasoningPhase::Reasoning {
+            let execution = self.request.reasoning.as_ref().ok_or_else(|| {
+                "SQ8 active reasoning state has no execution contract".to_string()
+            })?;
+            let remaining = self
+                .request
+                .max_new_tokens
+                .checked_sub(self.generated_tokens)
+                .ok_or_else(|| "SQ8 reasoning completion counter exceeds its limit".to_string())?;
+            let close_and_answer = execution
+                .forced_end_sequence
+                .len()
+                .checked_add(execution.reserved_answer_tokens)
+                .ok_or_else(|| "SQ8 reasoning length reservation overflows".to_string())?;
+            if remaining <= close_and_answer {
+                reasoning.force_close().map_err(|error| {
+                    format!("SQ8 reasoning answer-reservation close failed: {error:?}")
+                })?;
+            }
+        }
+        if reasoning.phase != ReasoningPhase::ForcingEndSequence {
+            return Ok(None);
+        }
+        let token_id = reasoning.next_forced_token().ok_or_else(|| {
+            "SQ8 reasoning forced-end sequence is exhausted before answer phase".to_string()
+        })?;
+        reasoning
+            .accept_forced(token_id)
+            .map_err(|error| format!("SQ8 reasoning forced transition failed: {error:?}"))?;
+        Ok(Some((token_id, reasoning)))
+    }
+
+    fn sampled_reasoning_transition(
+        &self,
+        sampled_token_id: usize,
+    ) -> Result<(usize, bool, Option<ReasoningState>), String> {
+        if let Some((token_id, reasoning_after)) = self.forced_reasoning_transition()? {
+            return Ok((token_id, true, Some(reasoning_after)));
+        }
+        let Some(mut reasoning_after) = self.reasoning.clone() else {
+            return Ok((sampled_token_id, false, None));
+        };
+        if !self.request.test_only_ignores_eos()
+            && self.request.eos_token_ids.contains(&sampled_token_id)
+        {
+            reasoning_after.on_eos();
+            if reasoning_after.phase == ReasoningPhase::ForcingEndSequence {
+                let token_id = reasoning_after
+                    .next_forced_token()
+                    .ok_or_else(|| "SQ8 reasoning EOS close has no forced token".to_string())?;
+                reasoning_after.accept_forced(token_id).map_err(|error| {
+                    format!("SQ8 reasoning EOS forced transition failed: {error:?}")
+                })?;
+                return Ok((token_id, true, Some(reasoning_after)));
+            }
+        } else {
+            reasoning_after
+                .accept_sampled(sampled_token_id)
+                .map_err(|error| format!("SQ8 reasoning sampled transition failed: {error:?}"))?;
+        }
+        Ok((sampled_token_id, false, Some(reasoning_after)))
+    }
+
+    fn terminal_reason_after(
+        &self,
+        token_id: usize,
+        reasoning_after: Option<&ReasoningState>,
+    ) -> Option<Sq8FinishReason> {
+        if reasoning_after.is_some_and(|reasoning| reasoning.phase == ReasoningPhase::Finished) {
+            Some(Sq8FinishReason::Stop)
+        } else if reasoning_after.is_none()
+            && !self.request.test_only_ignores_eos()
+            && self.request.eos_token_ids.contains(&token_id)
+        {
             Some(Sq8FinishReason::Stop)
         } else if self.generated_tokens + 1 == self.request.max_new_tokens {
             Some(Sq8FinishReason::Length)
         } else {
             None
         }
+    }
+
+    #[cfg(test)]
+    fn terminal_reason(&self, token_id: usize) -> Option<Sq8FinishReason> {
+        self.terminal_reason_after(token_id, None)
     }
 }
 
@@ -392,9 +555,16 @@ enum GeneratedTokenCommit {
 }
 
 #[derive(Debug)]
+enum PendingTokenSource {
+    Sampled(Sq8SamplingProposal),
+    Forced,
+}
+
+#[derive(Debug)]
 struct PendingServingToken {
     prepared: Sq8PreparedToken,
-    proposal: Sq8SamplingProposal,
+    source: PendingTokenSource,
+    reasoning_after: Option<ReasoningState>,
     commit: GeneratedTokenCommit,
 }
 
@@ -457,14 +627,46 @@ fn commit_pending_token_state(
     if &pending.prepared != prepared {
         return Err("serving token commit handle changed after publication".into());
     }
-    let sampled = pending.proposal.sampled();
-    if sampled.token_id != prepared.token_id {
-        return Err("serving sampling proposal changed before commit".into());
+    match &pending.source {
+        PendingTokenSource::Sampled(proposal)
+            if proposal.sampled().token_id == prepared.token_id => {}
+        PendingTokenSource::Sampled(_) => {
+            return Err("serving sampling proposal changed before commit".into());
+        }
+        PendingTokenSource::Forced => {}
     }
     let next_generated_tokens = prepared
         .generated_index
         .checked_add(1)
         .ok_or_else(|| "serving generated token counter overflows".to_string())?;
+    let active_before = active
+        .as_ref()
+        .ok_or_else(|| "serving token commit has no active request".to_string())?;
+    if active_before.reasoning.is_some() != pending.reasoning_after.is_some() {
+        return Err("serving pending reasoning state changed before commit".into());
+    }
+    let forced_before = active_before
+        .reasoning
+        .as_ref()
+        .map_or(0, |reasoning| reasoning.forced_end_tokens);
+    let forced_after = pending
+        .reasoning_after
+        .as_ref()
+        .map_or(0, |reasoning| reasoning.forced_end_tokens);
+    match &pending.source {
+        PendingTokenSource::Sampled(_) if forced_after != forced_before => {
+            return Err("serving sampled token changed forced-end accounting".into());
+        }
+        PendingTokenSource::Forced
+            if forced_after
+                != forced_before
+                    .checked_add(1)
+                    .ok_or_else(|| "serving forced-end counter overflows".to_string())? =>
+        {
+            return Err("serving forced token did not advance forced-end accounting".into());
+        }
+        _ => {}
+    }
     match pending.commit {
         GeneratedTokenCommit::Prefill => {
             scheduler.record_prefill_generated_token(SERVING_INTERNAL_REQUEST_ID)?
@@ -474,15 +676,23 @@ fn commit_pending_token_state(
     let active = active
         .as_mut()
         .ok_or_else(|| "serving token commit has no active request".to_string())?;
-    let committed = active.sampler.commit(pending.proposal)?;
-    if committed.token_id != prepared.token_id
-        || committed.logit.to_bits() != sampled.logit.to_bits()
-    {
-        return Err("serving sampler commit did not match prepared token".into());
+    if let PendingTokenSource::Sampled(proposal) = pending.source {
+        let sampled = proposal.sampled();
+        let committed = active.sampler.commit(proposal)?;
+        if committed.token_id != prepared.token_id
+            || committed.logit.to_bits() != sampled.logit.to_bits()
+        {
+            return Err("serving sampler commit did not match prepared token".into());
+        }
+        active.sampled_tokens = active
+            .sampled_tokens
+            .checked_add(1)
+            .ok_or_else(|| "serving sampled token counter overflows".to_string())?;
     }
     active.generated_tokens = next_generated_tokens;
     active.last_generated_token = Some(prepared.token_id);
     active.finish_reason = prepared.terminal_reason;
+    active.reasoning = pending.reasoning_after;
     validate_active_sampling_progress(active)?;
     *state = if prepared.terminal_reason.is_some() {
         Sq8ServingRuntimeStatus::Finishing
@@ -810,6 +1020,16 @@ impl Qwen3Sq8ServingSession {
         cancel: Sq8CancellationToken,
         stream: &mut RuntimeStream,
     ) -> Result<(), Sq8ServingError> {
+        self.start_with_reasoning_dialect(request, cancel, None, stream)
+    }
+
+    pub fn start_with_reasoning_dialect(
+        &mut self,
+        request: Sq8ServingRequest,
+        cancel: Sq8CancellationToken,
+        reasoning_dialect: Option<&ReasoningDialect>,
+        stream: &mut RuntimeStream,
+    ) -> Result<(), Sq8ServingError> {
         match self.state {
             Sq8ServingRuntimeStatus::Ready => {}
             Sq8ServingRuntimeStatus::Failed => return Err(self.failed_error()),
@@ -848,7 +1068,9 @@ impl Qwen3Sq8ServingSession {
             prompt_tokens: request.prompt_token_ids.len(),
             max_new_tokens: request.max_new_tokens,
         };
-        let active = ActiveServingRequest::new(request, cancel);
+        let active =
+            ActiveServingRequest::new_with_reasoning_dialect(request, cancel, reasoning_dialect)
+                .map_err(Sq8ServingError::invalid_request)?;
         let allocation = match self
             .scheduler
             .activate_single_request_with_all_blocks(scheduler_request)
@@ -1168,6 +1390,24 @@ impl Qwen3Sq8ServingSession {
             1 => Sq8ModelHeadServingSource::M1PagedDecode,
             _ => Sq8ModelHeadServingSource::CachedPrefixChunk,
         };
+        if let Some((token_id, reasoning_after)) = self
+            .active
+            .as_ref()
+            .ok_or_else(|| "serving final prefill has no active request".to_string())?
+            .forced_reasoning_transition()?
+        {
+            let prepared = self.prepare_selected_token(
+                token_id,
+                PendingTokenSource::Forced,
+                Some(reasoning_after),
+                scheduler_cached,
+                GeneratedTokenCommit::Prefill,
+            )?;
+            return Ok(PreparedOracleAdvance {
+                advance: Sq8PreparedAdvance::Token(prepared),
+                capture: None,
+            });
+        }
         match self.run_head_synchronized(source, scheduler_cached, stream, capture_oracle)? {
             HeadPreparation::Prepared { proposal, capture } => {
                 let prepared = self.prepare_generated_token(
@@ -1239,6 +1479,22 @@ impl Qwen3Sq8ServingSession {
         if self.active_cancelled()? {
             self.state = Sq8ServingRuntimeStatus::Cancelling;
             return Ok(Sq8PreparedAdvance::CancellationObserved);
+        }
+        if let Some((token_id, reasoning_after)) = self
+            .active
+            .as_ref()
+            .ok_or_else(|| "serving decode has no active request".to_string())?
+            .forced_reasoning_transition()?
+        {
+            return self
+                .prepare_selected_token(
+                    token_id,
+                    PendingTokenSource::Forced,
+                    Some(reasoning_after),
+                    expected_position + 1,
+                    GeneratedTokenCommit::Decode(ready),
+                )
+                .map(Sq8PreparedAdvance::Token);
         }
         let head = self.run_head_synchronized(
             Sq8ModelHeadServingSource::M1PagedDecode,
@@ -1538,6 +1794,33 @@ impl Qwen3Sq8ServingSession {
         if sampled.token_id >= QWEN3_14B_VOCAB_SIZE || !sampled.logit.is_finite() {
             return Err(format!("serving sampled invalid token: {sampled:?}"));
         }
+        let (token_id, forced, reasoning_after) = self
+            .active
+            .as_ref()
+            .ok_or_else(|| "serving generated token has no active request".to_string())?
+            .sampled_reasoning_transition(sampled.token_id)?;
+        let source = if forced {
+            PendingTokenSource::Forced
+        } else {
+            PendingTokenSource::Sampled(proposal)
+        };
+        self.prepare_selected_token(token_id, source, reasoning_after, cache_len, commit)
+    }
+
+    fn prepare_selected_token(
+        &mut self,
+        token_id: usize,
+        source: PendingTokenSource,
+        reasoning_after: Option<ReasoningState>,
+        cache_len: usize,
+        commit: GeneratedTokenCommit,
+    ) -> Result<Sq8PreparedToken, String> {
+        if self.pending_token.is_some() {
+            return Err("serving already has a pending token".into());
+        }
+        if token_id >= QWEN3_14B_VOCAB_SIZE {
+            return Err(format!("serving selected invalid token: {token_id}"));
+        }
         let (generated_index, terminal_reason) = {
             let active = self
                 .active
@@ -1594,7 +1877,10 @@ impl Qwen3Sq8ServingSession {
                     }
                 }
             }
-            (generated_index, active.terminal_reason(sampled.token_id))
+            (
+                generated_index,
+                active.terminal_reason_after(token_id, reasoning_after.as_ref()),
+            )
         };
 
         let nonce = self.next_prepared_nonce;
@@ -1602,7 +1888,7 @@ impl Qwen3Sq8ServingSession {
             .checked_add(1)
             .ok_or_else(|| "serving prepared-token nonce overflows".to_string())?;
         let prepared = Sq8PreparedToken {
-            token_id: sampled.token_id,
+            token_id,
             generated_index,
             cache_len,
             terminal_reason,
@@ -1610,7 +1896,8 @@ impl Qwen3Sq8ServingSession {
         };
         self.pending_token = Some(PendingServingToken {
             prepared: prepared.clone(),
-            proposal,
+            source,
+            reasoning_after,
             commit,
         });
         self.state = Sq8ServingRuntimeStatus::TokenPrepared;
@@ -1622,12 +1909,8 @@ impl Qwen3Sq8ServingSession {
         outcome: Sq8ReleaseOutcome,
         stream: &mut RuntimeStream,
     ) -> Result<Sq8ReleaseSummary, Sq8ServingError> {
-        let (request_id, prompt_tokens, generated_tokens) = match self.active.as_ref() {
-            Some(active) => (
-                active.request.request_id.clone(),
-                active.request.prompt_token_ids.len(),
-                active.generated_tokens,
-            ),
+        let release = match self.active.as_ref() {
+            Some(active) => active.snapshot_release_accounting(outcome),
             None => {
                 return Err(self.fail_runtime(stream, "serving reset has no active request"));
             }
@@ -1714,14 +1997,7 @@ impl Qwen3Sq8ServingSession {
                 self.fail_runtime(stream, format!("serving post-reset baseline failed: {err}"))
             );
         }
-        Ok(Sq8ReleaseSummary {
-            request_id,
-            outcome,
-            prompt_tokens,
-            generated_tokens,
-            reasoning_usage: None,
-            reset_complete: true,
-        })
+        Ok(release.complete_after_reset())
     }
 
     fn active_cancelled(&self) -> Result<bool, String> {
@@ -2102,14 +2378,23 @@ fn validate_active_sampling_progress(active: &ActiveServingRequest) -> Result<()
     let expected_draws = if active.request.sampling.temperature == 0.0 {
         0
     } else {
-        u64::try_from(active.generated_tokens).map_err(|_| {
-            "serving generated-token count does not fit RNG draw counter".to_string()
-        })?
+        u64::try_from(active.sampled_tokens)
+            .map_err(|_| "serving sampled-token count does not fit RNG draw counter".to_string())?
     };
+    let forced_tokens = active
+        .reasoning
+        .as_ref()
+        .map_or(0, |reasoning| reasoning.forced_end_tokens);
+    if active.sampled_tokens.checked_add(forced_tokens) != Some(active.generated_tokens) {
+        return Err(format!(
+            "serving generated-token accounting mismatch: generated={} sampled={} forced={forced_tokens}",
+            active.generated_tokens, active.sampled_tokens
+        ));
+    }
     if active.sampler.draws() != expected_draws {
         return Err(format!(
-            "serving sampling progress mismatch: generated_tokens={} expected_draws={expected_draws} actual_draws={}",
-            active.generated_tokens,
+            "serving sampling progress mismatch: sampled_tokens={} expected_draws={expected_draws} actual_draws={}",
+            active.sampled_tokens,
             active.sampler.draws()
         ));
     }
@@ -2122,6 +2407,78 @@ mod tests {
     use crate::sq8_stack_runtime::QWEN3_14B_SQ8_STACK_LAYERS;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn qwen3_reasoning_dialect() -> ReasoningDialect {
+        ReasoningDialect {
+            identity: "qwen3-thinking-v1".into(),
+            start_sequence: vec![151_667],
+            end_sequence: vec![151_668],
+            forced_end_sequence: vec![151_668],
+            max_budget_tokens: 256,
+            reserved_answer_tokens: 1,
+            enabled_by_default: false,
+            effort_budgets: vec![
+                ("low".into(), 32),
+                ("medium".into(), 128),
+                ("high".into(), 256),
+            ],
+            history_reasoning_policy: crate::reasoning::HistoryReasoningPolicy::Omit,
+            initial_phase: crate::reasoning::InitialReasoningPhase::Reasoning,
+            eos_policy: crate::reasoning::ReasoningEosPolicy::Close,
+        }
+    }
+
+    fn reasoning_active(
+        enabled: bool,
+        budget_tokens: Option<usize>,
+        max_new_tokens: usize,
+        temperature: f32,
+    ) -> ActiveServingRequest {
+        let dialect = qwen3_reasoning_dialect();
+        let mut request = Sq8ServingRequest::new(
+            "req-reasoning",
+            vec![1, 2, 151_667],
+            max_new_tokens,
+            Sq8SamplingParams {
+                temperature,
+                top_p: 1.0,
+                top_k: QWEN3_14B_SQ8_SERVING_TOP_K,
+                seed: 9,
+            },
+        );
+        request.reasoning = Some(crate::reasoning::ReasoningExecution {
+            enabled,
+            budget_tokens,
+            dialect_id: dialect.identity.clone(),
+            end_sequence: dialect.end_sequence.clone(),
+            forced_end_sequence: dialect.forced_end_sequence.clone(),
+            reserved_answer_tokens: dialect.reserved_answer_tokens,
+        });
+        request.validate().unwrap();
+        let mut active = ActiveServingRequest::new_with_reasoning_dialect(
+            request,
+            Sq8CancellationToken::new(),
+            Some(&dialect),
+        )
+        .unwrap();
+        active.prompt_tokens_processed = active.request.prompt_token_ids.len();
+        active
+    }
+
+    fn commit_cpu_reasoning_transition(
+        active: &mut ActiveServingRequest,
+        token_id: usize,
+        forced: bool,
+        reasoning_after: ReasoningState,
+    ) {
+        active.generated_tokens += 1;
+        if !forced {
+            active.sampled_tokens += 1;
+        }
+        active.last_generated_token = Some(token_id);
+        active.reasoning = Some(reasoning_after);
+        validate_active_sampling_progress(active).unwrap();
+    }
 
     struct ServingTokenTransactionFixture {
         state: Sq8ServingRuntimeStatus,
@@ -2169,12 +2526,63 @@ mod tests {
         };
         let pending_token = Some(PendingServingToken {
             prepared: prepared.clone(),
-            proposal,
+            source: PendingTokenSource::Sampled(proposal),
+            reasoning_after: None,
             commit: GeneratedTokenCommit::Prefill,
         });
         let mut scheduler = SchedulerState::with_block_size(4, 16);
         scheduler
             .activate_single_request_with_all_blocks(Request::new(1, 3, 2))
+            .unwrap();
+        scheduler
+            .advance_prefill_tokens(SERVING_INTERNAL_REQUEST_ID, 3)
+            .unwrap();
+        ServingTokenTransactionFixture {
+            state: Sq8ServingRuntimeStatus::TokenPrepared,
+            pending_token,
+            active: Some(active),
+            scheduler,
+            prepared,
+            cancel,
+        }
+    }
+
+    fn eos_forced_token_transaction_fixture() -> ServingTokenTransactionFixture {
+        let active = reasoning_active(true, None, 4, 1.0);
+        let cancel = active.cancel.clone();
+        let mut logits = vec![-100.0; QWEN3_14B_VOCAB_SIZE];
+        let eos = QWEN3_14B_SQ8_SERVING_EOS_TOKEN_IDS[0];
+        logits[eos] = 100.0;
+        let proposal = active
+            .sampler
+            .propose(
+                &logits,
+                active.request.sampling.temperature,
+                active.request.sampling.top_k,
+                active.request.sampling.top_p,
+            )
+            .unwrap();
+        assert!(proposal.consumes_rng());
+        assert_eq!(proposal.sampled().token_id, eos);
+        let (token_id, forced, reasoning_after) = active.sampled_reasoning_transition(eos).unwrap();
+        assert!(forced);
+        assert_eq!(token_id, 151_668);
+        let prepared = Sq8PreparedToken {
+            token_id,
+            generated_index: 0,
+            cache_len: active.request.prompt_token_ids.len(),
+            terminal_reason: None,
+            nonce: 8,
+        };
+        let pending_token = Some(PendingServingToken {
+            prepared: prepared.clone(),
+            source: PendingTokenSource::Forced,
+            reasoning_after,
+            commit: GeneratedTokenCommit::Prefill,
+        });
+        let mut scheduler = SchedulerState::with_block_size(4, 16);
+        scheduler
+            .activate_single_request_with_all_blocks(Request::new(1, 3, 4))
             .unwrap();
         scheduler
             .advance_prefill_tokens(SERVING_INTERNAL_REQUEST_ID, 3)
@@ -2298,6 +2706,337 @@ mod tests {
         request.validate().unwrap();
         let active = ActiveServingRequest::new(request, Sq8CancellationToken::new());
         validate_active_sampling_progress(&active).unwrap();
+    }
+
+    #[test]
+    fn qwen3_reasoning_contract_fixes_effort_budgets_and_token_ids() {
+        let dialect = qwen3_reasoning_dialect();
+        dialect.validate(QWEN3_14B_VOCAB_SIZE).unwrap();
+        assert_eq!(dialect.identity, "qwen3-thinking-v1");
+        assert_eq!(dialect.start_sequence, vec![151_667]);
+        assert_eq!(dialect.end_sequence, vec![151_668]);
+        assert_eq!(dialect.forced_end_sequence, vec![151_668]);
+        assert_eq!(
+            dialect.effort_budgets,
+            vec![
+                ("low".into(), 32),
+                ("medium".into(), 128),
+                ("high".into(), 256),
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_request_and_loaded_dialect_must_be_present_together() {
+        let dialect = qwen3_reasoning_dialect();
+        let plain = Sq8ServingRequest::greedy("req-plain", vec![1], 1);
+        assert!(
+            ActiveServingRequest::new_with_reasoning_dialect(
+                plain,
+                Sq8CancellationToken::new(),
+                Some(&dialect),
+            )
+            .is_err()
+        );
+
+        let with_reasoning = reasoning_active(true, Some(0), 2, 0.0).request;
+        assert!(
+            ActiveServingRequest::new_with_reasoning_dialect(
+                with_reasoning,
+                Sq8CancellationToken::new(),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reasoning_disabled_retains_v2_zero_usage_accounting() {
+        let mut active = reasoning_active(false, None, 1, 0.0);
+        assert_eq!(
+            active.reasoning.as_ref().unwrap().phase,
+            ReasoningPhase::Disabled
+        );
+        let (token_id, forced, reasoning_after) = active.sampled_reasoning_transition(42).unwrap();
+        assert_eq!(token_id, 42);
+        assert!(!forced);
+        commit_cpu_reasoning_transition(&mut active, token_id, forced, reasoning_after.unwrap());
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn bounded_reasoning_budgets_close_exactly_at_zero_low_medium_and_high() {
+        for budget in [0_usize, 32, 128, 256] {
+            let mut active = reasoning_active(true, Some(budget), budget + 2, 0.0);
+            for _ in 0..budget {
+                let (token_id, forced, reasoning_after) =
+                    active.sampled_reasoning_transition(42).unwrap();
+                assert_eq!(token_id, 42, "budget={budget}");
+                assert!(!forced, "budget={budget}");
+                commit_cpu_reasoning_transition(
+                    &mut active,
+                    token_id,
+                    forced,
+                    reasoning_after.unwrap(),
+                );
+            }
+            assert_eq!(
+                active.reasoning.as_ref().unwrap().phase,
+                ReasoningPhase::ForcingEndSequence,
+                "budget={budget}"
+            );
+            let (token_id, reasoning_after) = active
+                .forced_reasoning_transition()
+                .unwrap()
+                .expect("budget close token");
+            assert_eq!(token_id, 151_668);
+            commit_cpu_reasoning_transition(&mut active, token_id, true, reasoning_after);
+            assert_eq!(
+                active.reasoning_usage(),
+                Some(ReasoningUsage {
+                    reasoning_tokens: budget,
+                    forced_end_tokens: 1,
+                }),
+                "budget={budget}"
+            );
+            assert_eq!(
+                active.reasoning.as_ref().unwrap().phase,
+                ReasoningPhase::Answer
+            );
+            assert_eq!(active.request.max_new_tokens - active.generated_tokens, 1);
+        }
+    }
+
+    #[test]
+    fn unbounded_reasoning_natural_close_is_sampled_and_not_forced() {
+        let mut active = reasoning_active(true, None, 6, 0.0);
+        for token_id in [42, 151_668] {
+            let (selected, forced, reasoning_after) =
+                active.sampled_reasoning_transition(token_id).unwrap();
+            assert_eq!(selected, token_id);
+            assert!(!forced);
+            commit_cpu_reasoning_transition(
+                &mut active,
+                selected,
+                forced,
+                reasoning_after.unwrap(),
+            );
+        }
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 1,
+                forced_end_tokens: 0,
+            })
+        );
+        assert_eq!(
+            active.reasoning.as_ref().unwrap().phase,
+            ReasoningPhase::Answer
+        );
+    }
+
+    #[test]
+    fn unbounded_reasoning_reserves_forced_close_and_one_answer_token() {
+        let mut active = reasoning_active(true, None, 3, 0.0);
+        let (token_id, forced, reasoning_after) = active.sampled_reasoning_transition(42).unwrap();
+        assert!(!forced);
+        commit_cpu_reasoning_transition(&mut active, token_id, forced, reasoning_after.unwrap());
+
+        let (forced_token, reasoning_after) = active
+            .forced_reasoning_transition()
+            .unwrap()
+            .expect("length guard must close reasoning");
+        assert_eq!(forced_token, 151_668);
+        commit_cpu_reasoning_transition(&mut active, forced_token, true, reasoning_after);
+        assert_eq!(active.request.max_new_tokens - active.generated_tokens, 1);
+
+        let (answer_token, forced, reasoning_after) =
+            active.sampled_reasoning_transition(77).unwrap();
+        assert!(!forced);
+        assert_eq!(
+            active.terminal_reason_after(answer_token, reasoning_after.as_ref()),
+            Some(Sq8FinishReason::Length)
+        );
+        commit_cpu_reasoning_transition(
+            &mut active,
+            answer_token,
+            forced,
+            reasoning_after.unwrap(),
+        );
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 1,
+                forced_end_tokens: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_eos_is_replaced_by_forced_close_without_consuming_rng() {
+        let mut fixture = eos_forced_token_transaction_fixture();
+        let eos = QWEN3_14B_SQ8_SERVING_EOS_TOKEN_IDS[0];
+        assert_ne!(fixture.prepared.token_id, eos);
+        let result = publish_prepared_token_transaction(
+            &mut fixture.state,
+            &mut fixture.pending_token,
+            &mut fixture.active,
+            &mut fixture.scheduler,
+            &fixture.cancel,
+            &fixture.prepared,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Sq8ServingAdvance::Token {
+                token_id: 151_668,
+                terminal_reason: None,
+                ..
+            }
+        ));
+        let active = fixture.active.as_ref().unwrap();
+        assert_eq!(active.generated_tokens, 1);
+        assert_eq!(active.sampled_tokens, 0);
+        assert_eq!(active.sampler.draws(), 0);
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 1,
+            })
+        );
+        assert_eq!(
+            active.reasoning.as_ref().unwrap().phase,
+            ReasoningPhase::Answer
+        );
+    }
+
+    #[test]
+    fn reasoning_cancel_and_publication_failure_leave_committed_accounting_unchanged() {
+        let mut cancelled = eos_forced_token_transaction_fixture();
+        cancelled.cancel.cancel_checked().unwrap();
+        let result = publish_prepared_token_transaction(
+            &mut cancelled.state,
+            &mut cancelled.pending_token,
+            &mut cancelled.active,
+            &mut cancelled.scheduler,
+            &cancelled.cancel,
+            &cancelled.prepared,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(result, Sq8ServingAdvance::CancellationObserved);
+        let active = cancelled.active.as_ref().unwrap();
+        assert_eq!(active.generated_tokens, 0);
+        assert_eq!(active.sampled_tokens, 0);
+        assert_eq!(active.sampler.draws(), 0);
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 0,
+            })
+        );
+        assert_eq!(
+            active.reasoning.as_ref().unwrap().phase,
+            ReasoningPhase::Reasoning
+        );
+
+        let mut failed = eos_forced_token_transaction_fixture();
+        assert!(
+            publish_prepared_token_transaction(
+                &mut failed.state,
+                &mut failed.pending_token,
+                &mut failed.active,
+                &mut failed.scheduler,
+                &failed.cancel,
+                &failed.prepared,
+                |_| Err("flush failed".into()),
+            )
+            .is_err()
+        );
+        let active = failed.active.as_ref().unwrap();
+        assert_eq!(active.generated_tokens, 0);
+        assert_eq!(active.sampled_tokens, 0);
+        assert_eq!(active.sampler.draws(), 0);
+        assert_eq!(
+            active.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 0,
+            })
+        );
+        assert_eq!(
+            active.reasoning.as_ref().unwrap().phase,
+            ReasoningPhase::Reasoning
+        );
+    }
+
+    #[test]
+    fn reasoning_release_summary_keeps_committed_usage_after_active_state_is_cleared() {
+        let mut active = reasoning_active(true, Some(0), 2, 0.0);
+        let (forced_token, reasoning_after) = active
+            .forced_reasoning_transition()
+            .unwrap()
+            .expect("zero budget forces the close token");
+        commit_cpu_reasoning_transition(&mut active, forced_token, true, reasoning_after);
+        let release = active.snapshot_release_accounting(Sq8ReleaseOutcome::Cancelled);
+        drop(active);
+
+        assert_eq!(
+            release.complete_after_reset(),
+            Sq8ReleaseSummary {
+                request_id: "req-reasoning".into(),
+                outcome: Sq8ReleaseOutcome::Cancelled,
+                prompt_tokens: 3,
+                generated_tokens: 1,
+                reasoning_usage: Some(ReasoningUsage {
+                    reasoning_tokens: 0,
+                    forced_end_tokens: 1,
+                }),
+                reset_complete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_reuse_starts_with_zero_accounting_after_prior_release() {
+        let mut first = reasoning_active(true, Some(0), 2, 0.0);
+        let (forced_token, reasoning_after) = first
+            .forced_reasoning_transition()
+            .unwrap()
+            .expect("zero budget forces the close token");
+        commit_cpu_reasoning_transition(&mut first, forced_token, true, reasoning_after);
+        let prior_release = first
+            .snapshot_release_accounting(Sq8ReleaseOutcome::Cancelled)
+            .complete_after_reset();
+        assert_eq!(
+            prior_release.reasoning_usage,
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 1,
+            })
+        );
+
+        let reused = reasoning_active(false, None, 1, 0.0);
+        assert_eq!(reused.generated_tokens, 0);
+        assert_eq!(reused.sampled_tokens, 0);
+        assert_eq!(reused.sampler.draws(), 0);
+        assert_eq!(
+            reused.reasoning_usage(),
+            Some(ReasoningUsage {
+                reasoning_tokens: 0,
+                forced_end_tokens: 0,
+            })
+        );
+        validate_active_sampling_progress(&reused).unwrap();
     }
 
     #[test]
@@ -2614,6 +3353,7 @@ mod tests {
         active.sampler.commit(proposal).unwrap();
         assert!(validate_active_sampling_progress(&active).is_err());
         active.generated_tokens = 1;
+        active.sampled_tokens = 1;
         validate_active_sampling_progress(&active).unwrap();
     }
 

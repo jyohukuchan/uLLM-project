@@ -32,7 +32,7 @@ import sys
 import time
 
 mode = os.environ.get("FAKE_WORKER_MODE", "normal")
-schema = "ullm.worker.v2" if mode == "reasoning_v2" else "ullm.worker.v1"
+schema = "ullm.worker.v2" if mode in {"reasoning_v2", "reasoning_v2_no_answer"} else "ullm.worker.v1"
 if mode == "no_ready":
     time.sleep(10)
 ready = {
@@ -81,8 +81,12 @@ for line in sys.stdin:
                 "phase": "prefill",
                 "processed_prompt_tokens": processed,
             }, separators=(",", ":")), flush=True)
-        if mode == "reasoning_v2":
-            token_ids = [7, 20, 21, 151645]
+        if mode in {"reasoning_v2", "reasoning_v2_no_answer"}:
+            token_ids = (
+                [7, 20, 151645]
+                if mode == "reasoning_v2_no_answer"
+                else [7, 20, 21, 151645]
+            )
             for index, token_id in enumerate(token_ids):
                 print(json.dumps({
                     "schema_version": schema,
@@ -301,6 +305,52 @@ def test_v2_reasoning_release_records_worker_accounting(
     assert len(released) == 1
     assert released[0]["reasoning_tokens"] == 1
     assert released[0]["forced_end_tokens"] == 2
+
+
+def test_v2_reasoning_release_requires_reserved_answer_after_forced_close(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        exits: list[int] = []
+        reasoning_config = replace(
+            config(tmp_path, mode="reasoning_v2_no_answer"),
+            worker_schema="ullm.worker.v2",
+            reasoning_dialect=ReasoningDialect(
+                identity="synthetic.worker-v2.v1",
+                start_sequence=(10,),
+                end_sequence=(20, 21),
+                forced_end_sequence=(20, 21),
+                max_budget_tokens=8,
+                reserved_answer_tokens=1,
+                effort_budgets=(("low", 1), ("medium", 2), ("high", 4)),
+            ),
+        )
+        supervisor = WorkerSupervisor(reasoning_config, fatal_exit=exits.append)
+        await supervisor.launch()
+        await supervisor.wait_ready()
+        request = WorkerGenerationRequest(
+            prompt_token_ids=(0, 1, 2),
+            max_new_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            seed=0,
+            reasoning=ReasoningRequest(
+                enabled=True,
+                budget_tokens=1,
+                history_reasoning_policy="omit",
+                dialect_id="synthetic.worker-v2.v1",
+            ),
+        )
+        with pytest.raises(WorkerFatal):
+            await supervisor.wait(await supervisor.admit(request))
+        for _ in range(100):
+            if exits:
+                break
+            await asyncio.sleep(0.01)
+        assert exits == [1]
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

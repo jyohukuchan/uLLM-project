@@ -374,15 +374,18 @@ class WorkerSupervisor:
             "eos_token_ids": list(self._config.eos_token_ids),
         }
         if request.reasoning is not None:
+            dialect = self._config.reasoning_dialect
+            if dialect is None:
+                raise WorkerProtocolError(
+                    "reasoning dialect disappeared before command publication"
+                )
             command["reasoning"] = {
                 "enabled": request.reasoning.enabled,
                 "budget_tokens": request.reasoning.budget_tokens,
                 "dialect_id": request.reasoning.dialect_id,
-                "end_token_ids": list(self._config.reasoning_dialect.end_sequence),
-                "forced_end_token_ids": list(
-                    self._config.reasoning_dialect.forced_end_sequence
-                ),
-                "reserved_answer_tokens": self._config.reasoning_dialect.reserved_answer_tokens,
+                "end_token_ids": list(dialect.end_sequence),
+                "forced_end_token_ids": list(dialect.forced_end_sequence),
+                "reserved_answer_tokens": dialect.reserved_answer_tokens,
             }
         _log_lifecycle(
             "request_admitted",
@@ -819,6 +822,10 @@ class WorkerSupervisor:
         ):
             raise WorkerProtocolError("worker release event violates counters")
         if active.request.reasoning is not None:
+            if reasoning_tokens is None or forced_end_tokens is None:
+                raise WorkerProtocolError(
+                    "worker release reasoning accounting is missing"
+                )
             dialect = self._config.reasoning_dialect
             budget = active.request.reasoning.budget_tokens
             if (
@@ -829,8 +836,16 @@ class WorkerSupervisor:
                     outcome != "cancelled"
                     and forced_end_tokens not in {0, len(dialect.forced_end_sequence)}
                 )
+                or (
+                    outcome != "cancelled"
+                    and active.request.reasoning.enabled
+                    and completion_tokens - reasoning_tokens - forced_end_tokens
+                    < dialect.reserved_answer_tokens
+                )
             ):
-                raise WorkerProtocolError("worker release reasoning accounting is invalid")
+                raise WorkerProtocolError(
+                    "worker release reasoning accounting is invalid"
+                )
         if outcome in {"stop", "length"} and active.terminal_outcome != outcome:
             raise WorkerProtocolError(
                 "worker release outcome differs from terminal token"

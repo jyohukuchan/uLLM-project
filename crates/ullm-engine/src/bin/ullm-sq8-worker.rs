@@ -81,7 +81,9 @@ fn run_worker(source: WorkerSource) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config = match Qwen3Sq8WorkerBackendConfig::new(artifact, package) {
+    let config = match Qwen3Sq8WorkerBackendConfig::new(artifact, package)
+        .and_then(|config| config.with_reasoning_dialect(profile.reasoning.clone()))
+    {
         Ok(config) => config,
         Err(_) => {
             write_process_log("error", "cli_failed", Some("invalid_cli"), None);

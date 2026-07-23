@@ -101,6 +101,27 @@ impl Sq8WorkerProfile {
             reasoning: defaults.reasoning.clone(),
         }
     }
+
+    pub fn validate_protocol_contract(&self) -> Result<(), Sq8WorkerProtocolError> {
+        validate_schema_version(&self.worker_schema)?;
+        match (self.worker_schema.as_str(), self.reasoning.as_ref()) {
+            (SQ8_WORKER_SCHEMA_VERSION, None) => Ok(()),
+            (SQ8_WORKER_SCHEMA_VERSION_V2, Some(dialect)) => {
+                dialect.validate(self.vocab_size).map_err(|_| {
+                    Sq8WorkerProtocolError::invalid_command(
+                        "ullm.worker.v2 profile has an invalid reasoning dialect",
+                    )
+                })
+            }
+            (SQ8_WORKER_SCHEMA_VERSION, Some(_)) => Err(Sq8WorkerProtocolError::invalid_command(
+                "ullm.worker.v1 profile forbids a reasoning dialect",
+            )),
+            (SQ8_WORKER_SCHEMA_VERSION_V2, None) => Err(Sq8WorkerProtocolError::invalid_command(
+                "ullm.worker.v2 profile requires a reasoning dialect",
+            )),
+            _ => unreachable!("schema version was validated above"),
+        }
+    }
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -336,6 +357,28 @@ impl Sq8GenerateCommand {
         );
         request.eos_token_ids = self.eos_token_ids;
         request.reasoning = self.reasoning;
+        match profile.worker_schema.as_str() {
+            SQ8_WORKER_SCHEMA_VERSION
+                if profile.reasoning.is_some() || request.reasoning.is_some() =>
+            {
+                return Err(Sq8WorkerProtocolError::invalid_request(
+                    "ullm.worker.v1 forbids a loaded or requested reasoning contract",
+                ));
+            }
+            SQ8_WORKER_SCHEMA_VERSION_V2
+                if profile.reasoning.is_none() || request.reasoning.is_none() =>
+            {
+                return Err(Sq8WorkerProtocolError::invalid_request(
+                    "ullm.worker.v2 requires loaded and requested reasoning contracts",
+                ));
+            }
+            SQ8_WORKER_SCHEMA_VERSION | SQ8_WORKER_SCHEMA_VERSION_V2 => {}
+            _ => {
+                return Err(Sq8WorkerProtocolError::invalid_request(
+                    "loaded worker profile has an unsupported protocol schema",
+                ));
+            }
+        }
         if let Some(execution) = request.reasoning.as_ref() {
             let Some(dialect) = profile.reasoning.as_ref() else {
                 return Err(Sq8WorkerProtocolError::invalid_request(
@@ -410,10 +453,15 @@ pub enum Sq8WorkerCommandKind {
 pub struct Sq8WorkerCommandInspection<'a> {
     payload: &'a [u8],
     pub kind: Sq8WorkerCommandKind,
+    schema_version: String,
     request_id: Option<String>,
 }
 
 impl Sq8WorkerCommandInspection<'_> {
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
     }
@@ -427,7 +475,26 @@ impl Sq8WorkerCommandInspection<'_> {
         self,
         profile: &Sq8WorkerProfile,
     ) -> Result<Sq8WorkerCommand, Sq8WorkerProtocolError> {
-        decode_inspected_sq8_worker_command(self.payload, self.kind, profile.context_length)
+        self.validate_schema_with_profile(profile)?;
+        decode_inspected_sq8_worker_command(
+            self.payload,
+            self.kind,
+            profile.context_length,
+            &profile.worker_schema,
+        )
+    }
+
+    pub fn validate_schema_with_profile(
+        &self,
+        profile: &Sq8WorkerProfile,
+    ) -> Result<(), Sq8WorkerProtocolError> {
+        profile.validate_protocol_contract()?;
+        if self.schema_version != profile.worker_schema {
+            return Err(Sq8WorkerProtocolError::invalid_command(
+                "command schema_version does not match the loaded worker profile",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1241,6 +1308,7 @@ pub fn inspect_sq8_worker_command(
     Ok(Sq8WorkerCommandInspection {
         payload,
         kind,
+        schema_version: discriminators.schema_version,
         request_id,
     })
 }
@@ -1249,6 +1317,7 @@ fn decode_inspected_sq8_worker_command(
     payload: &[u8],
     inspected_kind: Sq8WorkerCommandKind,
     token_id_limit: usize,
+    expected_schema_version: &str,
 ) -> Result<Sq8WorkerCommand, Sq8WorkerProtocolError> {
     let mut deserializer = serde_json::Deserializer::from_slice(payload);
     let raw = RawWorkerCommandSeed { token_id_limit }
@@ -1270,14 +1339,21 @@ fn decode_inspected_sq8_worker_command(
             reasoning,
         } => {
             validate_schema_version(&schema_version)?;
+            if schema_version != expected_schema_version {
+                return Err(Sq8WorkerProtocolError::invalid_command(
+                    "command schema_version changed after inspection",
+                ));
+            }
             if inspected_kind != Sq8WorkerCommandKind::Generate {
                 return Err(Sq8WorkerProtocolError::invalid_command(
                     "command type changed after inspection",
                 ));
             }
-            if schema_version == SQ8_WORKER_SCHEMA_VERSION && reasoning.is_some() {
+            if (schema_version == SQ8_WORKER_SCHEMA_VERSION && reasoning.is_some())
+                || (schema_version == SQ8_WORKER_SCHEMA_VERSION_V2 && reasoning.is_none())
+            {
                 return Err(Sq8WorkerProtocolError::invalid_command(
-                    "reasoning execution requires ullm.worker.v2",
+                    "reasoning execution presence does not match the worker schema",
                 ));
             }
             Ok(Sq8WorkerCommand::Generate(Sq8GenerateCommand {
@@ -1308,6 +1384,11 @@ fn decode_inspected_sq8_worker_command(
             reason,
         } => {
             validate_schema_version(&schema_version)?;
+            if schema_version != expected_schema_version {
+                return Err(Sq8WorkerProtocolError::invalid_command(
+                    "command schema_version changed after inspection",
+                ));
+            }
             if inspected_kind != Sq8WorkerCommandKind::Cancel {
                 return Err(Sq8WorkerProtocolError::invalid_command(
                     "command type changed after inspection",
@@ -1322,6 +1403,11 @@ fn decode_inspected_sq8_worker_command(
         }
         RawWorkerCommand::Shutdown { schema_version } => {
             validate_schema_version(&schema_version)?;
+            if schema_version != expected_schema_version {
+                return Err(Sq8WorkerProtocolError::invalid_command(
+                    "command schema_version changed after inspection",
+                ));
+            }
             if inspected_kind != Sq8WorkerCommandKind::Shutdown {
                 return Err(Sq8WorkerProtocolError::invalid_command(
                     "command type changed after inspection",
@@ -2449,6 +2535,37 @@ mod tests {
         br#"{"schema_version":"ullm.worker.v1","type":"generate","request_id":"req-1","prompt_token_ids":[1,2,3],"max_new_tokens":2,"sampling":{"temperature":0.6,"top_p":0.95,"top_k":20,"seed":-7},"eos_token_ids":[151645,151643]}"#.to_vec()
     }
 
+    fn qwen3_reasoning_dialect() -> crate::reasoning::ReasoningDialect {
+        crate::reasoning::ReasoningDialect {
+            identity: "qwen3-thinking-v1".into(),
+            start_sequence: vec![151_667],
+            end_sequence: vec![151_668],
+            forced_end_sequence: vec![151_668],
+            max_budget_tokens: 256,
+            reserved_answer_tokens: 1,
+            enabled_by_default: false,
+            effort_budgets: vec![
+                ("low".into(), 32),
+                ("medium".into(), 128),
+                ("high".into(), 256),
+            ],
+            history_reasoning_policy: crate::reasoning::HistoryReasoningPolicy::Omit,
+            initial_phase: crate::reasoning::InitialReasoningPhase::Reasoning,
+            eos_policy: crate::reasoning::ReasoningEosPolicy::Close,
+        }
+    }
+
+    fn v2_profile() -> Sq8WorkerProfile {
+        let mut profile = Sq8WorkerProfile::sq8_defaults();
+        profile.worker_schema = SQ8_WORKER_SCHEMA_VERSION_V2.into();
+        profile.reasoning = Some(qwen3_reasoning_dialect());
+        profile
+    }
+
+    fn valid_v2_generate() -> &'static [u8] {
+        br#"{"schema_version":"ullm.worker.v2","type":"generate","request_id":"req-1","prompt_token_ids":[1,2,3],"max_new_tokens":34,"sampling":{"temperature":0.6,"top_p":0.95,"top_k":20,"seed":7},"eos_token_ids":[151645,151643],"reasoning":{"enabled":true,"budget_tokens":32,"dialect_id":"qwen3-thinking-v1","end_token_ids":[151668],"forced_end_token_ids":[151668],"reserved_answer_tokens":1}}"#
+    }
+
     fn flushed_terminal_ack(
         control: &Sq8WorkerControl,
         generation: u64,
@@ -2589,6 +2706,14 @@ mod tests {
         );
         assert_eq!(
             decode_sq8_worker_command(br#"{"schema_version":"ullm.worker.v2","type":"shutdown"}"#)
+                .unwrap_err()
+                .kind,
+            Sq8WorkerProtocolErrorKind::InvalidCommand
+        );
+        assert_eq!(
+            inspect_sq8_worker_command(br#"{"schema_version":"ullm.worker.v2","type":"shutdown"}"#)
+                .unwrap()
+                .decode_with_profile(&v2_profile())
                 .unwrap(),
             Sq8WorkerCommand::Shutdown
         );
@@ -2596,18 +2721,92 @@ mod tests {
 
     #[test]
     fn strict_decoder_accepts_v2_reasoning_execution() {
-        let payload = br#"{"schema_version":"ullm.worker.v2","type":"generate","request_id":"req-1","prompt_token_ids":[1,2,3],"max_new_tokens":16,"sampling":{"temperature":0.6,"top_p":0.95,"top_k":20,"seed":7},"eos_token_ids":[151645,151643],"reasoning":{"enabled":true,"budget_tokens":8,"dialect_id":"qwen3.5-thinking-v1","end_token_ids":[248069],"forced_end_token_ids":[248069],"reserved_answer_tokens":1}}"#;
-        let Sq8WorkerCommand::Generate(command) = decode_sq8_worker_command(payload).unwrap()
+        let profile = v2_profile();
+        let Sq8WorkerCommand::Generate(command) = inspect_sq8_worker_command(valid_v2_generate())
+            .unwrap()
+            .decode_with_profile(&profile)
+            .unwrap()
         else {
             panic!("expected generate")
         };
         let reasoning = command.reasoning.as_ref().expect("reasoning contract");
         assert!(reasoning.enabled);
-        assert_eq!(reasoning.budget_tokens, Some(8));
-        assert_eq!(reasoning.dialect_id, "qwen3.5-thinking-v1");
-        assert_eq!(reasoning.end_sequence, vec![248069]);
-        assert_eq!(reasoning.forced_end_sequence, vec![248069]);
+        assert_eq!(reasoning.budget_tokens, Some(32));
+        assert_eq!(reasoning.dialect_id, "qwen3-thinking-v1");
+        assert_eq!(reasoning.end_sequence, vec![151_668]);
+        assert_eq!(reasoning.forced_end_sequence, vec![151_668]);
         assert_eq!(reasoning.reserved_answer_tokens, 1);
+        command.into_serving_request_with_profile(&profile).unwrap();
+    }
+
+    #[test]
+    fn loaded_profile_requires_exact_command_schema_for_every_command_kind() {
+        let v1 = Sq8WorkerProfile::sq8_defaults();
+        let v2 = v2_profile();
+        let v1_commands = [
+            valid_generate(),
+            br#"{"schema_version":"ullm.worker.v1","type":"cancel","request_id":"req-1","reason":"operator"}"#.to_vec(),
+            br#"{"schema_version":"ullm.worker.v1","type":"shutdown"}"#.to_vec(),
+        ];
+        let v2_commands = [
+            valid_v2_generate().to_vec(),
+            br#"{"schema_version":"ullm.worker.v2","type":"cancel","request_id":"req-1","reason":"operator"}"#.to_vec(),
+            br#"{"schema_version":"ullm.worker.v2","type":"shutdown"}"#.to_vec(),
+        ];
+        for payload in &v1_commands {
+            let inspection = inspect_sq8_worker_command(payload).unwrap();
+            assert_eq!(inspection.schema_version(), SQ8_WORKER_SCHEMA_VERSION);
+            assert!(inspection.decode_with_profile(&v1).is_ok());
+            assert_eq!(
+                inspect_sq8_worker_command(payload)
+                    .unwrap()
+                    .decode_with_profile(&v2)
+                    .unwrap_err()
+                    .kind,
+                Sq8WorkerProtocolErrorKind::InvalidCommand
+            );
+        }
+        for payload in &v2_commands {
+            let inspection = inspect_sq8_worker_command(payload).unwrap();
+            assert_eq!(inspection.schema_version(), SQ8_WORKER_SCHEMA_VERSION_V2);
+            assert!(inspection.decode_with_profile(&v2).is_ok());
+            assert_eq!(
+                inspect_sq8_worker_command(payload)
+                    .unwrap()
+                    .decode_with_profile(&v1)
+                    .unwrap_err()
+                    .kind,
+                Sq8WorkerProtocolErrorKind::InvalidCommand
+            );
+        }
+    }
+
+    #[test]
+    fn worker_profile_schema_and_reasoning_presence_are_bijective() {
+        let v1 = Sq8WorkerProfile::sq8_defaults();
+        v1.validate_protocol_contract().unwrap();
+        let v2 = v2_profile();
+        v2.validate_protocol_contract().unwrap();
+
+        let mut v1_with_reasoning = v1.clone();
+        v1_with_reasoning.reasoning = Some(qwen3_reasoning_dialect());
+        assert!(v1_with_reasoning.validate_protocol_contract().is_err());
+
+        let mut v2_without_reasoning = v2;
+        v2_without_reasoning.reasoning = None;
+        assert!(v2_without_reasoning.validate_protocol_contract().is_err());
+    }
+
+    #[test]
+    fn v2_generate_requires_explicit_reasoning_even_when_disabled() {
+        let payload = String::from_utf8(valid_generate())
+            .unwrap()
+            .replace("ullm.worker.v1", "ullm.worker.v2");
+        let error = inspect_sq8_worker_command(payload.as_bytes())
+            .unwrap()
+            .decode_with_profile(&v2_profile())
+            .unwrap_err();
+        assert_eq!(error.kind, Sq8WorkerProtocolErrorKind::InvalidCommand);
     }
 
     #[test]
